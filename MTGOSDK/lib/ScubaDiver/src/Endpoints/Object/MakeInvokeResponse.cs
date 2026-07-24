@@ -68,15 +68,38 @@ public partial class Diver : IDisposable
       argumentTypes[i] = paramsArray[i]?.GetType() ?? typeof(object);
     }
 
-    // Create cache key
-    var cacheKey = (dumpedObjType.FullName, request.MethodName, paramCount, ComputeTypeHash(argumentTypes));
+    // Resolve generic type arguments UP FRONT. Generic methods such as
+    // ITradeEscrow.Process<T>(T message) have open generic placeholders for their
+    // parameter types until MakeGenericMethod is applied, so method resolution
+    // must know the generic args BEFORE matching parameter types — otherwise the
+    // concrete argument type never matches the 'T' parameter and the method is
+    // reported as not found.
+    Type[] genericArgs = null;
+    if (request.GenericArgsTypeFullNames?.Length > 0)
+    {
+      genericArgs = new Type[request.GenericArgsTypeFullNames.Length];
+      for (int i = 0; i < request.GenericArgsTypeFullNames.Length; i++)
+      {
+        genericArgs[i] = _runtime.ResolveType(request.GenericArgsTypeFullNames[i]);
+        if (genericArgs[i] == null)
+          return QuickError($"Failed to resolve generic type: {request.GenericArgsTypeFullNames[i]}");
+      }
+    }
+
+    // Create cache key (fold generic args into the hash so generic and
+    // non-generic resolutions for the same name/arity do not collide).
+    var cacheKey = (dumpedObjType.FullName, request.MethodName, paramCount,
+                    ComputeTypeHash(argumentTypes) * 31 + ComputeTypeHash(genericArgs));
 
     // Try cache first
     if (!s_methodCache.TryGetValue(cacheKey, out var method))
     {
-      // Use existing reflection helper
+      // Generic-aware resolver overload: filters to generic methods, applies
+      // MakeGenericMethod(genericArgs), then matches parameter types. When
+      // genericArgs is null this behaves identically to the non-generic lookup.
       method = dumpedObjType.GetMethodRecursive(
         request.MethodName,
+        genericArgs,
         argumentTypes
       );
 
@@ -87,22 +110,14 @@ public partial class Diver : IDisposable
     if (method == null)
       return QuickError($"Couldn't find method '{request.MethodName}' on type '{dumpedObjType.FullName}'");
 
-    // Handle generics
-    if (request.GenericArgsTypeFullNames?.Length > 0)
-    {
-      Type[] genericArgs = new Type[request.GenericArgsTypeFullNames.Length];
-      for (int i = 0; i < request.GenericArgsTypeFullNames.Length; i++)
-      {
-        genericArgs[i] = _runtime.ResolveType(request.GenericArgsTypeFullNames[i]);
-        if (genericArgs[i] == null)
-          return QuickError($"Failed to resolve generic type: {request.GenericArgsTypeFullNames[i]}");
-      }
-      method = method.MakeGenericMethod(genericArgs);
-    }
-    // Check if this invocation requires UI thread affinity
-    // DispatcherObject instances must be accessed on their owning thread
-    bool isDispatcherObject = instance != null && instance is System.Windows.Threading.DispatcherObject;
-    bool needsUIThread = request.ForceUIThread && isDispatcherObject;
+    // (generics already applied by the generic-aware GetMethodRecursive above)
+    // Marshal to MTGO's application UI dispatcher whenever the caller explicitly
+    // requested it (ForceUIThread) — NOT only when the target is a DispatcherObject.
+    // Many plain model-object methods (e.g. ITradeEscrow.Process) synchronously
+    // trigger WPF UI updates downstream (TradeSceneViewModel -> DataGrid); those
+    // must run on the UI thread or they throw thread-affinity errors and corrupt
+    // the UI. STAThread.Execute dispatches onto Application.Current.Dispatcher.
+    bool needsUIThread = request.ForceUIThread;
 
     // Start sub-activity for the actual reflection invocation
     using var activity = s_activitySource.StartActivity("MethodInvoke");
@@ -118,8 +133,9 @@ public partial class Diver : IDisposable
     {
       if (needsUIThread && !STAThread.IsDispatcherThread)
       {
-        // For DispatcherObject instances with ForceUIThread, invoke on UI thread proactively
-        Log.Debug($"[Diver] Invoking {request.MethodName} on UI thread (DispatcherObject target)");
+        // ForceUIThread requested — run on MTGO's application UI dispatcher so any
+        // downstream WPF UI updates happen on the correct thread.
+        Log.Debug($"[Diver] Invoking {request.MethodName} on UI thread (ForceUIThread)");
         results = STAThread.Execute(() => method.Invoke(instance, paramsArray));
       }
       else

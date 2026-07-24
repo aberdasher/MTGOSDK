@@ -35,13 +35,19 @@ public static class Bootstrapper
 {
   private static IBootstrapperRuntime? s_runtime;
 
+  // [EXPERIMENT] Extraction dir is runtime-overridable via the MTGOSDK_EXTRACT_DIR
+  // env var so we can isolate whether the prior CLR-host load failure (0x80070002)
+  // was tied to the %LOCALAPPDATA% location, the old "MTGOSDK" folder identity, or
+  // transient stale state — without rebuilding per test.
   public static string AppDataDir =>
-    Path.Combine(
-      Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-      ExtractDir
-    );
+    Environment.GetEnvironmentVariable("MTGOSDK_EXTRACT_DIR") is { Length: > 0 } o
+      ? o
+      : Path.Combine(
+          Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+          ExtractDir
+        );
 
-  public static string ExtractDir = "MTGOSDK";
+  public static string ExtractDir = "mtgosdk-diver";
 
   public static void Configure(IBootstrapperRuntime runtime) =>
     s_runtime = runtime ?? throw new ArgumentNullException(nameof(runtime));

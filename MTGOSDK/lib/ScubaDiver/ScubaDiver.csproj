@@ -26,8 +26,13 @@
     <ILRepackTarget>Microsoft.Diagnostics.Runtime</ILRepackTarget>
     <ILRepackOutput>$(SolutionDir)dist/$(Configuration)/$(RuntimeIdentifier)/$(ILRepackTarget).dll</ILRepackOutput>
     <UnmergedArtifactOutput>$(SolutionDir)dist/$(Configuration)/unmerged/$(AssemblyName).dll</UnmergedArtifactOutput>
-    <SystemValueTuplePayloadVersion>4.5.0</SystemValueTuplePayloadVersion>
-    <SystemValueTuplePayloadDll>$(NuGetPackageRoot)system.valuetuple\$(SystemValueTuplePayloadVersion)\lib\net461\System.ValueTuple.dll</SystemValueTuplePayloadDll>
+    <!-- Must match the assembly version of the System.ValueTuple reference the
+         merged Diver is compiled against (the CPM-pinned version), otherwise the
+         .NET Framework CLR fails to resolve it during the Diver's type load
+         inside MTGO (before the AssemblyResolve handler is active) and the Diver
+         never starts. 4.6.1/net462 ships assembly version 4.0.5.0. -->
+    <SystemValueTuplePayloadVersion>4.6.1</SystemValueTuplePayloadVersion>
+    <SystemValueTuplePayloadDll>$(NuGetPackageRoot)system.valuetuple\$(SystemValueTuplePayloadVersion)\lib\net462\System.ValueTuple.dll</SystemValueTuplePayloadDll>
   </PropertyGroup>
 
   <!-- Ensure Harmony is internalized into the single ClrMD injection payload. -->
@@ -85,7 +90,7 @@
     <PackageReference Include="System.ValueTuple"
                       GeneratePathProperty="true"
                       ExcludeAssets="runtime" />
-    <PackageDownload Include="System.ValueTuple" Version="[4.5.0]" />
+    <PackageDownload Include="System.ValueTuple" Version="[4.6.1]" />
     <PackageReference Include="Microsoft.Diagnostics.Runtime" />
     <PackageReference Include="Microsoft.NETFramework.ReferenceAssemblies"
                       PrivateAssets="All" />

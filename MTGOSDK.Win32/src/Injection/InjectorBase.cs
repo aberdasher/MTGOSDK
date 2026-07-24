@@ -155,6 +155,23 @@ public class InjectorBase
     if (thread == IntPtr.Zero)
       throw new Exception("Failed to create remote thread.");
 
+    // [DIAGNOSTIC] Wait briefly for the injected CLR-hosting stub to complete and
+    // record its exit code (the HRESULT of the last host call). This surfaces
+    // silent CLR-host/DLL-load failures that would otherwise be invisible.
+    try
+    {
+      uint wait = Kernel32.WaitForSingleObject(thread, 2500);
+      bool got = Kernel32.GetExitCodeThread(thread, out uint exitCode);
+      string diag =
+        $"{DateTime.Now:HH:mm:ss} inject: wait=0x{wait:X8} gotExit={got} " +
+        $"threadExit=0x{exitCode:X8} lastErr={System.Runtime.InteropServices.Marshal.GetLastWin32Error()}" +
+        Environment.NewLine;
+      System.IO.File.AppendAllText(
+        System.IO.Path.Combine(System.IO.Path.GetTempPath(), "mtgosdk_inject.log"),
+        diag);
+    }
+    catch { /* diagnostic only */ }
+
     return thread;
   }
 }
