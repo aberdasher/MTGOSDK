@@ -231,10 +231,10 @@ bool yes = args.Contains("--yes");
 bool attachOnly = args.Contains("--attach-only");
 string arg1 = args.Skip(1).FirstOrDefault(a => !a.StartsWith("--")) ?? "";
 
-// The ONLY place a commit (final approve) can happen: the autofullgrab mode with
-// an explicit --commit flag. Everything else stays hard-off (AllowCommit=false),
-// so no other mode can ever move assets even if --commit is passed.
-bool allowCommit = mode == "autofullgrab" && args.Contains("--commit");
+// The ONLY modes a commit (final approve) can happen in: autofullgrab (acquire a
+// free card) and lend (give a card), each requiring an explicit --commit flag.
+// Every other mode stays hard-off (AllowCommit=false) even if --commit is passed.
+bool allowCommit = (mode == "autofullgrab" || mode == "lend") && args.Contains("--commit");
 
 Line("=== MTGOSDK TradeBot prototype ===");
 Line($"mode={mode}  allowCommit={allowCommit.ToString().ToLowerInvariant()}" +
@@ -358,7 +358,24 @@ using (var exec = new TradeExecutor { AllowCommit = allowCommit })
       Line("Already logged in (login raced to completion).");
     }
   }
-  Line($"Connected as {client.CurrentUser.Name} (MTGO {Client.Version})\n");
+  // A freshly (re)started client can report no logged-in user for a while even
+  // though it will settle. Poll CurrentUser rather than dereferencing it blindly
+  // (a logged-out client throws "User ID must be greater than zero. Got -1.").
+  string? whoami = null;
+  for (int i = 0; i < 20 && whoami is null; i++)
+  {
+    try { var u = client.CurrentUser; if (u != null && u.Id > 0) whoami = u.Name; }
+    catch { /* not settled yet */ }
+    if (whoami is null) await Task.Delay(1500);
+  }
+  if (whoami is null)
+  {
+    Line("Client is not reporting a logged-in user (CurrentUser id = -1).");
+    Line("MTGO looks logged out / at the login screen — log in by hand, or fully");
+    Line("close MTGO and re-run without --attach-only so the bot cold-starts.");
+    Environment.Exit(4); return;
+  }
+  Line($"Connected as {whoami} (MTGO {Client.Version})\n");
 
   switch (mode)
   {
@@ -1049,12 +1066,193 @@ using (var exec = new TradeExecutor { AllowCommit = allowCommit })
       break;
     }
 
+    case "buddy":
+    {
+      // Diagnostic: add <name> as a buddy and report resolution before/after.
+      if (arg1.Length == 0) { Line("Usage: buddy <name> --yes"); break; }
+      if (!yes) { Line($"Refusing: adds '{arg1}' as a buddy. Re-run with --yes."); break; }
+      exec.Attach();
+      int? before = null; try { before = MTGOSDK.API.Users.UserManager.GetUserId(arg1); } catch (Exception ex) { Line($"GetUserId(before) threw: {ex.GetType().Name}: {ex.Message.Split('\n')[0]}"); }
+      Line($"GetUserId('{arg1}') before add = {(before?.ToString() ?? "null")}");
+      Line("Adding as buddy...");
+      try { exec.AddBuddy(arg1); } catch (Exception ex) { Line($"AddBuddy threw: {ex.Message.Split('\n')[0]}"); }
+      System.Threading.Thread.Sleep(4000);
+      int? after = null; try { after = MTGOSDK.API.Users.UserManager.GetUserId(arg1); } catch { }
+      Line($"GetUserId('{arg1}') after add  = {(after?.ToString() ?? "null")}");
+      Line("Current buddy list:");
+      try
+      {
+        foreach (var b in MTGOSDK.API.Users.UserManager.GetBuddyUsers())
+        { string nm = "?"; int bid = -1; try { nm = b.Name; } catch { } try { bid = b.Id; } catch { } Line($"  {nm} (id={bid})"); }
+      }
+      catch (Exception ex) { Line($"  (buddy list read failed: {ex.Message.Split('\n')[0]})"); }
+      break;
+    }
+
+    case "dmtest":
+    {
+      // Test the DM handshake in isolation (no trade): DM <user> and wait for YES.
+      if (arg1.Length == 0) { Line("Usage: dmtest <user> [message] --yes"); break; }
+      if (!yes) { Line($"Refusing: sends a DM to '{arg1}'. Re-run with --yes."); break; }
+      string msg = args.Skip(2).FirstOrDefault(a => !a.StartsWith("--")) ?? "DM handshake test — reply YES to confirm.";
+      exec.Attach();
+      if (!exec.EnsureKnownUser(arg1)) { Line($"Could not resolve or add '{arg1}' as a buddy — check the exact username."); break; }
+      exec.DumpDMTail(arg1);
+      try { exec.SendDM(arg1, msg); }
+      catch (Exception ex) { Line($"SendDM failed: {ex.Message}"); break; }
+      System.Threading.Thread.Sleep(1500);
+      exec.DumpDMTail(arg1);   // did our sent message land in the log?
+      Line($"\nWaiting up to 90s for a YES reply from {arg1} (reply now from that account)...");
+      bool gotYes = exec.WaitForDMYes(arg1, 90);
+      Line(gotYes ? $"✅ Got YES from {arg1} — handshake works." : $"⏱ No YES within 90s (no reply, or they said something else).");
+      break;
+    }
+
+    case "makebinder":
+    {
+      // Create/verify a trade binder on THIS (bot) account. No counterparty needed.
+      // Usage: makebinder [binderName] [cardname] --yes
+      //        makebinder <binderName> --cards="Event Ticket,Azimaet Drake,Radiant Strike" --yes
+      string binderName = arg1.Length > 0 ? arg1 : "Lending";
+      var cardsFlag = args.FirstOrDefault(a => a.StartsWith("--cards=", StringComparison.OrdinalIgnoreCase));
+      System.Collections.Generic.List<string> cards = cardsFlag != null
+        ? cardsFlag.Substring("--cards=".Length).Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).ToList()
+        : new() { args.Skip(2).FirstOrDefault(a => !a.StartsWith("--")) ?? "Azimaet Drake" };
+      if (!yes) { Line($"Refusing: creates a binder '{binderName}' containing [{string.Join(", ", cards)}] on your account. Re-run with --yes."); break; }
+      var binder = exec.CreateBinder(binderName, cards);
+      if (binder is null) { Line("Binder create/reuse failed — see above."); break; }
+      Line($"\nBinder '{binder.Name}' (id={binder.Id}) — {binder.ItemCount} item(s):");
+      try { foreach (var it in binder.Items) Line($"  {it.Quantity}x  catId={it.Id}  {it.Card?.Name}"); }
+      catch (Exception ex) { Line($"  (item read failed: {ex.Message})"); }
+      break;
+    }
+
+    case "deletebinder":
+    {
+      // Delete a trade binder on THIS (bot) account. No counterparty needed.
+      // Usage: deletebinder <binderName> --yes
+      string binderName = arg1.Length > 0 ? arg1 : "";
+      if (binderName.Length == 0) { Line("Usage: deletebinder <binderName> --yes"); break; }
+      if (!yes) { Line($"Refusing: deletes binder '{binderName}' from your account. Re-run with --yes."); break; }
+      Line(exec.DeleteBinder(binderName) ? $"Binder '{binderName}' is gone." : $"Could not delete '{binderName}' — see above.");
+      break;
+    }
+
+    case "lend":
+    {
+      // TARGETED LEND (custodian / GIVE side) — UNTESTED end to end (needs a
+      // recipient online). Flow: DM recipient "Ready for <card>? Reply YES" →
+      // wait for yes → initiate a trade → they grab <card> from our offer →
+      // GUARDRAIL: WE GIVE == exactly {<card> x1} and we receive nothing → submit
+      // our deposit → final approve (autonomous, gated by --commit) → DM done.
+      // Aborts + cancels on ANY mismatch, so we can never hand over more than the
+      // one intended card. WE only ever give that card.
+      string recipient = arg1;
+      string card = args.Skip(2).FirstOrDefault(a => !a.StartsWith("--")) ?? "Azimaet Drake";
+      if (recipient.Length == 0) { Line("Usage: lend <recipient> [cardname] [--commit] --yes"); break; }
+      if (!yes) { Line($"Refusing: DMs '{recipient}', opens a trade, and GIVES '{card}'{(allowCommit ? " (WILL COMMIT the give)" : " (dry-run: stops before commit)")}. Re-run with --yes."); break; }
+      Line($"Lending '{card}' to {recipient}." + (allowCommit ? "  *** WILL COMMIT ***" : "  [dry-run: reaches approval-ready then cancels — gives nothing]"));
+
+      exec.Attach();
+
+      // 0) ensure the dedicated single-card "Lending" binder exists (presents only
+      //    this card). Selecting it for the trade is still TODO (needs a recipient
+      //    to validate); the guardrail is what enforces giving only this card.
+      var lendBinder = exec.CreateSingleCardBinder("Lending", card);
+      if (lendBinder != null) Line($"Lending binder ready: '{lendBinder.Name}' (id={lendBinder.Id}, items={lendBinder.ItemCount}).");
+
+      // 1) DM handshake — confirm they're ready before sending an invite.
+      try { exec.SendDM(recipient, $"Ready for {card}? Reply YES and I'll send you a trade."); }
+      catch (Exception ex) { Line($"DM failed: {ex.Message}"); Line("(A private chat window with them must exist — open one once, then retry.)"); break; }
+      Line($"Waiting up to 5 min for {recipient} to reply YES...");
+      if (!exec.WaitForDMYes(recipient, 300)) { Line("No YES received within 5 min — aborting (no trade sent)."); break; }
+      try { exec.SendDM(recipient, $"Great — sending the trade now. Grab the {card} from my offer and submit."); } catch { }
+
+      // 2) initiate + advance binder (the recipient must accept the invite in MTGO)
+      var esc = TryReachNegotiation(exec, recipient);
+      if (esc is null)
+      {
+        Line($"Could not open a trade with {recipient} (did they accept the invite in time?).");
+        try { exec.SendDM(recipient, "Couldn't open the trade — accept my invite and we'll retry."); } catch { }
+        break;
+      }
+      Line($"\nTrade open with {esc.TradePartnerName}. Waiting for them to grab exactly '{card}'...");
+
+      // 3) wait until WE GIVE == exactly the target card (their grab), nothing else
+      bool ready = false;
+      for (int i = 0; i < 120 && !ready; i++)
+      {
+        System.Threading.Thread.Sleep(1000);
+        var c = MTGOSDK.API.Trade.TradeManager.CurrentTrade;
+        if (c is null) { Line("Trade closed before they grabbed the card."); break; }
+        esc = c;
+        if (exec.VerifyGiveIsOnly(c, card, 1)) ready = true;
+        else if (i % 10 == 0) Line($"  t+{i,3}s  WE GIVE: {TradeBot.TradeExecutor.Summarize(c.TradedItems)}");
+      }
+      if (!ready)
+      {
+        Line("They didn't grab exactly the one card (or grabbed extra) — cancelling for safety.");
+        exec.CancelCurrent(); WaitForNoTrade();
+        try { exec.SendDM(recipient, "Cancelled — please grab ONLY the offered card, then I'll retry."); } catch { }
+        break;
+      }
+      Line("GUARDRAIL passed: we give exactly the target card and receive nothing.");
+
+      // 4) submit our deposit; wait for approval-ready
+      exec.SubmitDeposit();
+      string st = "?"; bool approveReady = false;
+      for (int i = 0; i < 30 && !approveReady; i++)
+      {
+        System.Threading.Thread.Sleep(1000);
+        var c = MTGOSDK.API.Trade.TradeManager.CurrentTrade;
+        if (c is null) { Line("Trade closed before approval."); break; }
+        st = c.State.ToString(); esc = c;
+        if (i % 3 == 0) Line($"  t+{i,2}s state={st}");
+        if (st.StartsWith("Approval")) approveReady = true;
+      }
+      if (!approveReady) { Line("Did not reach approval-ready — cancelling."); exec.CancelCurrent(); WaitForNoTrade(); break; }
+
+      // 5) RE-VERIFY the guardrail right before committing (belt and suspenders)
+      if (!exec.VerifyGiveIsOnly(esc, card, 1))
+      {
+        Line("GUARDRAIL re-check FAILED at approval — cancelling (gives nothing).");
+        try { exec.Cancel(esc); } catch { } WaitForNoTrade();
+        try { exec.SendDM(recipient, "Cancelled at the final check for safety."); } catch { }
+        break;
+      }
+
+      if (!allowCommit)
+      {
+        Line("\n[dry-run] Approval-ready + guardrail OK; no --commit → cancelling (gave nothing).");
+        try { exec.Cancel(esc); } catch { } WaitForNoTrade();
+        Line("Re-run with `--commit --yes` to actually complete the lend.");
+        break;
+      }
+
+      Line("\n*** COMMITTING the give (ConfirmTrade) ***");
+      exec.ConfirmTrade();
+      for (int i = 0; i < 40; i++)
+      {
+        System.Threading.Thread.Sleep(1000);
+        var c = MTGOSDK.API.Trade.TradeManager.CurrentTrade;
+        if (c is null) { Line("Give complete — client clear."); break; }
+        if (i % 3 == 0) Line($"  t+{i,2}s state={c.State}");
+        if (c.State == MTGOSDK.API.Trade.Enums.TradeState.Closed) break;
+      }
+      try { exec.SendDM(recipient, $"Done — enjoy the {card}!"); } catch { }
+      Line("\nLedger (latest):");
+      var lpl = TradeBot.TradeExecutor.LedgerPath;
+      if (System.IO.File.Exists(lpl)) foreach (var l in System.IO.File.ReadAllLines(lpl).Reverse().Take(1)) Line("  " + l);
+      break;
+    }
+
     default:
       Line($"Unknown mode '{mode}'. Use:");
       Line("  read-only : probe | find [kw] | watch | botstatus <bot> | poolstatus [--bots=a,b,c]");
       Line("              readcurrent [card] | readchat | ledger");
       Line("  acquire   : autograb <bot> <card> --yes | poolgrab <card> [--bots=a,b,c] --yes");
       Line("  full-auto : autofullgrab <bot> [card] --yes         (request->deposit->approval-ready; add --commit to complete)");
+      Line("  lend      : lend <recipient> [card] --yes           (DM->wait YES->give card w/ guardrail; add --commit to complete)");
       Line("  low-level : opentrade <bot> --yes | takecard <card> --yes | grab <bot> --yes | invite <user> --yes");
       Line("  test      : stagetest <bot> [card] --yes  (controlled TakeCard test: stage -> observe -> cancel)");
       Line("  outward   : post \"<msg>\" --yes | clearpost --yes");

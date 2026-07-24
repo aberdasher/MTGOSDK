@@ -15,6 +15,7 @@
 **/
 
 using MTGOSDK.API;                                  // ObjectProvider
+using MTGOSDK.API.Chat;                             // ChannelManager, Channel, Message (DM handshake)
 using MTGOSDK.API.Collection;                       // ItemCollection, CardQuantityPair
 using MTGOSDK.API.Trade;                            // TradeManager, TradeEscrow
 using MTGOSDK.API.Trade.Enums;                      // TradeState
@@ -58,6 +59,18 @@ public sealed class TradeExecutor : IDisposable
   // the partner's binder is a BATCH request path (adds all matched cards at once).
   const string FileImportGrouping = "WotC.MtGO.Client.Model.Core.FileImport.FileImportCardGrouping";
   const string FileImportCard     = "WotC.MtGO.Client.Model.Core.FileImport.FileImportCard";
+
+  // Collection grouping manager + card-definition type for creating a single-card
+  // trade binder. NOTE ICardDefinition is in ...Model, NOT ...Model.Collection.
+  const string IGroupingManager   = "WotC.MtGO.Client.Model.Collection.ICollectionGroupingManager";
+  const string ICardDefinition    = "WotC.MtGO.Client.Model.ICardDefinition";
+
+  // Buddy list — the client only resolves users it knows (buddies/seen), so a DM
+  // to an unknown user requires adding them as a buddy first (AddUser(name, comment)).
+  const string IBuddyUsersList    = "WotC.MtGO.Client.Model.Chat.IBuddyUsersList";
+  const string IChat              = "WotC.MtGO.Client.Model.Chat.IChat";
+  const string IFlsClientSession  = "FlsClient.Interface.IFlsClientSession";
+  const string IShellViewModel    = "Shiny.Core.Interfaces.IShellViewModel";
 
   /// <summary>THE safety gate. Leave false for all validation runs.</summary>
   public bool AllowCommit { get; init; } = false;
@@ -486,6 +499,271 @@ public sealed class TradeExecutor : IDisposable
       if (can) vm.ConfirmTradeExecute();
     });
     Log($"[trade] FINAL APPROVE: {(can ? "ConfirmTradeExecute dispatched — COMMIT" : "ConfirmTradeCanExecute=false — skipped")}.");
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // TARGETED LEND — DM handshake + give-side safety guardrail.
+  // NOTE: this whole path is UNTESTED (needs a second person online). The
+  // guardrail below is the hard safety: we never approve a give that isn't
+  // exactly the one intended card.
+  // ─────────────────────────────────────────────────────────────────────────
+
+  /// <summary>
+  /// Resolve a username to its login id CASE-INSENSITIVELY (the client stores the
+  /// canonical case, e.g. "Basic_" not "basic_"). Returns -1 if the client doesn't
+  /// know the user. Read-only.
+  /// </summary>
+  public static int ResolveUserId(string username)
+  {
+    try { return Try(() => (int)Unbind(MTGOSDK.API.Users.UserManager.GetUser(username, true)).Id) ?? -1; }
+    catch { return -1; }
+  }
+
+  /// <summary>
+  /// Add a user as a buddy by name (IBuddyUsersList.AddUser(name, comment)) so the
+  /// client learns them — required before we can resolve name→id or DM them.
+  /// </summary>
+  public void AddBuddy(string username)
+  {
+    dynamic buddyList = Unbind((object)ObjectProvider.Get(IBuddyUsersList, true, false, false));
+    OnUI(() => buddyList.AddUser(username, ""));
+    Log($"[buddy] AddUser('{username}') dispatched.");
+  }
+
+  /// <summary>
+  /// Ensure the client can resolve <paramref name="username"/> (name→id); if it
+  /// can't, add them as a buddy and wait for the client to learn them. Returns
+  /// true once resolvable. (A brand-new buddy may need to accept the request
+  /// before they fully resolve.)
+  /// </summary>
+  public bool EnsureKnownUser(string username)
+  {
+    if (ResolveUserId(username) > 0) return true;
+    Log($"[buddy] '{username}' is unknown to the client — adding as a buddy...");
+    try { AddBuddy(username); } catch (Exception ex) { Log($"[buddy] AddUser failed: {ex.Message}"); return false; }
+    for (int i = 0; i < 15; i++)
+    {
+      System.Threading.Thread.Sleep(1000);
+      int id = ResolveUserId(username);
+      if (id > 0) { Log($"[buddy] '{username}' now resolves (id={id})."); return true; }
+    }
+    Log($"[buddy] '{username}' still not resolvable — they may need to ACCEPT the buddy request, or the name is wrong.");
+    return false;
+  }
+
+  /// <summary>
+  /// Reach the client's chat manager (PrimaryChatManager) via IShellViewModel.
+  /// </summary>
+  static dynamic ChatManager() =>
+    Unbind((object)ObjectProvider.Get(IShellViewModel, true, false, false)).ChatManager;
+
+  /// <summary>
+  /// Send a private (DM) chat message to a user. Creates the private chat SESSION
+  /// via the chat manager (PrimaryChatManager.CreatePrivateChat) if one doesn't
+  /// exist yet — this is what a headless client lacks — then sends through the
+  /// session's SendCommand (the real transmit path).
+  /// </summary>
+  public void SendDM(string username, string text)
+  {
+    int uid = ResolveUserId(username);
+    if (uid <= 0) throw new InvalidOperationException($"Could not resolve a user id for '{username}'.");
+
+    dynamic mgr = ChatManager();
+    dynamic session = null;
+    OnUI(() =>
+    {
+      try { session = mgr.GetPrivateChat(uid); } catch { }
+      if (session is null)
+      {
+        try { mgr.CreatePrivateChat(uid); } catch (Exception ex) { Log($"[dm] CreatePrivateChat threw: {ex.Message.Split('\n')[0]}"); }
+        try { session = mgr.GetPrivateChat(uid); } catch { }
+      }
+    });
+    if (session is null) { System.Threading.Thread.Sleep(600); try { session = mgr.GetPrivateChat(uid); } catch { } }
+    if (session is null)
+      throw new InvalidOperationException($"Could not create/get a chat session for '{username}'.");
+
+    OnUI(() => session.SendCommand.Execute(text));
+    Log($"[dm] -> {username}: {text}");
+  }
+
+  /// <summary>
+  /// Wait up to <paramref name="timeoutSec"/> for <paramref name="username"/> to
+  /// reply "yes" (yes / y / yes please / …) in the DM channel. Read-only.
+  /// </summary>
+  public bool WaitForDMYes(string username, int timeoutSec = 300)
+  {
+    int uid = ResolveUserId(username);
+    if (uid <= 0) return false;
+    var channel = ChannelManager.GetPrivateChannel(uid);
+    int seen = Try(() => channel.Messages.Count) ?? 0;
+    for (int i = 0; i < timeoutSec; i++)
+    {
+      System.Threading.Thread.Sleep(1000);
+      System.Collections.Generic.IList<Message> msgs;
+      try { msgs = channel.Messages; } catch { continue; }
+      for (int m = seen; m < msgs.Count; m++)
+      {
+        string who = Try(() => msgs[m].User?.Name) ?? "(system)";
+        string raw = (Try(() => msgs[m].Text) ?? "").Trim();
+        Log($"[dm-log] {who}: {raw}");   // diagnostic: show every new message
+        if (!string.Equals(who, username, StringComparison.OrdinalIgnoreCase)) continue;
+        string txt = raw.ToLowerInvariant();
+        if (txt == "y" || txt == "yes" || txt.StartsWith("yes") || txt.StartsWith("y ")) return true;
+      }
+      seen = msgs.Count;
+    }
+    return false;
+  }
+
+  /// <summary>Diagnostic: dump the last <paramref name="n"/> messages in the DM channel.</summary>
+  public void DumpDMTail(string username, int n = 8)
+  {
+    int uid = ResolveUserId(username);
+    if (uid <= 0) { Log($"[dm] can't resolve '{username}'"); return; }
+    var channel = ChannelManager.GetPrivateChannel(uid);
+    System.Collections.Generic.IList<Message> msgs;
+    try { msgs = channel.Messages; } catch (Exception ex) { Log($"[dm] messages read failed: {ex.Message.Split('\n')[0]}"); return; }
+    Log($"[dm] channel with {username} has {msgs.Count} message(s); last {Math.Min(n, msgs.Count)}:");
+    for (int i = Math.Max(0, msgs.Count - n); i < msgs.Count; i++)
+    {
+      string who = Try(() => msgs[i].User?.Name) ?? "(system)";
+      string txt = (Try(() => msgs[i].Text) ?? "").Trim();
+      Log($"    {who}: {txt}");
+    }
+  }
+
+  /// <summary>
+  /// SAFETY GUARDRAIL for a give: true ONLY if WE GIVE is EXACTLY one card whose
+  /// name matches <paramref name="cardName"/> (quantity == expectedQty) and
+  /// nothing else, and WE RECEIVE nothing. Never submit/approve a give that fails
+  /// this — it is what prevents ever handing over more than the one intended card.
+  /// </summary>
+  public bool VerifyGiveIsOnly(TradeEscrow esc, string cardName, int expectedQty = 1)
+  {
+    var give = new List<(string name, int qty)>();
+    try
+    {
+      foreach (var it in esc.TradedItems.CollectionItems)
+        give.Add((Try(() => it.Card?.Name) ?? "?", Try(() => (int)it.Quantity) ?? 0));
+    }
+    catch (Exception ex) { Log($"[guardrail] could not read WE GIVE: {ex.Message}"); return false; }
+
+    int recvCount = 0;
+    try { recvCount = esc.PartnerTradedItems.CollectionItems.Count; } catch { }
+
+    bool nameOk = give.Count == 1 && give[0].qty == expectedQty
+               && (give[0].name?.ToLowerInvariant().Contains(cardName.ToLowerInvariant()) ?? false);
+    bool ok = nameOk && recvCount == 0;
+    Log($"[guardrail] WE GIVE = {(give.Count == 0 ? "(none)" : string.Join(", ", give.Select(g => $"{g.qty}x {g.name}")))}; WE RECEIVE items = {recvCount} => {(ok ? "OK (exactly the target, receiving nothing)" : "REJECT")}");
+    return ok;
+  }
+
+  /// <summary>
+  /// Create (or reuse) a trade binder named <paramref name="binderName"/>
+  /// containing only <paramref name="cardName"/>, so a lend trade can present just
+  /// that one card. Operates entirely on THIS (the bot's) account. Returns the
+  /// Binder, or null on failure.
+  ///
+  /// Uses ICollectionGroupingManager.CreateNewBinder(name, image, IEnumerable&lt;ICardDefinition&gt;).
+  /// Two things the diver needs (both handled here): ICardDefinition's real name is
+  /// WotC.MtGO.Client.Model.ICardDefinition (NOT ...Collection.*), and the remote
+  /// List&lt;ICardDefinition&gt; must be built with an ASSEMBLY-QUALIFIED type-arg
+  /// (List`1[[Inner, Asm]]) or the diver's ResolveType can't find it.
+  /// </summary>
+  public MTGOSDK.API.Collection.Binder? CreateSingleCardBinder(string binderName, string cardName)
+    => CreateBinder(binderName, new[] { cardName });
+
+  /// <summary>
+  /// Create (or reuse) a trade binder named <paramref name="binderName"/>
+  /// containing one of each of <paramref name="cardNames"/> (quantity 1 each).
+  /// Operates entirely on THIS (the bot's) account. Returns the Binder, or null.
+  /// </summary>
+  public MTGOSDK.API.Collection.Binder? CreateBinder(string binderName, System.Collections.Generic.IReadOnlyList<string> cardNames)
+  {
+    var existing = MTGOSDK.API.Collection.CollectionManager.Binders
+      .FirstOrDefault(b => string.Equals(Try(() => b.Name) ?? "", binderName, StringComparison.OrdinalIgnoreCase));
+    if (existing != null)
+    {
+      Log($"[binder] found existing '{binderName}' (id={Try(() => existing.Id)}, items={Try(() => existing.ItemCount)}).");
+      return existing;
+    }
+
+    // Resolve each card name to its underlying ICardDefinition (skip unresolved).
+    var defs = new List<dynamic>();
+    foreach (var cn in cardNames)
+    {
+      dynamic d = null;
+      try { d = Unbind(MTGOSDK.API.Collection.CollectionManager.GetCard(cn)); }
+      catch (Exception ex) { Log($"[binder] could not resolve '{cn}' — skipping ({ex.Message.Split('\n')[0]})"); }
+      if (d != null) { defs.Add(d); Log($"[binder] resolved '{cn}'."); }
+    }
+    if (defs.Count == 0) { Log("[binder] no cards resolved — aborting."); return null; }
+
+    try
+    {
+      // Build List<ICardDefinition> remotely. The diver's type resolver only
+      // constructs a cross-assembly generic if the type-arg is ASSEMBLY-QUALIFIED
+      // (List`1[[Inner, Asm]]); a plain List`1[Inner] fails.
+      string asmName = Try(() => RemoteClient.GetInstanceType(ICardDefinition).Assembly.GetName().Name)
+                       ?? "WotC.MtGO.Client.Model";
+      string listType = $"System.Collections.Generic.List`1[[{ICardDefinition}, {asmName}]]";
+      dynamic list = RemoteClient.CreateInstance(listType);
+      foreach (var d in defs) list.Add(d);
+      dynamic mgr = Unbind((object)ObjectProvider.Get(IGroupingManager, true, false, false));
+      OnUI(() => mgr.CreateNewBinder(binderName, null, list));
+      Log($"[binder] CreateNewBinder('{binderName}') with {defs.Count} card(s).");
+    }
+    catch (Exception ex)
+    {
+      var inner = ex.InnerException;
+      Log($"[binder] CreateNewBinder failed: {ex.GetType().Name}: {ex.Message}" +
+          (inner != null ? $" || inner: {inner.GetType().Name}: {inner.Message}" : ""));
+      return null;
+    }
+
+    System.Threading.Thread.Sleep(1500);
+    var created = MTGOSDK.API.Collection.CollectionManager.Binders
+      .FirstOrDefault(b => string.Equals(Try(() => b.Name) ?? "", binderName, StringComparison.OrdinalIgnoreCase));
+    if (created is null) { Log($"[binder] created but not found on re-scan (give it a moment)."); return null; }
+    Log($"[binder] created '{created.Name}' (id={Try(() => created.Id)}, items={Try(() => created.ItemCount)}).");
+    return created;
+  }
+
+  /// <summary>
+  /// Delete a trade binder by name from THIS (the bot's) account.
+  /// Uses the concrete CollectionGroupingManager.DeleteGrouping(ICardGrouping, syncOnline:true)
+  /// — the same instance/UI-thread path as CreateNewBinder. Returns true if the
+  /// binder is gone afterward (also true if it never existed).
+  /// </summary>
+  public bool DeleteBinder(string binderName)
+  {
+    var target = MTGOSDK.API.Collection.CollectionManager.Binders
+      .FirstOrDefault(b => string.Equals(Try(() => b.Name) ?? "", binderName, StringComparison.OrdinalIgnoreCase));
+    if (target is null) { Log($"[binder] no binder named '{binderName}' — nothing to delete."); return true; }
+
+    int? id = Try(() => target.Id);
+    try
+    {
+      dynamic grouping = Unbind((object)target);
+      dynamic mgr = Unbind((object)ObjectProvider.Get(IGroupingManager, true, false, false));
+      OnUI(() => mgr.DeleteGrouping(grouping, true));
+      Log($"[binder] DeleteGrouping('{binderName}' id={id}) requested.");
+    }
+    catch (Exception ex)
+    {
+      var inner = ex.InnerException;
+      Log($"[binder] DeleteGrouping failed: {ex.GetType().Name}: {ex.Message}" +
+          (inner != null ? $" || inner: {inner.GetType().Name}: {inner.Message}" : ""));
+      return false;
+    }
+
+    System.Threading.Thread.Sleep(1500);
+    var still = MTGOSDK.API.Collection.CollectionManager.Binders
+      .FirstOrDefault(b => string.Equals(Try(() => b.Name) ?? "", binderName, StringComparison.OrdinalIgnoreCase));
+    if (still != null) { Log($"[binder] '{binderName}' still present after delete."); return false; }
+    Log($"[binder] '{binderName}' deleted.");
+    return true;
   }
 
   /// <summary>Summarize the view-model's requested ("you receive") list.</summary>
