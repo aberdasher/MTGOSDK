@@ -221,8 +221,16 @@
     </PropertyGroup>
     <ItemGroup>
       <_SDKPackagePaths Include="$(FeedPackagePath)\**\*.nupkg" />
+      <!-- Compute the package directory in its own metadata step first. MSBuild
+           does not recursively evaluate a property function nested directly as an
+           argument to another (it passes the inner call through as a literal),
+           which previously left VersionPath = "[System.IO.Path]::GetDirectoryName(...)"
+           and made the RemoveDir below throw PathTooLong. Split into two steps. -->
       <_SDKPackagePaths>
-        <VersionPath>$([System.IO.Path]::GetRelativePath('$(FeedOutputPath)', [System.IO.Path]::GetDirectoryName('%(Identity)')))</VersionPath>
+        <DirName>$([System.IO.Path]::GetDirectoryName('%(Identity)'))</DirName>
+      </_SDKPackagePaths>
+      <_SDKPackagePaths>
+        <VersionPath>$([System.IO.Path]::GetRelativePath('$(FeedOutputPath)', '%(DirName)'))</VersionPath>
       </_SDKPackagePaths>
       <_SDKPackagePaths>
         <Version>$([System.IO.Path]::GetFileName('%(VersionPath)'))</Version>

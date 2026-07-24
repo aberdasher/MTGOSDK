@@ -327,7 +327,13 @@ public sealed class TradeExecutor : IDisposable
   /// permissionCode, quantity, annotation) and dispatches SendTradeItemUpdateAction.
   /// Non-committing (negotiation only). Returns a short summary of the result.
   /// </summary>
-  public void TakeCard(TradeEscrow esc, int catId, int qty, int permissionCode = 0)
+  /// <remarks>
+  /// permissionCode defaults to 215 — the standard default permission code for a
+  /// tradeable digital object (see Deck.cs, which builds items with permission
+  /// code 215 and annotation 0). Sending 0 makes the trade server reject the
+  /// item update and close the trade with FinalState=ErrorReceived.
+  /// </remarks>
+  public void TakeCard(TradeEscrow esc, int catId, int qty, int permissionCode = 215)
   {
     dynamic annotation = RemoteClient.CreateEnum(AnnotationEnum, "NotSet");
     dynamic itemsArray = RemoteClient.CreateArray(
