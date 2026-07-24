@@ -47,6 +47,18 @@ public sealed class TradeExecutor : IDisposable
   const string A_FinalApprove = ActionsNs + ".SendFlsEscrowFinalApproveReqAction";
   const string A_Cancel       = ActionsNs + ".SendDosEscrowCancelReqAction";
 
+  // MTGO's own trade-window view-model (Shiny.Trade). Requesting a partner card
+  // through THIS builds the item-update message (permission code etc.) via the
+  // client's own logic, instead of us synthesizing a CollectionItem and guessing
+  // the permission code (which the trade server rejects with ErrorReceived).
+  const string ActiveTradeVM  = "Shiny.Trade.ViewModels.ActiveTradeViewModel";
+
+  // File-import types used by MTGO's own "import a wishlist into the trade" flow.
+  // Building an IFileImportCardGrouping of desired cards and matching it against
+  // the partner's binder is a BATCH request path (adds all matched cards at once).
+  const string FileImportGrouping = "WotC.MtGO.Client.Model.Core.FileImport.FileImportCardGrouping";
+  const string FileImportCard     = "WotC.MtGO.Client.Model.Core.FileImport.FileImportCard";
+
   /// <summary>THE safety gate. Leave false for all validation runs.</summary>
   public bool AllowCommit { get; init; } = false;
 
@@ -345,6 +357,160 @@ public sealed class TradeExecutor : IDisposable
     try { OnUI(() => ProcessAction(remote, A_ItemUpdate, action)); }
     catch (Exception ex) { Log($"[trade] takecard: tolerated downstream UI warning ({ex.Message.Split('\n')[0]})"); }
     Log($"[trade] item update dispatched: request catId={catId} x{qty} (perm={permissionCode})");
+  }
+
+  /// <summary>
+  /// Request a partner's card by catalog id through MTGO's OWN trade view-model,
+  /// so the item-update message is built by the client (correct permission code),
+  /// not synthesized by us. This is the reliable "take a partner item" path:
+  /// hand-built CollectionItems get rejected (ErrorReceived) because their
+  /// permission code doesn't match the real object.
+  /// </summary>
+  /// <remarks>
+  /// Reaches the live <c>ActiveTradeViewModel</c> off the client HEAP (it's a
+  /// per-trade instance, not a registered service), then, on the UI thread:
+  ///   item = vm.GetTradeItemUpdateMessage(catalogId)   // client builds the CollectionItem
+  ///   vm.AddPendingUpdateItem(item, quantity)          // stage the requested item
+  ///   vm.SendPendingItems()                            // dispatch the request
+  /// Non-committing (negotiation only). Throws if no trade view-model is live.
+  /// </remarks>
+  /// <summary>
+  /// Reach the live <c>ActiveTradeViewModel</c> off the client heap. There may be
+  /// STALE instances from earlier trades this session (so the singular lookup
+  /// throws "Multiple objects found"); enumerate all and pick the one bound to the
+  /// LIVE trade — matching the current partner name and a non-terminal state.
+  /// </summary>
+  static dynamic GetLiveTradeVM()
+  {
+    string partner = null;
+    try { partner = TradeManager.CurrentTrade?.TradePartnerName; } catch { }
+
+    dynamic vm = null, firstNameMatch = null;
+    int scanned = 0;
+    try
+    {
+      foreach (var cand in RemoteClient.GetInstances(ActiveTradeVM))
+      {
+        scanned++;
+        dynamic c = Unbind((object)cand);
+        string cn = Try(() => (string)c.CurrentTradeUserName) ?? "";
+        string est = Try(() => (string)c.CurrentTradeEscrow.CurrentState.ToString()) ?? "";
+        bool nameOk = partner is null || string.Equals(cn, partner, StringComparison.OrdinalIgnoreCase);
+        bool live = est.StartsWith("Negotiate") || est.StartsWith("Approval") || est.StartsWith("Invite");
+        if (nameOk && live) { vm = c; break; }
+        if (firstNameMatch is null && nameOk) firstNameMatch = c;
+      }
+    }
+    catch (Exception ex)
+    {
+      throw new InvalidOperationException(
+        $"Could not enumerate {ActiveTradeVM} on the heap (is a trade window open?): {ex.Message}", ex);
+    }
+    vm ??= firstNameMatch;
+    if (vm is null)
+      throw new InvalidOperationException(
+        $"No live {ActiveTradeVM} found (scanned {scanned}) — open a trade first.");
+    Log($"[trade] reached ActiveTradeViewModel (partner={Try(() => (string)vm.CurrentTradeUserName) ?? "?"}, scanned {scanned})");
+    return vm;
+  }
+
+  /// <summary>
+  /// BATCH request via MTGO's wishlist/import flow: build an IFileImportCardGrouping
+  /// of desired cards and match it against the partner's binder
+  /// (ActiveTradeViewModel.MatchDesiredCardsFromPartnersTradeBinder). This mirrors
+  /// "import a list -> add all matches to the trade". Returns the requested list.
+  /// </summary>
+  public string RequestViaWishlist(int catalogId, int quantity, string cardName)
+  {
+    dynamic vm = GetLiveTradeVM();
+    Log($"[wishlist] requesting catId={catalogId} x{quantity} ({cardName}) via import/match");
+
+    int matched = -1;
+    try
+    {
+      OnUI(() =>
+      {
+        dynamic grouping = RemoteClient.CreateInstance(FileImportGrouping);
+        dynamic card = RemoteClient.CreateInstance(FileImportCard);
+        card.CatalogId = catalogId;
+        card.Quantity = quantity;
+        if (!string.IsNullOrEmpty(cardName)) card.CardName = cardName;
+        grouping.Cards.Add(card);
+        dynamic result = vm.MatchDesiredCardsFromPartnersTradeBinder(grouping);
+        matched = Try(() => (int)result.Count) ?? -1;
+        // Some paths only build the match list; ensure it's applied + sent.
+        try { vm.SendPendingItems(); } catch { }
+      });
+    }
+    catch (Exception ex) { Log($"[wishlist] tolerated downstream warning ({ex.Message.Split('\n')[0]})"); }
+    Log($"[wishlist] MatchDesiredCardsFromPartnersTradeBinder matched {matched} card(s)");
+
+    System.Threading.Thread.Sleep(1500);
+    string requested = ReadRequestedItems(vm);
+    Log($"[wishlist] you-receive (ItemsLocalUserWants) now: {requested}");
+    return requested;
+  }
+
+  /// <summary>
+  /// Submit my (empty) deposit proposal via the view-model's Submit command
+  /// (NegotiateNoDeposit -> DepositSubmittedLocal). Reversible before the final
+  /// approve (you can still Modify/Cancel), so this is NON-committing.
+  /// </summary>
+  public void SubmitDeposit()
+  {
+    dynamic vm = GetLiveTradeVM();
+    bool can = false;
+    OnUI(() =>
+    {
+      can = Try<bool>(() => (bool)vm.SubmitTradeCanExecute());
+      if (can) vm.SubmitTradeExecute();
+    });
+    Log($"[trade] deposit submit: {(can ? "SubmitTradeExecute dispatched" : "SubmitTradeCanExecute=false — skipped")}.");
+  }
+
+  /// <summary>
+  /// THE COMMITTING CALL: final approve via the view-model's Confirm command
+  /// (ApprovalNone -> ApprovalSubmittedLocal -> ... -> TradeComplete). Point of no
+  /// return — gated by AllowCommit; throws in dry-run so nothing commits by accident.
+  /// </summary>
+  public void ConfirmTrade()
+  {
+    if (!AllowCommit)
+      throw new InvalidOperationException(
+        "ConfirmTrade BLOCKED: AllowCommit is false (dry-run). No assets moved.");
+    dynamic vm = GetLiveTradeVM();
+    bool can = false;
+    OnUI(() =>
+    {
+      can = Try<bool>(() => (bool)vm.ConfirmTradeCanExecute());
+      if (can) vm.ConfirmTradeExecute();
+    });
+    Log($"[trade] FINAL APPROVE: {(can ? "ConfirmTradeExecute dispatched — COMMIT" : "ConfirmTradeCanExecute=false — skipped")}.");
+  }
+
+  /// <summary>Summarize the view-model's requested ("you receive") list.</summary>
+  static string ReadRequestedItems(dynamic vm)
+  {
+    try
+    {
+      dynamic wants = vm.ItemsLocalUserWants;
+      var names = new List<string>();
+      try
+      {
+        foreach (var it in Map<dynamic>(wants.Items))
+        {
+          int? q = Try(() => (int?)it.Quantity);
+          int? cid = Try(() => (int?)it.CatalogId);
+          string nm = Try(() => (string)it.Name);
+          names.Add($"{q}x {(string.IsNullOrEmpty(nm) ? $"catId={cid}" : nm)}");
+        }
+      }
+      catch { }
+      if (names.Count > 0) return string.Join(", ", names);
+      int n = Try(() => (int)wants.ItemCount);
+      return n > 0 ? $"{n} item(s)" : "(none)";
+    }
+    catch (Exception ex) { return $"<read failed: {ex.Message.Split('\n')[0]}>"; }
   }
 
   /// <summary>Human-readable summary of what each side has staged in the escrow.</summary>

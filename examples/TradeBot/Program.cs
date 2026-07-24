@@ -195,21 +195,22 @@ static void StageAndHold(TradeBot.TradeExecutor exec, MTGOSDK.API.Trade.TradeEsc
     try { catId = match.Id; } catch { }
     try { cname = match.Card?.Name ?? "?"; } catch { }
     try { avail = match.Quantity; } catch { }
-    Line($"\nFound {avail}x {cname} (catId={catId}). Staging 1 into the trade...");
-    exec.TakeCard(esc, catId, 1);
+    Line($"\nFound {avail}x {cname} (catId={catId}). Requesting via wishlist import (autonomous)...");
+    string requested = exec.RequestViaWishlist(catId, 1, cname);
     System.Threading.Thread.Sleep(3000);
     var e2 = MTGOSDK.API.Trade.TradeManager.CurrentTrade;
     if (e2 != null)
     {
       Line($"state={e2.State}");
-      try { Line($"  WE RECEIVE: {TradeBot.TradeExecutor.Summarize(e2.PartnerTradedItems)}"); } catch (Exception ex) { Line($"  (receive read failed: {ex.Message})"); }
-      try { Line($"  WE GIVE:    {TradeBot.TradeExecutor.Summarize(e2.TradedItems)}"); } catch { }
+      Line($"  YOU RECEIVE (requested): {requested}");
+      try { Line($"  bot deposited:  {TradeBot.TradeExecutor.Summarize(e2.PartnerTradedItems)}"); } catch (Exception ex) { Line($"  (receive read failed: {ex.Message})"); }
+      try { Line($"  WE GIVE:        {TradeBot.TradeExecutor.Summarize(e2.TradedItems)}"); } catch { }
     }
   }
 
   // HOLD the session open (bot stays attached, keeping the trade alive) while
-  // YOU review and click Submit. The bot never commits.
-  Line("\n>>> Review the trade window and click SUBMIT to complete it. <<<");
+  // YOU review and click Submit/Confirm. The bot never commits.
+  Line("\n>>> Card requested autonomously. Review the trade window and click SUBMIT + CONFIRM to complete it. <<<");
   Line("    Bot is holding the session open and will NOT commit. Waiting up to 180s...\n");
   for (int i = 0; i < 180; i++)
   {
@@ -230,8 +231,14 @@ bool yes = args.Contains("--yes");
 bool attachOnly = args.Contains("--attach-only");
 string arg1 = args.Skip(1).FirstOrDefault(a => !a.StartsWith("--")) ?? "";
 
+// The ONLY place a commit (final approve) can happen: the autofullgrab mode with
+// an explicit --commit flag. Everything else stays hard-off (AllowCommit=false),
+// so no other mode can ever move assets even if --commit is passed.
+bool allowCommit = mode == "autofullgrab" && args.Contains("--commit");
+
 Line("=== MTGOSDK TradeBot prototype ===");
-Line($"mode={mode}  allowCommit=false (hard-coded off)\n");
+Line($"mode={mode}  allowCommit={allowCommit.ToString().ToLowerInvariant()}" +
+     (allowCommit ? "  *** WILL COMMIT (final approve) — acquiring a FREE card ***" : "  (no commit)") + "\n");
 
 // Ledger view needs no MTGO connection.
 if (mode == "ledger")
@@ -273,7 +280,7 @@ try
 catch (Exception ex) { Line($"Failed to connect to MTGO: {ex.GetType().Name}: {ex.Message}"); Environment.Exit(1); return; }
 
 using (client)
-using (var exec = new TradeExecutor { AllowCommit = false })
+using (var exec = new TradeExecutor { AllowCommit = allowCommit })
 {
   // Determine the client's TRUE login state before deciding whether to log in.
   //
@@ -855,15 +862,206 @@ using (var exec = new TradeExecutor { AllowCommit = false })
       break;
     }
 
+    case "stagetest":
+    {
+      // CONTROLLED TEST of autonomous card-select (TakeCard ->
+      // SendTradeItemUpdateAction). Initiates a trade with an OPEN bot, reaches
+      // negotiation, stages ONE partner card via TakeCard, checks whether it
+      // landed (WE RECEIVE non-empty, still in Negotiate, CurrentTrade intact)
+      // WITHOUT corrupting the trade UI, then AUTO-CANCELS. Non-committing.
+      // This exercises the diver's ForceUIThread -> Application.Current.Dispatcher
+      // marshaling for a non-DispatcherObject target (the escrow) — the exact
+      // path that previously corrupted the DataGrid on the wrong thread.
+      if (arg1.Length == 0) { Line("Usage: stagetest <bot> [cardname] --yes"); break; }
+      if (!yes) { Line($"Refusing: initiates a real trade with '{arg1}', stages a card via TakeCard (non-committing), then cancels. Re-run with --yes."); break; }
+      string wantCard = args.Skip(2).FirstOrDefault(a => !a.StartsWith("--")) ?? "";
+
+      exec.Attach();
+      bool staged = false;
+      try
+      {
+        var esc = TryReachNegotiation(exec, arg1);
+        if (esc is null) { Line("Did not reach negotiation (bot busy/declined). Try an open bot (see poolstatus)."); break; }
+        Line($"\nReached negotiation with {esc.TradePartnerName} (state={esc.State}).");
+
+        System.Collections.Generic.List<MTGOSDK.API.Collection.CardQuantityPair> items;
+        try { items = esc.PartnerCollection.CollectionItems; }
+        catch (Exception ex) { Line($"PartnerCollection read failed: {ex.Message}"); break; }
+
+        MTGOSDK.API.Collection.CardQuantityPair? match = null;
+        foreach (var it in items)
+        {
+          string nm; try { nm = it.Card?.Name ?? ""; } catch { nm = ""; }
+          if (wantCard.Length == 0 || nm.ToLowerInvariant().Contains(wantCard.ToLowerInvariant())) { match = it; break; }
+        }
+        if (match is null) { Line($"No card to stage (partner offers {items.Count} stack(s); no match for '{wantCard}')."); }
+        else
+        {
+          int catId = -1; string cn = "?";
+          try { catId = match.Id; } catch { }
+          try { cn = match.Card?.Name ?? "?"; } catch { }
+          Line($"Requesting 1x {cn} (catId={catId}) via wishlist import (autonomous)...");
+          string requested = exec.RequestViaWishlist(catId, 1, cn);
+          System.Threading.Thread.Sleep(2000);
+
+          var e2 = MTGOSDK.API.Trade.TradeManager.CurrentTrade;
+          if (e2 is null)
+          {
+            Line("!! CurrentTrade went NULL after request — trade was rejected/closed (the old ErrorReceived mode).");
+          }
+          else
+          {
+            string st = "?"; try { st = e2.State.ToString(); } catch { }
+            string dep = "?"; try { dep = TradeBot.TradeExecutor.Summarize(e2.PartnerTradedItems); } catch (Exception ex) { dep = $"<read failed: {ex.Message}>"; }
+            Line($"  state={st}");
+            Line($"  YOU RECEIVE (requested list): {requested}");
+            Line($"  partner-deposited so far:    {dep}");
+            bool alive = st.StartsWith("Negotiate") || st.StartsWith("Approval");
+            bool gotItem = requested != "(none)" && !requested.StartsWith("<");
+            if (alive && gotItem)
+            {
+              Line("  ✅ REQUEST ACCEPTED — card is in the you-receive list and the trade is alive (no ErrorReceived).");
+              staged = true;
+            }
+            else if (alive)
+            {
+              Line("  ⚠ Trade alive but requested list empty — the request may not have applied (inspect above).");
+            }
+            else
+            {
+              Line("  ⚠ Trade left negotiation unexpectedly — inspect above.");
+            }
+          }
+        }
+      }
+      catch (Exception ex) { Line($"stagetest threw: {ex.Message.Split('\n')[0]}"); }
+      finally
+      {
+        Line("\nCleaning up (auto-cancel — no commit)...");
+        exec.CancelCurrent();
+        if (!WaitForNoTrade()) Line("  (warning: escrow didn't clear — MTGO may need a restart)");
+        MTGOSDK.API.Trade.TradeEscrow? f = null;
+        try { f = MTGOSDK.API.Trade.TradeManager.CurrentTrade; } catch { }
+        Line($"Final: CurrentTrade={(f is null ? "<none — CLEARED OK>" : f.State + " (NOT cleared)")}");
+        Line(staged
+          ? "\nRESULT: ✅ Card requested via ActiveTradeViewModel and staged into WE RECEIVE — autonomous card-select works."
+          : "\nRESULT: ⚠ Request did not cleanly stage — see above.");
+      }
+      break;
+    }
+
+    case "autofullgrab":
+    {
+      // FULLY AUTONOMOUS grab, end to end: detect -> initiate -> advance ->
+      // negotiate -> request card via wishlist import -> submit my (empty)
+      // deposit -> reach approval-ready. WITHOUT --commit it stops there and
+      // cancels (validates the whole flow, moves nothing). WITH --commit it sends
+      // the final approve and completes the trade. WE GIVE is always (none) — a
+      // free-card grab. Must be a COLD START or an attached, logged-in client.
+      string bot = arg1;
+      string card = args.Skip(2).FirstOrDefault(a => !a.StartsWith("--")) ?? "";
+      if (bot.Length == 0) { Line("Usage: autofullgrab <bot> [cardname] [--commit] --yes"); break; }
+      if (!yes) { Line($"Refusing: full autonomous grab from '{bot}'{(allowCommit ? " that WILL COMMIT (acquire a free card, give nothing)" : " (dry-run: stops before commit)")}. Re-run with --yes."); break; }
+
+      exec.Attach();
+      var esc = TryReachNegotiation(exec, bot);
+      if (esc is null) { Line("Did not reach negotiation (bot busy/declined) — try an open bot (poolstatus)."); break; }
+      Line($"\nNegotiating with {esc.TradePartnerName} (state={esc.State}).");
+
+      // 1) pick + request the card via the wishlist-import path
+      System.Collections.Generic.List<MTGOSDK.API.Collection.CardQuantityPair> items;
+      try { items = esc.PartnerCollection.CollectionItems; }
+      catch (Exception ex) { Line($"PartnerCollection read failed: {ex.Message}"); exec.CancelCurrent(); break; }
+      MTGOSDK.API.Collection.CardQuantityPair? match = null;
+      foreach (var it in items)
+      {
+        string nm; try { nm = it.Card?.Name ?? ""; } catch { nm = ""; }
+        if (card.Length == 0 || nm.ToLowerInvariant().Contains(card.ToLowerInvariant())) { match = it; break; }
+      }
+      if (match is null) { Line("No matching card in the bot's offer — aborting."); exec.CancelCurrent(); WaitForNoTrade(); break; }
+      int catId = -1; string cn = "?";
+      try { catId = match.Id; } catch { }
+      try { cn = match.Card?.Name ?? "?"; } catch { }
+      Line($"Requesting 1x {cn} (catId={catId}) via wishlist import...");
+      string requested = exec.RequestViaWishlist(catId, 1, cn);
+      if (requested == "(none)" || requested.StartsWith("<")) { Line("Request didn't stage — aborting."); exec.CancelCurrent(); WaitForNoTrade(); break; }
+
+      // 2) submit my (empty) deposit; retry SubmitDeposit until state advances
+      Line("Submitting my deposit (we give nothing)...");
+      bool submitted = false;
+      for (int i = 0; i < 10 && !submitted; i++)
+      {
+        exec.SubmitDeposit();
+        for (int j = 0; j < 4 && !submitted; j++)
+        {
+          System.Threading.Thread.Sleep(1000);
+          MTGOSDK.API.Trade.TradeEscrow? c = null; try { c = MTGOSDK.API.Trade.TradeManager.CurrentTrade; } catch { }
+          if (c is null) break;
+          string st = c.State.ToString();
+          if (st.Contains("Deposit") && (st.Contains("Submitted") || st.Contains("Received")) || st.StartsWith("Approval"))
+          { submitted = true; Line($"  deposit accepted (state={st})."); }
+        }
+      }
+
+      // 3) wait for approval-ready (both deposited)
+      string finalSt = "?"; bool approveReady = false;
+      for (int i = 0; i < 30 && !approveReady; i++)
+      {
+        MTGOSDK.API.Trade.TradeEscrow? c = null; try { c = MTGOSDK.API.Trade.TradeManager.CurrentTrade; } catch { }
+        if (c is null) { Line("Trade closed before approval."); break; }
+        finalSt = c.State.ToString();
+        if (i % 3 == 0) Line($"  t+{i,2}s state={finalSt}");
+        if (finalSt.StartsWith("Approval")) approveReady = true;
+        else System.Threading.Thread.Sleep(1000);
+      }
+      if (!approveReady) { Line("Did not reach approval-ready — cancelling (nothing moved)."); exec.CancelCurrent(); WaitForNoTrade(); break; }
+
+      try { Line($"  bot deposited: {TradeBot.TradeExecutor.Summarize(esc.PartnerTradedItems)}"); } catch { }
+      try { Line($"  WE GIVE:       {TradeBot.TradeExecutor.Summarize(esc.TradedItems)}"); } catch { }
+      Line($"\n>>> APPROVAL-READY (state={finalSt}) — deposits done; WE GIVE nothing. <<<");
+
+      // 4) commit, or (dry-run) stop + cancel
+      if (!allowCommit)
+      {
+        Line("[dry-run] No --commit → NOT approving. Cancelling (no assets moved)...");
+        try { exec.Cancel(esc); } catch (Exception ex) { Line($"(cancel threw: {ex.Message.Split('\n')[0]})"); }
+        WaitForNoTrade();
+        Line("\nDry-run OK. Re-run with `--commit --yes` to actually complete the grab.");
+        break;
+      }
+
+      Line("\n*** COMMITTING: sending final approve (ConfirmTrade) — acquiring the free card ***");
+      exec.ConfirmTrade();
+      for (int i = 0; i < 40; i++)
+      {
+        System.Threading.Thread.Sleep(1000);
+        MTGOSDK.API.Trade.TradeEscrow? c = null; try { c = MTGOSDK.API.Trade.TradeManager.CurrentTrade; } catch { }
+        if (c is null) { Line("Trade complete/closed — client is clear."); break; }
+        string st = c.State.ToString();
+        if (i % 3 == 0) Line($"  t+{i,2}s state={st}");
+        if (st == "Closed") { Line("Trade closed."); break; }
+      }
+      Line("\nAcquisition ledger (latest):");
+      var lp2 = TradeBot.TradeExecutor.LedgerPath;
+      if (System.IO.File.Exists(lp2))
+        foreach (var l in System.IO.File.ReadAllLines(lp2).Reverse().Take(1)) Line("  " + l);
+      else Line("  (no ledger entry written)");
+      break;
+    }
+
     default:
       Line($"Unknown mode '{mode}'. Use:");
       Line("  read-only : probe | find [kw] | watch | botstatus <bot> | poolstatus [--bots=a,b,c]");
       Line("              readcurrent [card] | readchat | ledger");
       Line("  acquire   : autograb <bot> <card> --yes | poolgrab <card> [--bots=a,b,c] --yes");
+      Line("  full-auto : autofullgrab <bot> [card] --yes         (request->deposit->approval-ready; add --commit to complete)");
       Line("  low-level : opentrade <bot> --yes | takecard <card> --yes | grab <bot> --yes | invite <user> --yes");
+      Line("  test      : stagetest <bot> [card] --yes  (controlled TakeCard test: stage -> observe -> cancel)");
       Line("  outward   : post \"<msg>\" --yes | clearpost --yes");
       break;
   }
 
-  Line("\nDone. (AllowCommit was false the entire run — no trade was committed.)");
+  Line(allowCommit
+    ? "\nDone. (AllowCommit was TRUE for this run — a final approve was authorized.)"
+    : "\nDone. (AllowCommit was false the entire run — no trade was committed.)");
 }
