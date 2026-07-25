@@ -777,6 +777,52 @@ public sealed class TradeExecutor : IDisposable
   }
 
   /// <summary>
+  /// Status of a multi-card GIVE vs the intended set: what the partner still needs
+  /// to grab (<c>missing</c>), what they grabbed that they SHOULDN'T (<c>extra</c>),
+  /// and whether WE GIVE is EXACTLY the intended set with nothing received
+  /// (<c>exact</c>). Used to remind the partner what's left to grab, and as the
+  /// give-side guardrail for a set. Read-only.
+  /// </summary>
+  public (List<string> missing, List<string> extra, bool exact) GiveStatus(
+      TradeEscrow esc, IReadOnlyList<(string name, int qty)> intended)
+  {
+    var give = new List<(string name, int qty)>();
+    try { foreach (var it in esc.TradedItems.CollectionItems) give.Add((Try(() => it.Card?.Name) ?? "?", Try(() => (int)it.Quantity) ?? 0)); }
+    catch { return (intended.Select(w => w.qty > 1 ? $"{w.qty}x {w.name}" : w.name).ToList(), new(), false); }
+
+    int recvCount = 0;
+    try { recvCount = esc.PartnerTradedItems.CollectionItems.Count; } catch { }
+
+    var missing = new List<string>();
+    foreach (var want in intended)
+    {
+      int got = give.Where(g => (g.name ?? "").IndexOf(want.name, StringComparison.OrdinalIgnoreCase) >= 0).Sum(g => g.qty);
+      if (got < want.qty) { int short_ = want.qty - got; missing.Add(short_ > 1 ? $"{short_}x {want.name}" : want.name); }
+    }
+    var extra = new List<string>();
+    foreach (var g in give)
+    {
+      var match = intended.FirstOrDefault(w => (g.name ?? "").IndexOf(w.name, StringComparison.OrdinalIgnoreCase) >= 0);
+      int allowed = match.name != null ? match.qty : 0;
+      if (g.qty > allowed) { int over = g.qty - allowed; extra.Add($"{over}x {g.name}"); }
+    }
+    bool exact = missing.Count == 0 && extra.Count == 0 && recvCount == 0;
+    return (missing, extra, exact);
+  }
+
+  /// <summary>True if the trade partner (the OTHER party) has SUBMITTED their
+  /// deposit — MTGO signals this in the escrow state ("...DepositReceivedOther" /
+  /// "...DepositSubmittedOther" / "...DepositReceivedBoth"). Lets us catch a partner
+  /// who hit Submit before finishing their grab. Read-only.</summary>
+  public static bool PartnerHasSubmitted(TradeEscrow esc)
+  {
+    string s = ""; try { s = esc.State.ToString(); } catch { return false; }
+    return s.IndexOf("DepositReceivedOther", StringComparison.OrdinalIgnoreCase) >= 0
+        || s.IndexOf("DepositSubmittedOther", StringComparison.OrdinalIgnoreCase) >= 0
+        || s.IndexOf("DepositReceivedBoth", StringComparison.OrdinalIgnoreCase) >= 0;
+  }
+
+  /// <summary>
   /// SAFETY GUARDRAIL for a two-sided SWAP: true ONLY if WE GIVE is EXACTLY
   /// {<paramref name="giveQty"/> x <paramref name="giveCard"/>} and WE RECEIVE is
   /// EXACTLY {<paramref name="getQty"/> x <paramref name="getCard"/>} — nothing

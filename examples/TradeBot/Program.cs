@@ -1387,6 +1387,21 @@ using (var exec = new TradeExecutor { AllowCommit = allowCommit })
       break;
     }
 
+    case "collection":
+    {
+      // READ-ONLY: list owned cards (name x total qty) — to pick cards to lend/test.
+      // Usage: collection [filter-substring]
+      string filter = arg1;
+      exec.Attach();
+      var col = MTGOSDK.API.Collection.CollectionManager.Collection;
+      var byName = new System.Collections.Generic.Dictionary<string, int>();
+      try { foreach (var it in col.Items) { string nm = it.Card?.Name ?? "?"; int q = it.Quantity; if (q <= 0) continue; if (filter.Length > 0 && nm.IndexOf(filter, StringComparison.OrdinalIgnoreCase) < 0) continue; byName[nm] = (byName.TryGetValue(nm, out var v) ? v : 0) + q; } }
+      catch (Exception ex) { Line($"collection read failed: {ex.Message.Split('\n')[0]}"); break; }
+      Line($"Owned distinct items: {byName.Count}{(filter.Length > 0 ? $" (filter '{filter}')" : "")}. Top 60 by quantity:");
+      foreach (var kv in byName.OrderByDescending(k => k.Value).ThenBy(k => k.Key).Take(60)) Line($"  {kv.Value,4}x  {kv.Key}");
+      break;
+    }
+
     case "lendinvite":
     {
       // ATTEMPT the give-side SETUP only: DM the recipient, then initiate a trade
@@ -1460,58 +1475,91 @@ using (var exec = new TradeExecutor { AllowCommit = allowCommit })
 
     case "lend":
     {
-      // TARGETED LEND (custodian / GIVE side) — UNTESTED end to end (needs a
-      // recipient online). Flow: DM recipient "Ready for <card>? Reply YES" →
-      // wait for yes → initiate a trade → they grab <card> from our offer →
-      // GUARDRAIL: WE GIVE == exactly {<card> x1} and we receive nothing → submit
-      // our deposit → final approve (autonomous, gated by --commit) → DM done.
-      // Aborts + cancels on ANY mismatch, so we can never hand over more than the
-      // one intended card. WE only ever give that card.
+      // TARGETED LEND (custodian / GIVE side). Flow: DM "Ready for <cards>? Reply
+      // YES" → wait for yes → initiate + present the Lending binder → they grab the
+      // card(s) from our offer. NEW: if they hit SUBMIT before grabbing everything,
+      // DM them the still-un-grabbed cards and DON'T approve until they have them
+      // all. GUARDRAIL: WE GIVE == EXACTLY the intended set, receive nothing — cancel
+      // on anything extra. Final approve is autonomous, gated by --commit.
+      // Usage: lend <recipient> [card] [--cards="A,B,C"] [--commit] --yes
       string recipient = arg1;
-      string card = args.Skip(2).FirstOrDefault(a => !a.StartsWith("--")) ?? "Azimaet Drake";
-      if (recipient.Length == 0) { Line("Usage: lend <recipient> [cardname] [--commit] --yes"); break; }
-      if (!yes) { Line($"Refusing: DMs '{recipient}', opens a trade, and GIVES '{card}'{(allowCommit ? " (WILL COMMIT the give)" : " (dry-run: stops before commit)")}. Re-run with --yes."); break; }
-      Line($"Lending '{card}' to {recipient}." + (allowCommit ? "  *** WILL COMMIT ***" : "  [dry-run: reaches approval-ready then cancels — gives nothing]"));
+      var cardsFlag = args.FirstOrDefault(a => a.StartsWith("--cards=", StringComparison.OrdinalIgnoreCase));
+      var giveCards = cardsFlag != null
+        ? cardsFlag.Substring("--cards=".Length).Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).ToList()
+        : new System.Collections.Generic.List<string> { args.Skip(2).FirstOrDefault(a => !a.StartsWith("--")) ?? "Azimaet Drake" };
+      var intended = giveCards.Select(n => (name: n, qty: 1)).ToList();
+      string cardList = string.Join(", ", giveCards);
+      if (recipient.Length == 0) { Line("Usage: lend <recipient> [card] [--cards=\"A,B,C\"] [--commit] --yes"); break; }
+      if (giveCards.Count == 0) { Line("Nothing to lend — give a card or --cards=\"...\"."); break; }
+      if (!yes) { Line($"Refusing: DMs '{recipient}', opens a trade, and GIVES [{cardList}]{(allowCommit ? " (WILL COMMIT the give)" : " (dry-run: stops before commit)")}. Re-run with --yes."); break; }
+      Line($"Lending [{cardList}] to {recipient}." + (allowCommit ? "  *** WILL COMMIT ***" : "  [dry-run: reaches approval-ready then cancels — gives nothing]"));
 
       exec.Attach();
 
-      // 0) ensure the dedicated single-card "Lending" binder exists (presents only
-      //    this card). Selecting it for the trade is still TODO (needs a recipient
-      //    to validate); the guardrail is what enforces giving only this card.
-      var lendBinder = exec.CreateSingleCardBinder("Lending", card);
+      // 0) ensure the "Lending" binder holds ALL the cards to give (owned printings).
+      var lendBinder = exec.CreateBinder("Lending", giveCards);
       if (lendBinder != null) Line($"Lending binder ready: '{lendBinder.Name}' (id={lendBinder.Id}, items={lendBinder.ItemCount}).");
 
       // 1+2) standardized handshake: DM "reply YES", wait for it, THEN initiate +
       //       present the Lending binder (no accept-race — see HandshakeThenInitiate).
       var esc = HandshakeThenInitiate(exec, recipient,
-        $"Ready for {card}? Reply YES and I'll send you a trade — then just accept it and grab the {card} from my offer.",
+        $"Ready for [{cardList}]? Reply YES and I'll send you a trade — then accept it and grab {(giveCards.Count == 1 ? "the card" : $"all {giveCards.Count} cards")} from my offer.",
         presentBinder: "Lending");
       if (esc is null)
       {
         try { exec.SendDM(recipient, "Couldn't open the trade — reply YES when you're ready and I'll retry."); } catch { }
         break;
       }
-      Line($"\nTrade open with {esc.TradePartnerName}. Waiting for them to grab exactly '{card}'...");
+      Line($"\nTrade open with {esc.TradePartnerName}. They should grab: {cardList}.");
 
-      // 3) wait until WE GIVE == exactly the target card (their grab), nothing else
+      // 3) wait until WE GIVE == exactly the intended SET. If they hit SUBMIT before
+      //    grabbing everything, REMIND them what's still un-grabbed. If they grab
+      //    something not offered, cancel.
       bool ready = false;
-      for (int i = 0; i < 120 && !ready; i++)
+      string lastRemindKey = "";
+      for (int i = 0; i < 300 && !ready; i++)
       {
         System.Threading.Thread.Sleep(1000);
         var c = MTGOSDK.API.Trade.TradeManager.CurrentTrade;
-        if (c is null) { Line("Trade closed before they grabbed the card."); break; }
+        if (c is null) { Line("Trade closed before they finished grabbing."); esc = null; break; }
         esc = c;
-        if (exec.VerifyGiveIsOnly(c, card, 1)) ready = true;
-        else if (i % 10 == 0) Line($"  t+{i,3}s  WE GIVE: {TradeBot.TradeExecutor.Summarize(c.TradedItems)}");
+        var (missing, extra, exact) = exec.GiveStatus(c, intended);
+
+        if (extra.Count > 0)
+        {
+          Line($"They grabbed something not offered ({string.Join(", ", extra)}) — cancelling for safety.");
+          exec.CancelCurrent(); WaitForNoTrade();
+          try { exec.SendDM(recipient, $"Cancelled — you grabbed {string.Join(", ", extra)}, which isn't part of this lend. Please grab ONLY [{cardList}], then reply YES to retry."); } catch { }
+          esc = null; break;
+        }
+        if (exact) { ready = true; break; }
+
+        // THE REMINDER: they submitted their deposit but haven't grabbed everything.
+        if (missing.Count > 0 && TradeBot.TradeExecutor.PartnerHasSubmitted(c))
+        {
+          string key = string.Join("|", missing);
+          if (key != lastRemindKey)
+          {
+            lastRemindKey = key;
+            Line($"  [reminder] {recipient} submitted but still needs to grab: {string.Join(", ", missing)}");
+            try { exec.SendDM(recipient, $"Hold on — you submitted, but you still need to grab: {string.Join(", ", missing)}. Please grab {(missing.Count == 1 ? "it" : "them")} from my offer and submit again. I won't approve until you have everything."); } catch { }
+          }
+        }
+        else
+        {
+          if (!TradeBot.TradeExecutor.PartnerHasSubmitted(c)) lastRemindKey = "";   // reset so a fresh submit re-reminds
+          if (i % 10 == 0) Line($"  t+{i,3}s  WE GIVE: {TradeBot.TradeExecutor.Summarize(c.TradedItems)}  (still to grab: {(missing.Count == 0 ? "(none)" : string.Join(", ", missing))})");
+        }
       }
+      if (esc is null) break;
       if (!ready)
       {
-        Line("They didn't grab exactly the one card (or grabbed extra) — cancelling for safety.");
+        Line("They didn't grab the full set in time — cancelling.");
         exec.CancelCurrent(); WaitForNoTrade();
-        try { exec.SendDM(recipient, "Cancelled — please grab ONLY the offered card, then I'll retry."); } catch { }
+        try { exec.SendDM(recipient, $"Cancelled — didn't get all of [{cardList}] grabbed in time. Reply YES to retry."); } catch { }
         break;
       }
-      Line("GUARDRAIL passed: we give exactly the target card and receive nothing.");
+      Line("GUARDRAIL passed: we give exactly the intended set and receive nothing.");
 
       // 4) submit our deposit; wait for approval-ready
       exec.SubmitDeposit();
@@ -1520,15 +1568,16 @@ using (var exec = new TradeExecutor { AllowCommit = allowCommit })
       {
         System.Threading.Thread.Sleep(1000);
         var c = MTGOSDK.API.Trade.TradeManager.CurrentTrade;
-        if (c is null) { Line("Trade closed before approval."); break; }
+        if (c is null) { Line("Trade closed before approval."); esc = null; break; }
         st = c.State.ToString(); esc = c;
         if (i % 3 == 0) Line($"  t+{i,2}s state={st}");
         if (st.StartsWith("Approval")) approveReady = true;
       }
+      if (esc is null) break;
       if (!approveReady) { Line("Did not reach approval-ready — cancelling."); exec.CancelCurrent(); WaitForNoTrade(); break; }
 
       // 5) RE-VERIFY the guardrail right before committing (belt and suspenders)
-      if (!exec.VerifyGiveIsOnly(esc, card, 1))
+      if (!exec.GiveStatus(esc, intended).exact)
       {
         Line("GUARDRAIL re-check FAILED at approval — cancelling (gives nothing).");
         try { exec.Cancel(esc); } catch { } WaitForNoTrade();
@@ -1554,7 +1603,7 @@ using (var exec = new TradeExecutor { AllowCommit = allowCommit })
         if (i % 3 == 0) Line($"  t+{i,2}s state={c.State}");
         if (c.State == MTGOSDK.API.Trade.Enums.TradeState.Closed) break;
       }
-      try { exec.SendDM(recipient, $"Done — enjoy the {card}!"); } catch { }
+      try { exec.SendDM(recipient, $"Done — enjoy [{cardList}]!"); } catch { }
       Line("\nLedger (latest):");
       var lpl = TradeBot.TradeExecutor.LedgerPath;
       if (System.IO.File.Exists(lpl)) foreach (var l in System.IO.File.ReadAllLines(lpl).Reverse().Take(1)) Line("  " + l);
