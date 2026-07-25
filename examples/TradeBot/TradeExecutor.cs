@@ -83,6 +83,11 @@ public sealed class TradeExecutor : IDisposable
   private List<string> _lastGiven = new();
   private string? _lastPartner;
 
+  /// <summary>FinalState of the most recently CLOSED trade (e.g. "TradeComplete",
+  /// "OtherBusyTrading", "UserCanceledTrade"). Lets callers explain why an invite
+  /// bounced. Null until a trade has closed this session.</summary>
+  public string? LastCloseReason { get; private set; }
+
   static List<string> SnapshotItems(ItemCollection coll)
   {
     var list = new List<string>();
@@ -772,6 +777,32 @@ public sealed class TradeExecutor : IDisposable
   }
 
   /// <summary>
+  /// SAFETY GUARDRAIL for a two-sided SWAP: true ONLY if WE GIVE is EXACTLY
+  /// {<paramref name="giveQty"/> x <paramref name="giveCard"/>} and WE RECEIVE is
+  /// EXACTLY {<paramref name="getQty"/> x <paramref name="getCard"/>} — nothing
+  /// more on either side. Never submit/approve a swap that fails this: it is what
+  /// guarantees we hand over only the offered card AND actually get the requested
+  /// one (so an incomplete or lopsided deal is cancelled, never committed).
+  /// </summary>
+  public bool VerifySwap(TradeEscrow esc, string giveCard, int giveQty, string getCard, int getQty)
+  {
+    var give = new List<(string name, int qty)>();
+    var recv = new List<(string name, int qty)>();
+    try { foreach (var it in esc.TradedItems.CollectionItems) give.Add((Try(() => it.Card?.Name) ?? "?", Try(() => (int)it.Quantity) ?? 0)); }
+    catch (Exception ex) { Log($"[guardrail] could not read WE GIVE: {ex.Message}"); return false; }
+    try { foreach (var it in esc.PartnerTradedItems.CollectionItems) recv.Add((Try(() => it.Card?.Name) ?? "?", Try(() => (int)it.Quantity) ?? 0)); }
+    catch (Exception ex) { Log($"[guardrail] could not read WE RECEIVE: {ex.Message}"); return false; }
+
+    bool giveOk = give.Count == 1 && give[0].qty == giveQty && (give[0].name?.ToLowerInvariant().Contains(giveCard.ToLowerInvariant()) ?? false);
+    bool recvOk = recv.Count == 1 && recv[0].qty == getQty  && (recv[0].name?.ToLowerInvariant().Contains(getCard.ToLowerInvariant()) ?? false);
+    bool ok = giveOk && recvOk;
+    string gs = give.Count == 0 ? "(none)" : string.Join(", ", give.Select(g => $"{g.qty}x {g.name}"));
+    string rs = recv.Count == 0 ? "(none)" : string.Join(", ", recv.Select(r => $"{r.qty}x {r.name}"));
+    Log($"[guardrail] WE GIVE = {gs} (need {giveQty}x {giveCard}); WE RECEIVE = {rs} (need {getQty}x {getCard}) => {(ok ? "OK (both sides exact)" : "REJECT")}");
+    return ok;
+  }
+
+  /// <summary>
   /// Create (or reuse) a trade binder named <paramref name="binderName"/>
   /// containing only <paramref name="cardName"/>, so a lend trade can present just
   /// that one card. Operates entirely on THIS (the bot's) account. Returns the
@@ -1043,6 +1074,7 @@ public sealed class TradeExecutor : IDisposable
       if (s.New == TradeState.Closed)
       {
         string fs = Try(() => e.FinalState.ToString()) ?? "?";
+        LastCloseReason = fs;
         if (fs == "TradeComplete")
           RecordAcquisition(_lastPartner ?? "?", _lastReceived, _lastGiven, fs);
         else
