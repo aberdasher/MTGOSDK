@@ -484,7 +484,7 @@ public sealed class Client : DLRWrapper<ISession>, IDisposable
         Unbind(s_shellViewModel.CurrentScene).SuggestedLeagues.Count > 0 &&
         Unbind(s_shellViewModel.CurrentScene).JoinedEvents.Count >= 0 &&
         // Checks to see if the play service event dictionary has finished populating.
-        MTGOSDK.API.Play.EventManager.m_eventsById.Any(),
+        MTGOSDK.API.Play.EventManager.m_eventsById.Count > 0,
         //
         // If we're unable to access these properties, check that we haven't
         // already navigated to a different scene (in which case we've already
