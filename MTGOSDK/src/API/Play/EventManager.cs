@@ -54,7 +54,7 @@ public static class EventManager
   /// <summary>
   /// A dictionary of all events by their event ID.
   /// </summary>
-  private static dynamic m_eventsById
+  internal static dynamic m_eventsById
   {
     get => field ??= Unbind(s_playService).m_matchesAndTournamentsAndQueuesById;
     set => field = value;
@@ -79,7 +79,7 @@ public static class EventManager
   private static dynamic m_featuredEvents
   {
     get => field ??= ((DynamicRemoteObject)
-        Unbind(s_playService).GetFeaturedFilterables())
+        Unbind(s_playService.GetFeaturedEventsFilterables()))
           .Filter<IPlayerEvent>(e => e.MinimumPlayers > 2)
           .Sort<ITournament, DateTime>(e => e.ScheduledStartTime);
     set => field = value;

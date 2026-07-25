@@ -18,7 +18,6 @@ using FlsClient.Interface;
 using Shiny.Core.Interfaces;
 using WotC.MtGO.Client.Model;
 
-using MTGOSDK.API.Collection;
 using MTGOSDK.API.Settings;
 using MTGOSDK.API.Users;
 using MTGOSDK.Core.Exceptions;
@@ -481,9 +480,11 @@ public sealed class Client : DLRWrapper<ISession>, IDisposable
         Unbind(s_shellViewModel).ShowLoadDeckSplashScreen == false &&
         Unbind(s_shellViewModel).m_blockingProgressInstances.Count == 0 &&
         // Checks to see if the HomeSceneViewModel has finished initializing.
-        Unbind(s_shellViewModel.CurrentScene).FeaturedTournaments.Count > 0 &&
+        Unbind(s_shellViewModel.CurrentScene).FeaturedEvents.Count > 0 &&
         Unbind(s_shellViewModel.CurrentScene).SuggestedLeagues.Count > 0 &&
-        Unbind(s_shellViewModel.CurrentScene).JoinedEvents.Count >= 0,
+        Unbind(s_shellViewModel.CurrentScene).JoinedEvents.Count >= 0 &&
+        // Checks to see if the play service event dictionary has finished populating.
+        MTGOSDK.API.Play.EventManager.m_eventsById.Any(),
         //
         // If we're unable to access these properties, check that we haven't
         // already navigated to a different scene (in which case we've already
