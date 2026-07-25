@@ -111,6 +111,8 @@
     border-radius:var(--r);padding:8px 12px}
   .stack h3{font-size:11px;letter-spacing:.12em;text-transform:uppercase;color:var(--accent);margin-bottom:5px}
   .stack .s{font-size:12.5px;padding:2px 0}
+  .stack.reveal{border-color:color-mix(in srgb,var(--seat0) 60%,var(--line))}
+  .stack.reveal h3{color:var(--seat0)}
 
   /* ── log rail ── */
   .logpane{background:var(--panel);border-left:1px solid var(--line);display:flex;flex-direction:column;min-height:0}
@@ -150,6 +152,7 @@
   <div class="stage">
     <div class="board">
       <div class="stack" id="stack" hidden></div>
+      <div class="stack reveal" id="reveal" hidden></div>
       <div class="players" id="players"></div>
     </div>
     <aside class="logpane">
@@ -168,12 +171,12 @@
   const SEAT_HEX={ "--seat0":"#4a90d9","--seat1":"#d0574a","--seat2":"#57a468","--seat3":"#c9a24a" };
   const PIP={W:"#f3edd6",U:"#5a9bd8",B:"#8d7fa0",R:"#d0674f",G:"#63ab74",C:"#b9bcc4"};
 
-  let header=null, states=[], logs=[], overlays=[], result=null, idx=0, playing=false, timer=null;
+  let header=null, states=[], logs=[], overlays=[], reveals=[], result=null, idx=0, playing=false, timer=null;
 
   const $=id=>document.getElementById(id);
 
   function parse(text){
-    header=null; states=[]; logs=[]; overlays=[]; result=null;
+    header=null; states=[]; logs=[]; overlays=[]; reveals=[]; result=null;
     let ord=0;
     for(const raw of text.split(/\r?\n/)){
       const line=raw.trim(); if(!line) continue;
@@ -183,6 +186,7 @@
       else if(r.type==="state") states.push(r);
       else if(r.type==="log") logs.push(r);
       else if(r.type==="players") overlays.push(r);   // live status / commander damage
+      else if(r.type==="revealed") reveals.push(r);   // public reveals (separate channel)
       else if(r.type==="result") result=r;
     }
     idx=0;
@@ -197,11 +201,19 @@
     return m;
   }
 
+  // latest revealed-cards record at or before a given file ordinal
+  function revealAt(ord){
+    let chosen=null;
+    for(const r of reveals){ if(r._ord<=ord) chosen=r; else break; }
+    return chosen && chosen.cards ? chosen.cards : [];
+  }
+
   // strip MTGO markup: @[Name@:id,id:@] -> Name ; leading @P
   function clean(t){
     if(!t) return "";
     return t.replace(/@\[([^@]*)@:[^\]]*\]/g,"$1").replace(/@P/g,"").replace(/@\{[^}]*\}/g,"").trim();
   }
+  function esc(s){ return (s||"").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;"); }
 
   function seatVars(el,i){
     const key=SEAT[i%4];
@@ -269,14 +281,14 @@
     $("tick").textContent = (idx+1)+" / "+states.length;
     $("slider").value = idx;
 
-    // bucket cards by controller (battlefield) / owner (graveyard,exile) / stack
-    const bf={}, gy={}, ex={}, stack=[];
+    // bucket: battlefield by controller, stack global, EVERY other zone by owner
+    // (graveyard, exile, command, commander, revealed-zone, piles, effects, …).
+    const bf={}, stack=[], zbp={};
     for(const c of s.cards){
       const z=c.zone||"";
       if(z==="Battlefield"){ (bf[c.controller]=bf[c.controller]||[]).push(c); }
-      else if(z==="Graveyard"){ (gy[c.owner]=gy[c.owner]||[]).push(c); }
-      else if(z==="Exile"){ (ex[c.owner]=ex[c.owner]||[]).push(c); }
       else if(z==="Stack"){ stack.push(c); }
+      else { const o=(c.owner!=null?c.owner:c.controller); (zbp[o]=zbp[o]||{}); (zbp[o][z||"?"]=zbp[o][z||"?"]||[]).push(c); }
     }
 
     // stack
@@ -287,6 +299,13 @@
         if(c.targets && c.targets.length) txt+="  → "+c.targets.join(", ");
         d.textContent=txt; st.appendChild(d); });
     } else st.hidden=true;
+
+    // revealed cards (public reveals arrive on a separate channel)
+    const rv=$("reveal"); const rc=revealAt(s._ord);
+    if(rc.length){ rv.hidden=false; rv.innerHTML="<h3>Revealed</h3>";
+      rc.forEach(c=>{ const d=document.createElement("div"); d.className="s";
+        d.textContent=(c.owner!=null?(names[c.owner]||("P"+c.owner))+": ":"")+(c.name||"?")+(c.type?" — "+c.type:""); rv.appendChild(d); });
+    } else rv.hidden=true;
 
     // players
     const wrap=$("players"); wrap.innerHTML="";
@@ -332,13 +351,14 @@
       }
       panel.appendChild(field);
 
-      const zl=document.createElement("div"); zl.className="zoneline";
-      const gcards=(gy[p.index]||[]), ecards=(ex[p.index]||[]);
+      const zmap=zbp[p.index]||{};
+      const zorder=["Graveyard","Exile","Command","Commander","Revealed","Pile1","Pile2","Pile3","Aside","Effects","Sideboard"];
+      const zkeys=Object.keys(zmap).sort((a,b)=>{const ia=zorder.indexOf(a),ib=zorder.indexOf(b);return (ia<0?99:ia)-(ib<0?99:ib);});
       const parts=[];
-      parts.push(`<b>Graveyard</b> <span class="zn">${gcards.length}</span>` + (gcards.length?": "+gcards.map(c=>c.name).join(", "):""));
-      if(ecards.length) parts.push(`<b>Exile</b> <span class="zn">${ecards.length}</span>: `+ecards.map(c=>c.name).join(", "));
-      zl.innerHTML=parts.join(" &nbsp;·&nbsp; ");
-      panel.appendChild(zl);
+      if(!zmap["Graveyard"]) parts.push(`<b>Graveyard</b> <span class="zn">0</span>`);   // anchor even when empty
+      for(const z of zkeys){ const cs=zmap[z];
+        parts.push(`<b>${z}</b> <span class="zn">${cs.length}</span>: `+cs.map(c=>esc(c.name)).join(", ")); }
+      const zl=document.createElement("div"); zl.className="zoneline"; zl.innerHTML=parts.join(" &nbsp;·&nbsp; "); panel.appendChild(zl);
 
       wrap.appendChild(panel);
     });

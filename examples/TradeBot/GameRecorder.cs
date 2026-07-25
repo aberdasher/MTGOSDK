@@ -77,11 +77,34 @@ public static class GameRecorder
     Action<GSArgs.CardChangedEventArgs>   onCard   = a => TryState(SafeSnap(() => a.Snapshot));
     Action<GSArgs.PlayerChangedEventArgs> onPlayer = a => TryState(SafeSnap(() => a.Snapshot));
 
+    // Public reveals (Thoughtseize-style, top-of-library, pile divisions) arrive on a
+    // channel SEPARATE from the snapshot's cards — capture them here so a revealed
+    // card is recorded the moment it becomes spectator-visible.
+    string lastReveal = "";
+    Action<GSArgs.RevealedCardsEventArgs> onReveal = a =>
+    {
+      try
+      {
+        var list = new List<object>();
+        foreach (var c in a.Current)
+        {
+          var n = S(() => c.Name); if (n.Length == 0) continue;
+          list.Add(new { name = n, type = S(() => c.TypeLine), zone = S(() => c.Zone?.Name), owner = I(() => c.OwnerIndex) });
+        }
+        string js = JsonSerializer.Serialize(list, J);
+        lock (wlock) { if (js == lastReveal) return; lastReveal = js; }
+        if (list.Count > 0)
+          Write(new { type = "revealed", at = NowIso(), timestamp = SafeSnap(() => a.Snapshot)?.Timestamp, cards = list });
+      }
+      catch { }
+    };
+
     try
     {
       game.OnPromptChanged += onPrompt;   // first subscribe activates the processor
       game.OnCardChanged   += onCard;
       game.OnPlayerChanged += onPlayer;
+      game.OnRevealedCards += onReveal;
       game.ReadyProcessor();              // MANDATORY: drain loop is inert until this
     }
     catch (Exception ex) { Console.WriteLine($"[record] subscribe failed: {ex.Message.Split('\n')[0]}"); }
@@ -183,6 +206,11 @@ public static class GameRecorder
     var cards = new List<object>();
     foreach (var kv in snap.Cards) cards.Add(CardRec(kv.Value, names, Resolve));
 
+    // Transient hidden cards (scry / top-of-library peeks) — present only when the
+    // watcher can see them; usually empty for a pure spectator.
+    var hidden = new List<object>();
+    try { foreach (var kv in snap.HiddenCards) { var n = S(() => kv.Value.Name); if (n.Length > 0) hidden.Add(new { name = n, zone = S(() => kv.Value.Zone?.Name), owner = I(() => kv.Value.OwnerIndex) }); } } catch { }
+
     return new
     {
       type = "state",
@@ -194,6 +222,7 @@ public static class GameRecorder
       prompt = S(() => snap.PromptText),
       players,
       cards,
+      hidden = hidden.Count > 0 ? hidden : null,
     };
   }
 
