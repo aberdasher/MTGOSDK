@@ -119,6 +119,43 @@ public sealed class GamePlayer(dynamic gamePlayer) : DLRWrapper<IGamePlayer>
   /// </summary>
   public IEnumerable<Mana> ManaPool => Map<Mana>(@base.ManaPool);
 
+  /// <summary>
+  /// The player's game-result status (Invalid / IsPlaying / HasWon / HasLost).
+  /// Only meaningful on the LIVE player path (the watcher partial carries none).
+  /// </summary>
+  public string StatusName => Try(() => (string)Unbind(this).Status.ToString()) ?? "";
+
+  /// <summary>Whether the player has been eliminated from the game (live path).</summary>
+  public bool IsEliminated => Try<bool>(() => (bool)@base.IsEliminated);
+
+  /// <summary>
+  /// Commander damage dealt TO this player, keyed by the source player's index.
+  /// Live path only; empty for non-commander games. Best-effort: the underlying
+  /// dictionary may key by IGamePlayer, so we resolve each key to a Login/seat id.
+  /// </summary>
+  public IReadOnlyDictionary<int, int> CommanderDamage
+  {
+    get
+    {
+      var map = new Dictionary<int, int>();
+      try
+      {
+        dynamic dict = Unbind(this).CommanderDamageFromPlayer;
+        if (dict == null) return map;
+        foreach (var entry in dict)
+        {
+          int amt = Try<int>(() => (int)entry.Value);
+          if (amt <= 0) continue;
+          int key = Try<int>(() => (int)entry.Key);           // int-keyed
+          if (key == 0) { try { key = (int)entry.Key.User.Id; } catch { } } // IGamePlayer-keyed
+          map[key] = amt;
+        }
+      }
+      catch { }
+      return map;
+    }
+  }
+
   //
   // IGamePlayer wrapper methods
   //

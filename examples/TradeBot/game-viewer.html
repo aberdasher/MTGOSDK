@@ -82,6 +82,11 @@
     display:grid;place-items:center;border:1px solid rgba(0,0,0,.3)}
   .badge{font-family:var(--mono);font-size:10px;padding:1px 5px;border-radius:5px;
     background:var(--raised);border:1px solid var(--line);color:var(--muted)}
+  .badge.cmd{color:var(--bad);border-color:color-mix(in srgb,var(--bad) 55%,var(--line))}
+  .statusbadge{font-family:var(--mono);font-size:10px;font-weight:700;letter-spacing:.08em;padding:1px 6px;border-radius:5px}
+  .statusbadge.won{background:color-mix(in srgb,var(--good) 22%,transparent);color:var(--good);border:1px solid var(--good)}
+  .statusbadge.lost{background:color-mix(in srgb,var(--bad) 20%,transparent);color:var(--bad);border:1px solid var(--bad)}
+  .player.dead{opacity:.5;filter:grayscale(.45)}
 
   .battlefield{padding:8px 10px;display:flex;flex-direction:column;gap:7px}
   .cgroup{display:flex;flex-wrap:wrap;gap:6px}
@@ -163,12 +168,12 @@
   const SEAT_HEX={ "--seat0":"#4a90d9","--seat1":"#d0574a","--seat2":"#57a468","--seat3":"#c9a24a" };
   const PIP={W:"#f3edd6",U:"#5a9bd8",B:"#8d7fa0",R:"#d0674f",G:"#63ab74",C:"#b9bcc4"};
 
-  let header=null, states=[], logs=[], result=null, idx=0, playing=false, timer=null;
+  let header=null, states=[], logs=[], overlays=[], result=null, idx=0, playing=false, timer=null;
 
   const $=id=>document.getElementById(id);
 
   function parse(text){
-    header=null; states=[]; logs=[]; result=null;
+    header=null; states=[]; logs=[]; overlays=[]; result=null;
     let ord=0;
     for(const raw of text.split(/\r?\n/)){
       const line=raw.trim(); if(!line) continue;
@@ -177,9 +182,19 @@
       if(r.type==="header") header=r;
       else if(r.type==="state") states.push(r);
       else if(r.type==="log") logs.push(r);
+      else if(r.type==="players") overlays.push(r);   // live status / commander damage
       else if(r.type==="result") result=r;
     }
     idx=0;
+  }
+
+  // latest live-overlay at or before a given file ordinal -> {index:{status,eliminated,commanderDamage}}
+  function overlayAt(ord){
+    let chosen=null;
+    for(const o of overlays){ if(o._ord<=ord) chosen=o; else break; }
+    const m={};
+    if(chosen) for(const p of chosen.players) m[p.index]=p;
+    return m;
   }
 
   // strip MTGO markup: @[Name@:id,id:@] -> Name ; leading @P
@@ -223,7 +238,10 @@
     if(c.summoningSick) marks.push("~");
     if(c.faceDown) marks.push("face-down");
     if(c.token) marks.push("token");
-    if(marks.length){ const f=document.createElement("span"); f.className="fl"; f.textContent=marks.join(" "); el.appendChild(f); }
+    if(c.attachedToName) marks.push("on "+c.attachedToName);
+    if(c.blocks && c.blocks.length) marks.push("blocks "+c.blocks.join(", "));
+    if(c.targets && c.targets.length) marks.push("→ "+c.targets.join(", "));
+    if(marks.length){ const f=document.createElement("span"); f.className="fl"; f.textContent=marks.join(" · "); el.appendChild(f); }
     el.title=(c.type||"")+(c.faceDown?" (face-down)":"");
     return el;
   }
@@ -242,10 +260,12 @@
     if(!states.length){ $("gtitle").textContent="Load a recording to begin"; return; }
     const s=states[idx];
     const names={}; (s.players||[]).forEach(p=>names[p.index]=p.name);
+    const ov=overlayAt(s._ord);
     $("gtitle").textContent = header ? header.players.map(p=>p.name).join("  vs  ") : "game";
     $("turn").textContent = "Turn "+s.turn;
     $("phase").textContent = s.phase||"";
-    $("who").textContent = s.prompt ? "· "+clean(s.prompt) : "";
+    const dnStr = s.dayNight ? (s.dayNight==="night"?"☾ Night":"☀ Day") : "";
+    $("who").textContent = (dnStr?dnStr+" · ":"") + (s.prompt ? clean(s.prompt) : "");
     $("tick").textContent = (idx+1)+" / "+states.length;
     $("slider").value = idx;
 
@@ -263,7 +283,9 @@
     const st=$("stack");
     if(stack.length){ st.hidden=false; st.innerHTML="<h3>Stack · resolves top-down</h3>";
       stack.forEach(c=>{ const d=document.createElement("div"); d.className="s";
-        d.textContent=(names[c.controller]||"?")+": "+(c.name||"?")+(c.type?" — "+c.type:""); st.appendChild(d); });
+        let txt=(names[c.controller]||"?")+": "+(c.name||"?")+(c.type?" — "+c.type:"");
+        if(c.targets && c.targets.length) txt+="  → "+c.targets.join(", ");
+        d.textContent=txt; st.appendChild(d); });
     } else st.hidden=true;
 
     // players
@@ -271,16 +293,23 @@
     const ps=(s.players||[]).slice().sort((a,b)=>a.index-b.index);
     wrap.className="players"+(ps.length<=2?" duel":"");
     ps.forEach((p,pi)=>{
+      const info=ov[p.index];
       const panel=document.createElement("div"); panel.className="player";
       if(s.promptedPlayer===p.index) panel.classList.add("act");
+      if(info && (info.eliminated || info.status==="HasLost")) panel.classList.add("dead");
       seatVars(panel,p.index);
 
       const head=document.createElement("div"); head.className="phead";
       const nm=document.createElement("span"); nm.className="pname"; nm.textContent=p.name; head.appendChild(nm);
+      if(info && info.status){ const sb=document.createElement("span");
+        sb.className="statusbadge "+(info.status==="HasWon"?"won":"lost");
+        sb.textContent=info.status==="HasWon"?"WON":(info.status==="HasLost"?"LOST":info.status); head.appendChild(sb); }
       const cnt=document.createElement("span"); cnt.className="cnt num";
       cnt.textContent=`hand ${p.hand} · lib ${p.library} · gy ${p.graveyard}`; head.appendChild(cnt);
       if(p.counters){ for(const k in p.counters){ const b=document.createElement("span"); b.className="badge";
         b.textContent=`${k} ${p.counters[k]}`; head.appendChild(b);} }
+      if(info && info.commanderDamage){ for(const k in info.commanderDamage){ const b=document.createElement("span"); b.className="badge cmd";
+        b.textContent=`cmdr dmg ${info.commanderDamage[k]}`; head.appendChild(b);} }
       const pips=manaPips(p.mana); if(pips) head.appendChild(pips);
       if(p.clockSeconds){ const cl=document.createElement("span"); cl.className="clock num";
         const m=Math.floor(p.clockSeconds/60), sec=p.clockSeconds%60; cl.textContent=`${m}:${String(sec).padStart(2,"0")}`; head.appendChild(cl);}

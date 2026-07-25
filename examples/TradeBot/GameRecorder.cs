@@ -16,6 +16,8 @@
 using System.Text.Json;
 using System.Text.Json.Serialization;
 
+using static MTGOSDK.Core.Reflection.DLRWrapper;  // Unbind (for partial.ResolveAssociations)
+
 using GS = MTGOSDK.API.Play.Games;
 using GSProc = MTGOSDK.API.Play.Games.Processors;
 using GSArgs = MTGOSDK.API.Play.Games.Processors.EventArgs;
@@ -57,6 +59,9 @@ public static class GameRecorder
     var names = ReadNames(game);
     Write(new { type = "header", gameId = gid, players = names.Select(kv => new { index = kv.Key, name = kv.Value }), startedAt = NowIso() });
 
+    // Day/night has no snapshot field — derive it from the log narration.
+    var dn = new[] { "" };
+
     // State capture (dedup by server tick Timestamp — one record per distinct tick).
     var seenTicks = new HashSet<uint>();
     int stateCount = 0, logCount = 0;
@@ -64,7 +69,7 @@ public static class GameRecorder
     {
       if (snap is null) return;
       lock (wlock) { if (!seenTicks.Add(snap.Timestamp)) return; }
-      Write(BuildState(snap));
+      Write(BuildState(snap, dn[0]));
       System.Threading.Interlocked.Increment(ref stateCount);
     }
 
@@ -81,15 +86,15 @@ public static class GameRecorder
     }
     catch (Exception ex) { Console.WriteLine($"[record] subscribe failed: {ex.Message.Split('\n')[0]}"); }
 
-    // Main loop: append new log lines + watch for game end. State records are
-    // written from the event handlers above (on the drain thread).
-    int logSeen = 0;
+    // Main loop: append new log lines + a live per-player overlay + watch for end.
+    // State records are written from the event handlers above (on the drain thread).
+    int logSeen = 0, liveTick = 0, lastReport = 0;
+    string lastLive = "";
     var end = DateTime.Now.AddMinutes(maxMinutes);
     bool finished = false;
-    int lastReport = 0;
     while (DateTime.Now < end)
     {
-      // Drain new log lines.
+      // Drain new log lines (+ derive day/night from narration).
       try
       {
         var msgs = game.LogChannel.Messages;
@@ -99,6 +104,9 @@ public static class GameRecorder
           try { who = msgs[i].User?.Name ?? ""; } catch { }
           try { txt = (msgs[i].Text ?? "").Replace("\r", " ").Replace("\n", " ").Trim(); } catch { }
           try { ts = msgs[i].Timestamp.ToString("HH:mm:ss"); } catch { }
+          var low = txt.ToLowerInvariant();
+          if (low.Contains("becomes night") || low.Contains("night falls")) dn[0] = "night";
+          else if (low.Contains("becomes day") || low.Contains("day breaks")) dn[0] = "day";
           Write(new { type = "log", at = ts, user = who, text = txt });
           logCount++;
         }
@@ -106,9 +114,20 @@ public static class GameRecorder
       }
       catch { }
 
+      // Live per-player overlay: the watcher SNAPSHOT partial carries no win/loss
+      // Status or commander damage, so read the LIVE players; emit only on change.
+      if (++liveTick % 5 == 0)
+      {
+        var lp = ReadLivePlayers(game);
+        if (lp.Count > 0)
+        {
+          string js = JsonSerializer.Serialize(lp, J);
+          if (js != lastLive) { lastLive = js; Write(new { type = "players", at = NowIso(), players = lp }); }
+        }
+      }
+
       // End detection.
-      string status = S(() => game.Status.ToString());
-      if (status == "Finished") { finished = true; break; }
+      if (S(() => game.Status.ToString()) == "Finished") { finished = true; break; }
 
       if (stateCount + logCount - lastReport >= 20)
       { lastReport = stateCount + logCount; Console.WriteLine($"[record] {stateCount} states, {logCount} log lines so far..."); }
@@ -125,11 +144,18 @@ public static class GameRecorder
 
   // ── record builders ──────────────────────────────────────────────────────
 
-  static object BuildState(GSProc.GameStateSnapshot snap)
+  static object BuildState(GSProc.GameStateSnapshot snap, string dayNight)
   {
     var names = new Dictionary<int, string>();
     foreach (var kv in snap.Players)
     { var nm = S(() => kv.Value.Name); names[kv.Key] = string.IsNullOrWhiteSpace(nm) ? $"P{kv.Key}" : nm; }
+
+    // id -> name for resolving combat/target references (ids < 6 are players).
+    var cardNames = new Dictionary<int, string>();
+    foreach (var kv in snap.Cards) { var n = S(() => kv.Value.Name); if (n.Length > 0) cardNames[kv.Key] = n; }
+    string Resolve(int id) => id < 6
+      ? (names.TryGetValue(id, out var pn) ? pn : $"P{id}")
+      : (cardNames.TryGetValue(id, out var cn) ? cn : $"#{id}");
 
     var players = new List<object>();
     foreach (var idx in snap.Players.Keys.OrderBy(k => k))
@@ -155,7 +181,7 @@ public static class GameRecorder
     }
 
     var cards = new List<object>();
-    foreach (var kv in snap.Cards) cards.Add(CardRec(kv.Value, names));
+    foreach (var kv in snap.Cards) cards.Add(CardRec(kv.Value, names, Resolve));
 
     return new
     {
@@ -163,6 +189,7 @@ public static class GameRecorder
       timestamp = snap.Timestamp,
       turn = snap.TurnNumber,
       phase = snap.CurrentPhase.ToString(),
+      dayNight = string.IsNullOrEmpty(dayNight) ? null : dayNight,
       promptedPlayer = snap.PromptedPlayer == byte.MaxValue ? (int?)null : snap.PromptedPlayer,
       prompt = S(() => snap.PromptText),
       players,
@@ -170,7 +197,7 @@ public static class GameRecorder
     };
   }
 
-  static object CardRec(GS.GameCard c, Dictionary<int, string> names)
+  static object CardRec(GS.GameCard c, Dictionary<int, string> names, Func<int, string> resolve)
   {
     string type = S(() => c.TypeLine).Trim();
     bool creature = type.IndexOf("Creature", StringComparison.OrdinalIgnoreCase) >= 0;
@@ -179,6 +206,27 @@ public static class GameRecorder
 
     var counters = new Dictionary<string, int>();
     try { foreach (var cc in c.Counters) { var k = cc.ToString() ?? "?"; counters[k] = counters.GetValueOrDefault(k) + 1; } } catch { }
+
+    // Combat: a blocker's assigned attackers (BlockingOrders is the clean direction).
+    List<string>? blocks = null;
+    if (B(() => c.IsBlocking))
+    {
+      var b = new List<string>();
+      try { foreach (var t in c.BlockingOrders) { int tid = I(() => t.Id); if (tid > 0) b.Add(resolve(tid)); } } catch { }
+      if (b.Count > 0) blocks = b;
+    }
+
+    // Spell/ability TARGETS on the stack: ResolveAssociations()["ActionTarget"]
+    // (partial-only method) → target ids, resolved to card/player names.
+    List<string>? targets = null;
+    try
+    {
+      dynamic raw = Unbind(c);
+      var assoc = raw.ResolveAssociations() as System.Collections.Generic.Dictionary<string, System.Collections.Generic.List<int>>;
+      if (assoc != null && assoc.TryGetValue("ActionTarget", out var tl) && tl.Count > 0)
+        targets = tl.Select(resolve).ToList();
+    }
+    catch { }
 
     return new
     {
@@ -206,6 +254,9 @@ public static class GameRecorder
       chapter = chap > 0 ? (int?)chap : null,
       level = lvl > 0 ? (int?)lvl : null,
       attachedTo = att > 0 ? (int?)att : null,
+      attachedToName = att > 0 ? resolve(att) : null,
+      blocks,
+      targets,
       counters = counters.Count > 0 ? counters : null,
     };
   }
@@ -214,7 +265,35 @@ public static class GameRecorder
   {
     var winners = new List<string>();
     try { foreach (var p in game.WinningPlayers) { try { winners.Add(p.Name); } catch { } } } catch { }
-    return new { type = "result", finalStatus = S(() => game.Status.ToString()), winners, at = NowIso() };
+    var players = ReadLivePlayers(game);
+    return new { type = "result", finalStatus = S(() => game.Status.ToString()), winners, players = players.Count > 0 ? players : null, at = NowIso() };
+  }
+
+  // Live per-player status + commander damage (NOT on the watcher snapshot partial).
+  static List<object> ReadLivePlayers(GS.Game game)
+  {
+    var list = new List<object>();
+    try
+    {
+      int i = 0;
+      foreach (var p in game.Players)
+      {
+        var cd = new Dictionary<string, int>();
+        try { foreach (var kv in p.CommanderDamage) if (kv.Value > 0) cd[kv.Key.ToString()] = kv.Value; } catch { }
+        string status = S(() => p.StatusName);
+        list.Add(new
+        {
+          index = i,
+          name = S(() => p.Name),
+          status = (status.Length > 0 && status != "IsPlaying" && status != "Invalid") ? status : null,
+          eliminated = B(() => p.IsEliminated) ? true : (bool?)null,
+          commanderDamage = cd.Count > 0 ? cd : null,
+        });
+        i++;
+      }
+    }
+    catch { }
+    return list;
   }
 
   // ── helpers ──────────────────────────────────────────────────────────────
