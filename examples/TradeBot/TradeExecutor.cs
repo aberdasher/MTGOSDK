@@ -88,6 +88,11 @@ public sealed class TradeExecutor : IDisposable
   /// bounced. Null until a trade has closed this session.</summary>
   public string? LastCloseReason { get; private set; }
 
+  /// <summary>How many cards the last RequestViaWishlist matched against the
+  /// partner's presented trade binder (&gt;0 means the card IS in their offer, even
+  /// if it hasn't landed on our receive side yet).</summary>
+  public int LastMatchCount { get; private set; }
+
   static List<string> SnapshotItems(ItemCollection coll)
   {
     var list = new List<string>();
@@ -474,10 +479,10 @@ public sealed class TradeExecutor : IDisposable
   /// </summary>
   static dynamic GetLiveTradeVM()
   {
-    string partner = null;
-    try { partner = TradeManager.CurrentTrade?.TradePartnerName; } catch { }
+    string partner = null, liveId = null;
+    try { var cur = TradeManager.CurrentTrade; partner = cur?.TradePartnerName; liveId = Try(() => cur.Id.ToString()); } catch { }
 
-    dynamic vm = null, firstNameMatch = null;
+    dynamic vm = null, firstLive = null, firstNameMatch = null;
     int scanned = 0;
     try
     {
@@ -487,9 +492,14 @@ public sealed class TradeExecutor : IDisposable
         dynamic c = Unbind((object)cand);
         string cn = Try(() => (string)c.CurrentTradeUserName) ?? "";
         string est = Try(() => (string)c.CurrentTradeEscrow.CurrentState.ToString()) ?? "";
+        string escId = Try(() => c.CurrentTradeEscrow.Id.ToString()) ?? "";
         bool nameOk = partner is null || string.Equals(cn, partner, StringComparison.OrdinalIgnoreCase);
         bool live = est.StartsWith("Negotiate") || est.StartsWith("Approval") || est.StartsWith("Invite");
-        if (nameOk && live) { vm = c; break; }
+        // BEST: the VM bound to the LIVE escrow (matched by id) — unambiguous even
+        // when STALE VMs from earlier trades this session share the partner name and
+        // a non-terminal cached state (which made the match/request hit a dead VM).
+        if (liveId != null && liveId.Length > 0 && escId == liveId) { vm = c; break; }
+        if (firstLive is null && nameOk && live) firstLive = c;
         if (firstNameMatch is null && nameOk) firstNameMatch = c;
       }
     }
@@ -498,7 +508,7 @@ public sealed class TradeExecutor : IDisposable
       throw new InvalidOperationException(
         $"Could not enumerate {ActiveTradeVM} on the heap (is a trade window open?): {ex.Message}", ex);
     }
-    vm ??= firstNameMatch;
+    vm ??= firstLive ?? firstNameMatch;
     if (vm is null)
       throw new InvalidOperationException(
         $"No live {ActiveTradeVM} found (scanned {scanned}) — open a trade first.");
@@ -535,6 +545,7 @@ public sealed class TradeExecutor : IDisposable
       });
     }
     catch (Exception ex) { Log($"[wishlist] tolerated downstream warning ({ex.Message.Split('\n')[0]})"); }
+    LastMatchCount = matched;
     Log($"[wishlist] MatchDesiredCardsFromPartnersTradeBinder matched {matched} card(s)");
 
     System.Threading.Thread.Sleep(1500);
@@ -777,6 +788,29 @@ public sealed class TradeExecutor : IDisposable
   }
 
   /// <summary>
+  /// SAFETY GUARDRAIL for a one-way GRAB (receive-only): true ONLY if WE RECEIVE is
+  /// EXACTLY one card matching <paramref name="cardName"/> (qty == expectedQty) and
+  /// WE GIVE nothing. The mirror of <see cref="VerifyGiveIsOnly"/> — never
+  /// submit/approve a grab unless we're getting exactly the target and handing over
+  /// nothing.
+  /// </summary>
+  public bool VerifyReceiveIsOnly(TradeEscrow esc, string cardName, int expectedQty = 1)
+  {
+    var recv = new List<(string name, int qty)>();
+    try { foreach (var it in esc.PartnerTradedItems.CollectionItems) recv.Add((Try(() => it.Card?.Name) ?? "?", Try(() => (int)it.Quantity) ?? 0)); }
+    catch (Exception ex) { Log($"[guardrail] could not read WE RECEIVE: {ex.Message}"); return false; }
+
+    int giveCount = 0;
+    try { giveCount = esc.TradedItems.CollectionItems.Count; } catch { }
+
+    bool nameOk = recv.Count == 1 && recv[0].qty == expectedQty
+               && (recv[0].name?.ToLowerInvariant().Contains(cardName.ToLowerInvariant()) ?? false);
+    bool ok = nameOk && giveCount == 0;
+    Log($"[guardrail] WE RECEIVE = {(recv.Count == 0 ? "(none)" : string.Join(", ", recv.Select(r => $"{r.qty}x {r.name}")))}; WE GIVE items = {giveCount} => {(ok ? "OK (exactly the target, giving nothing)" : "REJECT")}");
+    return ok;
+  }
+
+  /// <summary>
   /// Status of a multi-card GIVE vs the intended set: what the partner still needs
   /// to grab (<c>missing</c>), what they grabbed that they SHOULDN'T (<c>extra</c>),
   /// and whether WE GIVE is EXACTLY the intended set with nothing received
@@ -996,6 +1030,21 @@ public sealed class TradeExecutor : IDisposable
     if (still != null) { Log($"[binder] '{binderName}' still present after delete."); return false; }
     Log($"[binder] '{binderName}' deleted.");
     return true;
+  }
+
+  /// <summary>
+  /// Create a binder named <paramref name="binderName"/> whose contents are EXACTLY
+  /// <paramref name="cardNames"/> — deleting any existing binder of that name first.
+  /// CreateBinder reuses a binder by name (contents can go stale across orders with
+  /// different cards); this guarantees a fresh, correct binder every time. Returns
+  /// the binder, or null. Owned-printing resolution applies (see CreateBinder).
+  /// </summary>
+  public MTGOSDK.API.Collection.Binder? EnsureBinderExact(string binderName, System.Collections.Generic.IReadOnlyList<string> cardNames)
+  {
+    var existing = MTGOSDK.API.Collection.CollectionManager.Binders
+      .FirstOrDefault(b => string.Equals(Try(() => b.Name) ?? "", binderName, StringComparison.OrdinalIgnoreCase));
+    if (existing != null) DeleteBinder(binderName);
+    return CreateBinder(binderName, cardNames);
   }
 
   /// <summary>Summarize the view-model's requested ("you receive") list.</summary>
