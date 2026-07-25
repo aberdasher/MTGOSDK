@@ -165,8 +165,65 @@ public static class BotPool
   // filter iterates AllPosts inside the diver and returns only matches, so this
   // avoids marshalling the whole (~1600-post) marketplace across the bridge.
   static List<(string Poster, string Message)> ReadPosts(string posterNameSearch)
+    => ReadPostsBy("Poster.Name", posterNameSearch)
+         .Select(p => (p.Poster, p.Message)).ToList();
+
+  /// <summary>One marketplace post: who posted it (+ their user id) and the text.</summary>
+  public readonly record struct DealerPost(string Poster, int PosterId, string Message);
+
+  /// <summary>
+  /// A marketplace dealer: a distinct poster whose posts matched a search, with a
+  /// representative post message, how many of their posts matched, and an
+  /// availability classification of the sample message.
+  /// </summary>
+  public readonly record struct Dealer(string Name, int Id, int MatchCount, string Sample, BotStatus Status)
   {
-    var list = new List<(string, string)>();
+    public override string ToString()
+    {
+      string tag = Status switch { BotStatus.Open => "OPEN", BotStatus.Busy => "busy", _ => "?   " };
+      string s = Sample.Length > 70 ? Sample.Substring(0, 70) + "…" : Sample;
+      return $"{Name,-22} id={Id,-9} posts={MatchCount,-4} [{tag}]  \"{s}\"";
+    }
+  }
+
+  /// <summary>
+  /// Find marketplace dealers whose POST TEXT contains <paramref name="keyword"/>
+  /// (e.g. "foil"), grouped by poster. Read-only, one server-side diver pass.
+  /// Posters currently listed on the marketplace are, by definition, online.
+  /// </summary>
+  public static List<Dealer> FindDealers(string keyword)
+  {
+    var byPoster = new Dictionary<string, (int Id, int Count, string Sample)>(StringComparer.OrdinalIgnoreCase);
+    foreach (var p in ReadPostsBy("RawMessage", keyword))
+    {
+      if (p.Poster.Length == 0) continue;
+      if (byPoster.TryGetValue(p.Poster, out var cur))
+        byPoster[p.Poster] = (cur.Id > 0 ? cur.Id : p.PosterId, cur.Count + 1, cur.Sample);
+      else
+        byPoster[p.Poster] = (p.PosterId, 1, p.Message);
+    }
+    return byPoster
+      .Select(kv => new Dealer(kv.Key, kv.Value.Id, kv.Value.Count, kv.Value.Sample, Classify(kv.Value.Sample)))
+      .OrderByDescending(d => d.MatchCount)
+      .ToList();
+  }
+
+  /// <summary>
+  /// Resolve a bot's login id straight from its marketplace post (no buddy-add
+  /// needed to DM it). Returns -1 if the bot isn't currently posting.
+  /// </summary>
+  public static int ResolvePosterId(string botName)
+    => ReadPostsBy("Poster.Name", botName)
+         .Where(p => string.Equals(p.Poster, botName, StringComparison.OrdinalIgnoreCase))
+         .Select(p => p.PosterId)
+         .FirstOrDefault(id => id > 0) is int id && id > 0 ? id : -1;
+
+  // Core reader: every marketplace post where <property> CONTAINS <search>, via the
+  // same server-side filter TradeManager uses (runs in the diver; only matches
+  // cross the bridge). Captures the poster's user id too.
+  static List<DealerPost> ReadPostsBy(string property, string search)
+  {
+    var list = new List<DealerPost>();
 
     dynamic mkt = ObjectProvider.Get(IMarketplace, true, false, false);
     dynamic allPosts = Unbind((object)mkt).AllPosts;
@@ -174,14 +231,15 @@ public static class BotPool
       CollectionHelpers,
       "WherePropertyStringContains",
       null,
-      new object[] { allPosts, "Poster.Name", posterNameSearch, true });
+      new object[] { allPosts, property, search, true });
 
     foreach (var post in Map<dynamic>(filtered))
     {
       string poster = Try(() => (string)post.Poster.Name) ?? "";
+      int    pid    = Try(() => (int)post.Poster.Id) ?? -1;
       string raw    = Try(() => (string)post.RawMessage) ?? "";
       string msg    = raw.Replace("\n", " ").Replace("\r", " ").Trim();
-      list.Add((poster, msg));
+      list.Add(new DealerPost(poster, pid, msg));
     }
     return list;
   }

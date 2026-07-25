@@ -294,7 +294,14 @@ using (var exec = new TradeExecutor { AllowCommit = allowCommit })
   //   * Only when WE launched MTGO ourselves do we go straight to auto-login,
   //     because we know it started fresh at the login screen.
   bool loggedIn = client.IsLoggedIn;
-  if (!loggedIn && mtgoRunning)
+  // Gate the "attached — don't re-login" path on --attach-only, NOT on whether an
+  // MTGO was running at startup. With CreateProcess=true (the default, i.e. no
+  // --attach-only) the SDK KILLS any running MTGO and launches a FRESH one at the
+  // login screen — so a pre-existing MTGO does NOT mean we attached to a live
+  // session. Keying off mtgoRunning made cold-starts silently skip login whenever
+  // an old MTGO happened to be up (relaunched fresh, then never logged in →
+  // CurrentUser = -1). --attach-only is the only mode that truly attaches.
+  if (!loggedIn && attachOnly)
   {
     // Attached to a PRE-EXISTING client. NEVER re-run LogOn on it: executing
     // the login command on a live session crashes the client (observed as
@@ -1105,6 +1112,46 @@ using (var exec = new TradeExecutor { AllowCommit = allowCommit })
       Line($"\nWaiting up to 90s for a YES reply from {arg1} (reply now from that account)...");
       bool gotYes = exec.WaitForDMYes(arg1, 90);
       Line(gotYes ? $"✅ Got YES from {arg1} — handshake works." : $"⏱ No YES within 90s (no reply, or they said something else).");
+      break;
+    }
+
+    case "dealers":
+    {
+      // READ-ONLY: find marketplace bots whose POST TEXT mentions a keyword
+      // (default "foil"), grouped by poster, most-active first. Posters currently
+      // listed are online. One server-side diver pass (no whole-marketplace scan).
+      // Usage: dealers [keyword]
+      string keyword = arg1.Length > 0 ? arg1 : "foil";
+      Line($"Searching marketplace posts for \"{keyword}\" (read-only)...\n");
+      var dealers = TradeBot.BotPool.FindDealers(keyword);
+      if (dealers.Count == 0) { Line($"No online bots have \"{keyword}\" in their posts right now."); break; }
+      Line($"{dealers.Count} bot(s) dealing in \"{keyword}\" (by matching-post count):");
+      foreach (var d in dealers.Take(25)) Line("  " + d);
+      if (dealers.Count > 25) Line($"  … and {dealers.Count - 25} more.");
+      Line($"\nDM one with:  dmbot <name> [message] --yes");
+      break;
+    }
+
+    case "dmbot":
+    {
+      // Test the DM path against a MARKETPLACE BOT (reliably online). Resolves the
+      // bot's user id straight from its post (no buddy-add), sends a message, then
+      // dumps the DM tail so any auto-reply is visible.
+      // Usage: dmbot <botname> [message] --yes
+      if (arg1.Length == 0) { Line("Usage: dmbot <botname> [message] --yes"); break; }
+      if (!yes) { Line($"Refusing: sends a DM to bot '{arg1}'. Re-run with --yes."); break; }
+      string botMsg = args.Skip(2).FirstOrDefault(a => !a.StartsWith("--"))
+                      ?? "Hi! Testing chat — do you carry foils? (automated test message)";
+      exec.Attach();
+      int uid = TradeBot.BotPool.ResolvePosterId(arg1);
+      if (uid <= 0) { Line($"'{arg1}' isn't currently posting on the marketplace (can't get its id). Try `dealers` to see live names, exact spelling matters."); break; }
+      Line($"Resolved {arg1} → id={uid} (from its marketplace post).");
+      exec.DumpDMTailById(uid, arg1);
+      try { exec.SendDMToId(uid, arg1, botMsg); }
+      catch (Exception ex) { Line($"SendDM failed: {ex.Message}"); break; }
+      Line($"\nSent. Waiting 20s for a reply from {arg1}...");
+      System.Threading.Thread.Sleep(20000);
+      exec.DumpDMTailById(uid, arg1, 12);
       break;
     }
 

@@ -567,6 +567,17 @@ public sealed class TradeExecutor : IDisposable
   {
     int uid = ResolveUserId(username);
     if (uid <= 0) throw new InvalidOperationException($"Could not resolve a user id for '{username}'.");
+    SendDMToId(uid, username, text);
+  }
+
+  /// <summary>
+  /// Send a DM to a user by their KNOWN login id (e.g. one pulled straight from a
+  /// marketplace post via BotPool.ResolvePosterId — lets us DM a bot without
+  /// adding it as a buddy). <paramref name="label"/> is only for logging.
+  /// </summary>
+  public void SendDMToId(int uid, string label, string text)
+  {
+    if (uid <= 0) throw new InvalidOperationException($"Bad user id {uid} for '{label}'.");
 
     dynamic mgr = ChatManager();
     dynamic session = null;
@@ -581,15 +592,30 @@ public sealed class TradeExecutor : IDisposable
     });
     if (session is null) { System.Threading.Thread.Sleep(600); try { session = mgr.GetPrivateChat(uid); } catch { } }
     if (session is null)
-      throw new InvalidOperationException($"Could not create/get a chat session for '{username}'.");
+      throw new InvalidOperationException($"Could not create/get a chat session for '{label}'.");
 
     OnUI(() => session.SendCommand.Execute(text));
-    Log($"[dm] -> {username}: {text}");
+    Log($"[dm] -> {label}: {text}");
   }
+
+  /// <summary>
+  /// The sender name of a chat message. The SDK's Message.User is deliberately
+  /// null when FromUser.Id == -1, which happens for private-DM messages (BOTH
+  /// directions — observed live), so fall back to the raw FromUser.Name off the
+  /// underlying object. Returns "" if no name is available at all.
+  /// </summary>
+  static string SenderName(Message m) =>
+    Try(() => m.User?.Name)
+    ?? Try(() => (string)Unbind((object)m).FromUser.Name)
+    ?? "";
 
   /// <summary>
   /// Wait up to <paramref name="timeoutSec"/> for <paramref name="username"/> to
   /// reply "yes" (yes / y / yes please / …) in the DM channel. Read-only.
+  /// Private-DM replies can arrive with FromUser.Id == -1 (no wrapper user), so we
+  /// do NOT hard-require a sender-name match: WE never send a yes, so a yes-pattern
+  /// on a new message is theirs. We still reject a yes whose sender name IS present
+  /// and is someone OTHER than them (e.g. our own echo), to be safe.
   /// </summary>
   public bool WaitForDMYes(string username, int timeoutSec = 300)
   {
@@ -604,12 +630,16 @@ public sealed class TradeExecutor : IDisposable
       try { msgs = channel.Messages; } catch { continue; }
       for (int m = seen; m < msgs.Count; m++)
       {
-        string who = Try(() => msgs[m].User?.Name) ?? "(system)";
+        string who = SenderName(msgs[m]);
         string raw = (Try(() => msgs[m].Text) ?? "").Trim();
-        Log($"[dm-log] {who}: {raw}");   // diagnostic: show every new message
-        if (!string.Equals(who, username, StringComparison.OrdinalIgnoreCase)) continue;
+        Log($"[dm-log] {(who.Length > 0 ? who : "(?)")}: {raw}");   // diagnostic
         string txt = raw.ToLowerInvariant();
-        if (txt == "y" || txt == "yes" || txt.StartsWith("yes") || txt.StartsWith("y ")) return true;
+        bool isYes = txt == "y" || txt == "yes" || txt.StartsWith("yes") || txt.StartsWith("y ");
+        // Accept when it's a yes AND the sender is either them or name-unavailable
+        // (private DMs often report no sender). A yes with a KNOWN sender that
+        // isn't them (our own echo) is rejected.
+        if (isYes && (who.Length == 0 || string.Equals(who, username, StringComparison.OrdinalIgnoreCase)))
+          return true;
       }
       seen = msgs.Count;
     }
@@ -621,15 +651,23 @@ public sealed class TradeExecutor : IDisposable
   {
     int uid = ResolveUserId(username);
     if (uid <= 0) { Log($"[dm] can't resolve '{username}'"); return; }
+    DumpDMTailById(uid, username, n);
+  }
+
+  /// <summary>Dump the DM tail for a KNOWN user id (no name resolution needed).</summary>
+  public void DumpDMTailById(int uid, string label, int n = 8)
+  {
+    if (uid <= 0) { Log($"[dm] bad id for '{label}'"); return; }
     var channel = ChannelManager.GetPrivateChannel(uid);
     System.Collections.Generic.IList<Message> msgs;
     try { msgs = channel.Messages; } catch (Exception ex) { Log($"[dm] messages read failed: {ex.Message.Split('\n')[0]}"); return; }
-    Log($"[dm] channel with {username} has {msgs.Count} message(s); last {Math.Min(n, msgs.Count)}:");
+    Log($"[dm] channel with {label} has {msgs.Count} message(s); last {Math.Min(n, msgs.Count)}:");
     for (int i = Math.Max(0, msgs.Count - n); i < msgs.Count; i++)
     {
-      string who = Try(() => msgs[i].User?.Name) ?? "(system)";
+      string who = SenderName(msgs[i]);
+      int? id = Try(() => (int?)Unbind((object)msgs[i]).FromUser.Id);
       string txt = (Try(() => msgs[i].Text) ?? "").Trim();
-      Log($"    {who}: {txt}");
+      Log($"    {(who.Length > 0 ? who : "(?)")}{(id.HasValue ? $" [id={id}]" : "")}: {txt}");
     }
   }
 
