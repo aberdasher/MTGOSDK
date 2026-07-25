@@ -784,7 +784,7 @@ public sealed class TradeExecutor : IDisposable
   /// guarantees we hand over only the offered card AND actually get the requested
   /// one (so an incomplete or lopsided deal is cancelled, never committed).
   /// </summary>
-  public bool VerifySwap(TradeEscrow esc, string giveCard, int giveQty, string getCard, int getQty)
+  public bool VerifySwap(TradeEscrow esc, string giveCard, int giveQty, string getCard, int getQty, bool log = true)
   {
     var give = new List<(string name, int qty)>();
     var recv = new List<(string name, int qty)>();
@@ -796,9 +796,12 @@ public sealed class TradeExecutor : IDisposable
     bool giveOk = give.Count == 1 && give[0].qty == giveQty && (give[0].name?.ToLowerInvariant().Contains(giveCard.ToLowerInvariant()) ?? false);
     bool recvOk = recv.Count == 1 && recv[0].qty == getQty  && (recv[0].name?.ToLowerInvariant().Contains(getCard.ToLowerInvariant()) ?? false);
     bool ok = giveOk && recvOk;
-    string gs = give.Count == 0 ? "(none)" : string.Join(", ", give.Select(g => $"{g.qty}x {g.name}"));
-    string rs = recv.Count == 0 ? "(none)" : string.Join(", ", recv.Select(r => $"{r.qty}x {r.name}"));
-    Log($"[guardrail] WE GIVE = {gs} (need {giveQty}x {giveCard}); WE RECEIVE = {rs} (need {getQty}x {getCard}) => {(ok ? "OK (both sides exact)" : "REJECT")}");
+    if (log)
+    {
+      string gs = give.Count == 0 ? "(none)" : string.Join(", ", give.Select(g => $"{g.qty}x {g.name}"));
+      string rs = recv.Count == 0 ? "(none)" : string.Join(", ", recv.Select(r => $"{r.qty}x {r.name}"));
+      Log($"[guardrail] WE GIVE = {gs} (need {giveQty}x {giveCard}); WE RECEIVE = {rs} (need {getQty}x {getCard}) => {(ok ? "OK (both sides exact)" : "REJECT")}");
+    }
     return ok;
   }
 
