@@ -355,6 +355,24 @@ public sealed class GameCard(dynamic gameCard) : DLRWrapper<IGameCard>
 
   public bool IsLand => (bool?)(@base.IsLand) ?? false;
 
+  /// <summary>Whether the card is currently face-down (morph/manifest/foretell/cloak).</summary>
+  public bool IsFaceDown => (bool?)(@base.IsFaceDown) ?? false;
+
+  /// <summary>Whether the permanent is phased out.</summary>
+  public bool IsPhasedOut => (bool?)(@base.IsPhasedOut) ?? false;
+
+  /// <summary>Marker flag: this thing carries the Monarch designation (holder = Controller).</summary>
+  public bool IsMonarch => (bool?)(@base.IsMonarch) ?? false;
+
+  /// <summary>Marker flag: this thing carries the City's Blessing (holder = Controller).</summary>
+  public bool IsCitysBlessing => (bool?)(@base.IsCitysBlessing) ?? false;
+
+  /// <summary>Marker flag: this thing is the max-speed emblem (holder = Controller).</summary>
+  public bool IsSpeedEmblem => (bool?)(@base.IsSpeedEmblem) ?? false;
+
+  /// <summary>Whether this card is a commander.</summary>
+  public bool IsCommander => (bool?)(@base.IsCommander) ?? false;
+
   //
   // IGameCard wrapper methods
   //

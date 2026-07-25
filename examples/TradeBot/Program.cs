@@ -51,6 +51,10 @@ using MTGOSDK.Core.Security;
 
 using TradeBot;
 
+using GS = MTGOSDK.API.Play.Games;
+using GSProc = MTGOSDK.API.Play.Games.Processors;
+using GSArgs = MTGOSDK.API.Play.Games.Processors.EventArgs;
+
 static void Line(string s = "") => Console.WriteLine(s);
 
 // Reads the private chat channel bound to a trade and prints the last `last`
@@ -210,6 +214,155 @@ static void DumpGameState(MTGOSDK.API.Play.Games.Game g, int maxCardsPerZone = 4
     }
   }
   catch (Exception ex) { Line($"  (shared zones unavailable: {ex.Message.Split('\n')[0]})"); }
+}
+
+// Acquire a full GameStateSnapshot for a watched game via the SDK processor/event
+// pipeline (the correct, IPC-free path: card partials resolve TypeLine/P/T/zone
+// locally). Subscribing activates the processor; ReadyProcessor() + WaitForPending
+// flush the buffered ticks; we cache the snapshot from whichever event fires.
+static GSProc.GameStateSnapshot? GetSnapshot(GS.Game game, int waitSec = 20)
+{
+  GSProc.GameStateSnapshot? snap = null;
+  Action<GSArgs.PromptChangedEventArgs> onPrompt = a => { try { snap = a.Snapshot; } catch { } };
+  Action<GSArgs.CardChangedEventArgs>   onCard   = a => { try { snap = a.Snapshot; } catch { } };
+  Action<GSArgs.PlayerChangedEventArgs> onPlayer = a => { try { snap = a.Snapshot; } catch { } };
+  try
+  {
+    game.OnPromptChanged += onPrompt;   // first subscribe activates the processor
+    game.OnCardChanged   += onCard;
+    game.OnPlayerChanged += onPlayer;
+    game.ReadyProcessor();              // MANDATORY: drain loop is inert until this
+    game.WaitForPendingProcessing(TimeSpan.FromSeconds(waitSec));
+  }
+  catch (Exception ex) { Line($"  (snapshot subscribe failed: {ex.Message.Split('\n')[0]})"); }
+  for (int i = 0; i < waitSec && snap is null; i++) System.Threading.Thread.Sleep(1000);
+  try { game.ClearEvents(); } catch { }
+  return snap;
+}
+
+static void SnapAdd(System.Collections.Generic.Dictionary<int, System.Collections.Generic.List<GS.GameCard>> d, int k, GS.GameCard c)
+{ if (!d.TryGetValue(k, out var l)) { l = new(); d[k] = l; } l.Add(c); }
+
+static string SnapName(GS.GameCard c) { try { return c.Name ?? "?"; } catch { return "?"; } }
+
+// One permanent/spell rendered with everything a spectator can see about it.
+static string SnapCardLine(GS.GameCard c)
+{
+  string nm = SnapName(c), tl = "";
+  try { tl = (c.TypeLine ?? "").Trim(); } catch { }
+  bool creature = tl.IndexOf("Creature", StringComparison.OrdinalIgnoreCase) >= 0;
+  string pt = "";
+  if (creature) { int pw = 0, to = 0; try { pw = c.Power; to = c.Toughness; } catch { } pt = $" {pw}/{to}"; }
+
+  var extra = new System.Collections.Generic.List<string>();
+  try { int loy = c.Loyalty; if (loy > 0) extra.Add($"loy {loy}"); } catch { }
+  try { int dmg = c.Damage;  if (dmg > 0) extra.Add($"dmg {dmg}"); } catch { }
+  try { int ch = c.CurrentChapter; if (ch > 0) extra.Add($"chapter {ch}"); } catch { }
+  try { int lv = c.CurrentLevel;   if (lv > 0) extra.Add($"level {lv}"); } catch { }
+  try
+  {
+    var g = new System.Collections.Generic.Dictionary<string, int>();
+    foreach (var cc in c.Counters) { var k = cc.ToString() ?? "?"; g[k] = g.GetValueOrDefault(k) + 1; }
+    foreach (var kv in g) extra.Add($"{kv.Key}×{kv.Value}");
+  }
+  catch { }
+
+  var flags = new System.Collections.Generic.List<string>();
+  try { if (c.IsTapped) flags.Add("tapped"); } catch { }
+  try { if (c.IsAttacking) flags.Add("attacking"); } catch { }
+  try { if (c.IsBlocking) flags.Add("blocking"); } catch { }
+  try { if (c.IsBlocked) flags.Add("blocked"); } catch { }
+  try { if (c.HasSummoningSickness) flags.Add("sick"); } catch { }
+  try { if (c.IsToken) flags.Add("token"); } catch { }
+  try { if (c.IsFaceDown) flags.Add("face-down"); } catch { }
+  try { if (c.IsPhasedOut) flags.Add("phased"); } catch { }
+
+  var tail = new System.Collections.Generic.List<string>();
+  if (extra.Count > 0) tail.Add(string.Join(",", extra));
+  if (flags.Count > 0) tail.Add(string.Join(",", flags));
+  string typ = creature ? "" : (tl.Length > 0 ? "  — " + tl : "");
+  return $"{nm}{pt}{typ}{(tail.Count > 0 ? "  [" + string.Join(" | ", tail) + "]" : "")}";
+}
+
+// Render a full board from a GameStateSnapshot: turn/phase/prompt, each player's
+// life+counts+counters+mana, their battlefield (detailed), graveyard/exile, the
+// stack, and global designations (monarch/emblem). All local, no per-card IPC.
+static void DumpGameStateSnap(GSProc.GameStateSnapshot snap)
+{
+  var names = new System.Collections.Generic.Dictionary<int, string>();
+  foreach (var kv in snap.Players)
+  { string nm; try { nm = kv.Value.Name; } catch { nm = null!; } names[kv.Key] = string.IsNullOrWhiteSpace(nm) ? $"P{kv.Key}" : nm; }
+
+  string toAct = snap.PromptedPlayer == byte.MaxValue ? "(all/none)" : names.GetValueOrDefault(snap.PromptedPlayer, $"P{snap.PromptedPlayer}");
+  Line($"  turn {snap.TurnNumber}  phase={snap.CurrentPhase}  toAct={toAct}  ({snap.Cards.Count} visible cards)");
+  if (!string.IsNullOrWhiteSpace(snap.PromptText)) Line($"  prompt: {snap.PromptText.Replace("\n", " ").Trim()}");
+
+  var bf = new System.Collections.Generic.Dictionary<int, System.Collections.Generic.List<GS.GameCard>>();
+  var gy = new System.Collections.Generic.Dictionary<int, System.Collections.Generic.List<GS.GameCard>>();
+  var ex = new System.Collections.Generic.Dictionary<int, System.Collections.Generic.List<GS.GameCard>>();
+  var stack = new System.Collections.Generic.List<GS.GameCard>();
+  var markers = new System.Collections.Generic.List<string>();
+  foreach (var kv in snap.Cards)
+  {
+    var c = kv.Value;
+    string zone = ""; int ctrl = -1, own = -1;
+    try { zone = c.Zone?.Name ?? ""; } catch { }
+    try { ctrl = c.ControllerIndex; } catch { }
+    try { own = c.OwnerIndex; } catch { }
+    try { if (c.IsMonarch) markers.Add($"Monarch: {names.GetValueOrDefault(ctrl, "?")}"); } catch { }
+    try { if (c.IsCitysBlessing) markers.Add($"City's Blessing: {names.GetValueOrDefault(ctrl, "?")}"); } catch { }
+    try { if (c.IsEmblem) markers.Add($"Emblem ({SnapName(c)}): {names.GetValueOrDefault(ctrl, "?")}"); } catch { }
+    switch (zone)
+    {
+      case "Battlefield": SnapAdd(bf, ctrl, c); break;
+      case "Graveyard":   SnapAdd(gy, own, c); break;
+      case "Exile":       SnapAdd(ex, own, c); break;
+      case "Stack":       stack.Add(c); break;
+    }
+  }
+
+  foreach (var idx in System.Linq.Enumerable.OrderBy(snap.Players.Keys, k => k))
+  {
+    var p = snap.Players[idx];
+    int life = 0, hand = 0, lib = 0, grave = 0; string clock = "", counters = "", mana = "";
+    try { life = p.Life; } catch { }
+    try { hand = p.HandCount; } catch { }
+    try { lib = p.LibraryCount; } catch { }
+    try { grave = p.GraveyardCount; } catch { }
+    try { clock = p.ChessClock.ToString(@"mm\:ss"); } catch { }
+    try { var cd = p.Counters; if (cd != null && cd.Count > 0) counters = "  counters=[" + string.Join(",", System.Linq.Enumerable.Select(cd, x => $"{x.Key}:{x.Value}")) + "]"; } catch { }
+    try
+    {
+      var parts = new System.Collections.Generic.List<string>();
+      foreach (var m in p.ManaPool) { try { int amt = m.Amount; if (amt > 0) parts.Add($"{m.Symbol}×{amt}"); } catch { } }
+      if (parts.Count > 0) mana = "  mana=" + string.Join("", parts);
+    }
+    catch { }
+    Line($"\n  ── {names.GetValueOrDefault(idx, $"P{idx}")}   life={life}  hand={hand} lib={lib} grave={grave}{(clock.Length > 0 ? "  clock=" + clock : "")}{counters}{mana}");
+
+    if (bf.TryGetValue(idx, out var perms) && perms.Count > 0)
+    {
+      Line($"      battlefield ({perms.Count}):");
+      foreach (var c in perms) Line($"        {SnapCardLine(c)}");
+    }
+    if (gy.TryGetValue(idx, out var gcards) && gcards.Count > 0)
+      Line($"      graveyard ({gcards.Count}): {string.Join(", ", System.Linq.Enumerable.Select(gcards, SnapName))}");
+    if (ex.TryGetValue(idx, out var ecards) && ecards.Count > 0)
+      Line($"      exile ({ecards.Count}): {string.Join(", ", System.Linq.Enumerable.Select(ecards, SnapName))}");
+  }
+
+  if (stack.Count > 0)
+  {
+    Line($"\n  ── stack ({stack.Count}) [resolves top-down]:");
+    foreach (var c in stack)
+    { int ci = -1; try { ci = c.ControllerIndex; } catch { } Line($"        {names.GetValueOrDefault(ci, "?")}: {SnapCardLine(c)}"); }
+  }
+
+  if (markers.Count > 0)
+  {
+    Line("\n  ── designations:");
+    foreach (var m in System.Linq.Enumerable.Distinct(markers)) Line($"        {m}");
+  }
 }
 
 // Tail a game's LogChannel, printing new lines as they stream in (a spectated
@@ -2160,7 +2313,12 @@ using (var exec = new TradeExecutor { AllowCommit = allowCommit })
       if (watched is null) { Line($"(game {gid} not found after watch — re-run `gamelog`)"); break; }
       DumpGameLog(watched, 60);
       if (args.Any(a => a.Equals("--state", StringComparison.OrdinalIgnoreCase)))
-      { Line("\n-- board state --"); DumpGameState(watched); }
+      {
+        Line("\n-- board state (snapshot) --");
+        var s = GetSnapshot(watched);
+        if (s != null) DumpGameStateSnap(s);
+        else Line("  (no snapshot arrived — the game may be idle; retry, or add --stream to catch activity)");
+      }
       if (stream) StreamGameLog(watched);
       break;
     }
