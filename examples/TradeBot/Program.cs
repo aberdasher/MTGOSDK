@@ -2312,6 +2312,22 @@ using (var exec = new TradeExecutor { AllowCommit = allowCommit })
       var watched = FindGames().FirstOrDefault(x => { try { return x.Id == gid; } catch { return false; } });
       if (watched is null) { Line($"(game {gid} not found after watch — re-run `gamelog`)"); break; }
       DumpGameLog(watched, 60);
+
+      // --record: stream a COMPLETE, replayable NDJSON record of the whole game
+      // (header + full-board state per tick + interleaved log + final result) until
+      // the game finishes or --minutes elapses. Usage: spectate --any --record [--out=<path>] [--minutes=N]
+      if (args.Any(a => a.Equals("--record", StringComparison.OrdinalIgnoreCase)))
+      {
+        int minutes = 90;
+        var mflag = args.FirstOrDefault(a => a.StartsWith("--minutes=", StringComparison.OrdinalIgnoreCase));
+        if (mflag != null && int.TryParse(mflag.Substring("--minutes=".Length), out var mm)) minutes = mm;
+        string outPath = args.FirstOrDefault(a => a.StartsWith("--out=", StringComparison.OrdinalIgnoreCase))?.Substring("--out=".Length)
+                         ?? System.IO.Path.Combine(TradeBot.GameRecorder.DefaultDir, $"game-{gid}-{DateTime.Now:yyyyMMdd-HHmmss}.ndjson");
+        Line($"\nRecording game {gid} -> {outPath}  (until finished or {minutes} min; Ctrl+C to stop)...");
+        TradeBot.GameRecorder.Run(watched, outPath, minutes);
+        break;
+      }
+
       if (args.Any(a => a.Equals("--state", StringComparison.OrdinalIgnoreCase)))
       {
         Line("\n-- board state (snapshot) --");
