@@ -465,13 +465,13 @@ public sealed class Game(dynamic game) : DLRWrapper<IGame>
         if (message == null) return null; // Ignore invalid messages.
 
         // Always compute elapsed game time for the clock field.
-        // GameResultsInfo_t.PlayingTime is unreliable — it reports
+        // GameResultsInfo_t.PlayingTime is unreliable -- it reports
         // sentinel values or garbage for untimed matches, and for
-        // timed matches it represents time remaining, not elapsed.
-        TimeSpan elapsed = game.EndTime is DateTime endTime
-                        && endTime > game.StartTime
-          ? endTime - game.StartTime
-          : DateTime.Now - game.StartTime;
+        // timed matches it represents time remaining and not elapsed.
+        TimeSpan elapsed = game.CompletedDuration
+          ?? (game.EndTime is DateTime endTime && endTime > game.StartTime
+              ? endTime - game.StartTime
+              : DateTime.Now - game.StartTime);
 
         List<GamePlayerResult> results = new();
         foreach(var entry in message.GameResults)
