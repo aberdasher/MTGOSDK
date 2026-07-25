@@ -677,6 +677,15 @@ if (mode == "ledger")
   return;
 }
 
+// Control UI: a local web panel that composes orders + spawns the `worker` process.
+// This process does NOT attach to MTGO (the spawned worker does), so it runs without
+// a live client.
+if (mode == "ui")
+{
+  TradeBot.ControlUi.Run(args);
+  return;
+}
+
 bool mtgoRunning = Process.GetProcessesByName("MTGO").Length > 0;
 if (!mtgoRunning && attachOnly)
 {
@@ -1970,6 +1979,7 @@ using (var exec = new TradeExecutor { AllowCommit = allowCommit })
       Line("  swap      : swap <partner> [--give=<card>] [--get=<card>] [--listen] --yes  (offer one card, request another; --listen watches for YES continuously; add --commit)");
       Line("  grabfrom  : grabfrom <partner> [card] [--listen] --yes  (receive a card, give nothing; add --commit)");
       Line("  worker    : worker [--dir=<path>] --yes                 (drain a folder of trade-order JSONs; add --commit for orders marked commit:true)");
+      Line("  ui        : ui [--dir=<path>] [--port=5577]             (local web control panel: compose orders, run the worker, watch status)");
       Line("  low-level : opentrade <bot> --yes | takecard <card> --yes | grab <bot> --yes | invite <user> --yes");
       Line("  test      : stagetest <bot> [card] --yes  (controlled TakeCard test: stage -> observe -> cancel)");
       Line("  outward   : post \"<msg>\" --yes | clearpost --yes");

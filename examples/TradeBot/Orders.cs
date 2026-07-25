@@ -112,4 +112,59 @@ public static class OrderQueue
   }
 
   public static string NowIso() => DateTime.Now.ToString("yyyy-MM-ddTHH:mm:ss");
+
+  /// <summary>Parse an order from a JSON string (null on failure).</summary>
+  public static TradeOrder? Parse(string json)
+  {
+    try { return JsonSerializer.Deserialize<TradeOrder>(json, Opts); } catch { return null; }
+  }
+
+  /// <summary>Write an order as &lt;dir&gt;/&lt;id&gt;.json (assigns an id if missing). Returns the path.</summary>
+  public static string SaveOrder(string dir, TradeOrder o)
+  {
+    Directory.CreateDirectory(dir);
+    if (string.IsNullOrWhiteSpace(o.Id)) o.Id = "ord-" + DateTime.Now.ToString("yyyyMMdd-HHmmss");
+    var path = Path.Combine(dir, o.Id + ".json");
+    File.WriteAllText(path, JsonSerializer.Serialize(o, Opts));
+    return path;
+  }
+
+  /// <summary>Every order in the folder merged with its status, as a JSON array (for the UI).</summary>
+  public static string AllJson(string dir)
+  {
+    var items = new List<object>();
+    if (Directory.Exists(dir))
+      foreach (var f in Directory.GetFiles(dir, "*.json").OrderBy(x => x, StringComparer.OrdinalIgnoreCase))
+      {
+        if (f.EndsWith(".status.json", StringComparison.OrdinalIgnoreCase)) continue;
+        TradeOrder? o = null;
+        try { o = JsonSerializer.Deserialize<TradeOrder>(File.ReadAllText(f), Opts); } catch { }
+        if (o is null) continue;
+        if (string.IsNullOrWhiteSpace(o.Id)) o.Id = Path.GetFileNameWithoutExtension(f);
+        OrderStatus? s = null;
+        var sp = StatusPathFor(f);
+        if (File.Exists(sp)) { try { s = JsonSerializer.Deserialize<OrderStatus>(File.ReadAllText(sp), Opts); } catch { } }
+        items.Add(new { id = o.Id, partner = o.MtgoPartner, give = o.Give, receive = o.Receive, commit = o.Commit,
+                        status = s?.Status ?? "pending", detail = s?.Detail ?? "" });
+      }
+    return JsonSerializer.Serialize(items, Opts);
+  }
+
+  /// <summary>Delete order files whose status is terminal (completed/cancelled/failed/unsupported), + their status files.</summary>
+  public static int ClearDone(string dir)
+  {
+    int n = 0;
+    if (!Directory.Exists(dir)) return 0;
+    foreach (var f in Directory.GetFiles(dir, "*.json"))
+    {
+      if (f.EndsWith(".status.json", StringComparison.OrdinalIgnoreCase)) continue;
+      var sp = StatusPathFor(f);
+      if (!File.Exists(sp)) continue;
+      string st = "";
+      try { st = JsonSerializer.Deserialize<OrderStatus>(File.ReadAllText(sp), Opts)?.Status ?? ""; } catch { }
+      if (st is "completed" or "completed_dryrun" or "cancelled" or "failed" or "unsupported")
+      { try { File.Delete(f); } catch { } try { File.Delete(sp); } catch { } n++; }
+    }
+    return n;
+  }
 }
