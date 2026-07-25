@@ -19,6 +19,15 @@
                      clear it. Requires --yes (publishes public content).
     clearpost        OUTWARD-FACING: retract your marketplace listing. Requires --yes.
     invite <user>    OUTWARD-FACING: send a trade invite. Requires --yes.
+    gamelog [--stream]
+                     READ-ONLY: list the games the client is aware of + dump the
+                     LogChannel (action log) of any it is WATCHING. --stream tails
+                     new log lines live.
+    spectate <gameId|player> [--stream]   OR   spectate --any [--stream]
+                     Drive the client to WATCH a live game itself (dispatch
+                     PlayerEventActions.WatchGame() into the game's Match), then dump
+                     + stream its action log. --any auto-picks the first live game.
+                     Read-only observation (registers as a watcher; no state change).
 
   Availability gating: bots advertise "open"/"free" vs "busy" in their post
   message; the acquire modes read that (read-only, no ping) and only invite open
@@ -71,6 +80,175 @@ static int DumpChat(MTGOSDK.API.Trade.TradeEscrow e, int last = 10)
     Line($"    [{ts}] {who}: {txt}");
   }
   return msgs.Count;
+}
+
+// Dump a spectated/replay game's action log (Game.LogChannel = "the log channel for
+// all game actions") + basic state. Read-only. `g` is a wrapped SDK Game.
+static void DumpGameLog(MTGOSDK.API.Play.Games.Game g, int last = 60)
+{
+  int id = -1, turn = -1; string status = "?", phase = "?"; bool rep = false;
+  try { id = g.Id; } catch { }
+  try { status = g.Status.ToString(); } catch { }
+  try { rep = g.IsReplay; } catch { }
+  try { turn = g.CurrentTurn; } catch { }
+  try { phase = g.CurrentPhase.ToString(); } catch { }
+  var players = new System.Collections.Generic.List<string>();
+  try { foreach (var p in g.Players) { try { players.Add(p.Name); } catch { } } } catch { }
+  Line($"\n=== Game {id}{(rep ? "  [REPLAY]" : "")}  status={status}  turn={turn} phase={phase}  players={(players.Count > 0 ? string.Join(" vs ", players) : "?")} ===");
+
+  MTGOSDK.API.Chat.Channel? ch = null;
+  try { ch = g.LogChannel; } catch (Exception ex) { Line($"  (log channel unavailable: {ex.Message.Split('\n')[0]})"); return; }
+  if (ch is null) { Line("  (no log channel)"); return; }
+  System.Collections.Generic.IList<MTGOSDK.API.Chat.Message> msgs;
+  try { msgs = ch.Messages; } catch (Exception ex) { Line($"  (log messages unavailable: {ex.Message.Split('\n')[0]})"); return; }
+  Line($"  game log: {msgs.Count} entries; last {Math.Min(last, msgs.Count)}:");
+  for (int i = Math.Max(0, msgs.Count - last); i < msgs.Count; i++)
+  {
+    string who = "", txt = "";
+    try { who = msgs[i].User?.Name ?? ""; } catch { }
+    try { txt = (msgs[i].Text ?? "").Replace("\n", " ").Replace("\r", " ").Trim(); } catch { }
+    Line($"    {(who.Length > 0 ? who + ": " : "")}{txt}");
+  }
+}
+
+// Dump one player zone (battlefield in detail; others brief name lists). Reads the
+// live per-game zone model of a WATCHED game. Each field is a remote read → wrapped
+// in try/catch and capped to bound IPC on big boards.
+static void DumpZone(MTGOSDK.API.Play.Games.Game g, MTGOSDK.API.Play.Games.GamePlayer p,
+                     MTGOSDK.API.Play.Games.CardZone zone, string label, int max, bool brief = false)
+{
+  MTGOSDK.API.Play.Games.GameZone gz;
+  try { gz = g.GetGameZone(p, zone); } catch { return; }   // zone not present for this player
+  System.Collections.Generic.List<MTGOSDK.API.Play.Games.GameCard> cards;
+  try { cards = System.Linq.Enumerable.ToList(gz.Cards); } catch { return; }
+  if (cards.Count == 0) return;
+  Line($"      {label} ({cards.Count}):");
+  int shown = 0;
+  foreach (var c in cards)
+  {
+    if (shown++ >= max) { Line($"        ... (+{cards.Count - max} more)"); break; }
+    string nm = "?"; try { nm = c.Name; } catch { }
+    if (brief) { Line($"        {nm}"); continue; }
+    string pt = ""; var flags = new System.Collections.Generic.List<string>();
+    try { string tl = c.TypeLine ?? ""; if (tl.IndexOf("Creature", StringComparison.OrdinalIgnoreCase) >= 0)
+          { int dmg = 0; try { dmg = c.Damage; } catch { } pt = $" {c.Power}/{c.Toughness}" + (dmg > 0 ? $" (dmg {dmg})" : ""); } } catch { }
+    try { int loy = c.Loyalty; if (loy > 0) flags.Add($"loy {loy}"); } catch { }
+    try { if (c.IsTapped) flags.Add("tapped"); } catch { }
+    try { if (c.IsAttacking) flags.Add("attacking"); } catch { }
+    try { if (c.IsBlocking) flags.Add("blocking"); } catch { }
+    try { if (c.HasSummoningSickness) flags.Add("sick"); } catch { }
+    try { if (c.IsToken) flags.Add("token"); } catch { }
+    try { if (System.Linq.Enumerable.Any(c.Counters)) flags.Add("counters"); } catch { }
+    Line($"        {nm}{pt}{(flags.Count > 0 ? "  [" + string.Join(",", flags) + "]" : "")}");
+  }
+}
+
+// Snapshot the STRUCTURED board state of a watched game (vs the text log): turn/
+// phase/prompt, each player's life+counts+counters+mana, their battlefield (with
+// P/T, tapped, combat, counters), graveyard/exile, and the stack. Read-only pull.
+static void DumpGameState(MTGOSDK.API.Play.Games.Game g, int maxCardsPerZone = 40)
+{
+  int turn = -1; string phase = "?", active = "?", priority = "?", prompt = "";
+  try { turn = g.CurrentTurn; } catch { }
+  try { phase = g.CurrentPhase.ToString(); } catch { }
+  try { active = g.ActivePlayer?.Name ?? "?"; } catch { }
+  try { priority = g.PriorityPlayer?.Name ?? "?"; } catch { }
+  try { prompt = g.Prompt?.Text ?? ""; } catch { }
+  Line($"  turn {turn}  phase={phase}  active={active}  priority={priority}");
+  if (prompt.Length > 0) Line($"  prompt: {prompt.Replace("\n", " ").Trim()}");
+  try { var w = System.Linq.Enumerable.ToList(g.WinningPlayers);
+        if (w.Count > 0) Line($"  winner(s): {string.Join(", ", w.ConvertAll(p => { try { return p.Name; } catch { return "?"; } }))}"); } catch { }
+
+  System.Collections.Generic.IList<MTGOSDK.API.Play.Games.GamePlayer> players;
+  try { players = g.Players; } catch (Exception ex) { Line($"  (players unavailable: {ex.Message.Split('\n')[0]})"); return; }
+  foreach (var p in players)
+  {
+    string name = "?", clock = "", counters = "", mana = ""; int life = 0, hand = 0, lib = 0, grave = 0;
+    try { name = p.Name; } catch { }
+    try { life = p.Life; } catch { }
+    try { hand = p.HandCount; } catch { }
+    try { lib = p.LibraryCount; } catch { }
+    try { grave = p.GraveyardCount; } catch { }
+    try { clock = p.ChessClock.ToString(@"mm\:ss"); } catch { }
+    try { var c = p.Counters; if (c != null && c.Count > 0) counters = "  counters=[" + string.Join(",", System.Linq.Enumerable.Select(c, kv => $"{kv.Key}:{kv.Value}")) + "]"; } catch { }
+    try { int mp = System.Linq.Enumerable.Count(p.ManaPool); if (mp > 0) mana = $"  mana={mp}"; } catch { }
+    Line($"\n  ── {name}   life={life}  hand={hand} lib={lib} grave={grave}{(clock.Length > 0 ? "  clock=" + clock : "")}{counters}{mana}");
+    DumpZone(g, p, MTGOSDK.API.Play.Games.CardZone.Battlefield, "battlefield", maxCardsPerZone);
+    DumpZone(g, p, MTGOSDK.API.Play.Games.CardZone.Graveyard, "graveyard", 15, brief: true);
+    DumpZone(g, p, MTGOSDK.API.Play.Games.CardZone.Exile, "exile", 15, brief: true);
+  }
+
+  // Shared zones — in MTGO's model the battlefield + stack are SHARED, holding
+  // BOTH players' permanents/spells tagged by controller (so per-player battlefield
+  // lookups above come back empty). Dump them with controller + P/T + combat flags.
+  try
+  {
+    foreach (var z in g.SharedZones)
+    {
+      string zname = "?"; System.Collections.Generic.List<MTGOSDK.API.Play.Games.GameCard> cards;
+      try { zname = z.Name ?? "?"; } catch { }
+      try { cards = System.Linq.Enumerable.ToList(z.Cards); } catch { continue; }
+      if (cards.Count == 0) continue;
+      Line($"\n  ── {zname} ({cards.Count}):");
+      int shown = 0;
+      foreach (var c in cards)
+      {
+        if (shown++ >= maxCardsPerZone) { Line($"      ... (+{cards.Count - maxCardsPerZone} more)"); break; }
+        string nm = "?", ctrl = ""; try { nm = c.Name; } catch { }
+        try { ctrl = c.Controller?.Name ?? ""; } catch { }
+        string pt = ""; var flags = new System.Collections.Generic.List<string>();
+        try { string tl = c.TypeLine ?? ""; if (tl.IndexOf("Creature", StringComparison.OrdinalIgnoreCase) >= 0)
+              { int dmg = 0; try { dmg = c.Damage; } catch { } pt = $" {c.Power}/{c.Toughness}" + (dmg > 0 ? $" (dmg {dmg})" : ""); } } catch { }
+        try { int loy = c.Loyalty; if (loy > 0) flags.Add($"loy {loy}"); } catch { }
+        try { if (c.IsTapped) flags.Add("tapped"); } catch { }
+        try { if (c.IsAttacking) flags.Add("attacking"); } catch { }
+        try { if (c.IsBlocking) flags.Add("blocking"); } catch { }
+        try { if (c.HasSummoningSickness) flags.Add("sick"); } catch { }
+        try { if (c.IsToken) flags.Add("token"); } catch { }
+        Line($"      {(ctrl.Length > 0 ? ctrl + ": " : "")}{nm}{pt}{(flags.Count > 0 ? "  [" + string.Join(",", flags) + "]" : "")}");
+      }
+    }
+  }
+  catch (Exception ex) { Line($"  (shared zones unavailable: {ex.Message.Split('\n')[0]})"); }
+}
+
+// Tail a game's LogChannel, printing new lines as they stream in (a spectated
+// game's actions arrive here live once you're connected as a watcher).
+static void StreamGameLog(MTGOSDK.API.Play.Games.Game g, int maxSeconds = 7200)
+{
+  int gid = -1; try { gid = g.Id; } catch { }
+  Line($"\nStreaming NEW log lines from game {gid} (Ctrl+C to stop)...");
+  int seen = 0; try { seen = g.LogChannel.Messages.Count; } catch { }
+  for (int t = 0; t < maxSeconds; t++)
+  {
+    System.Threading.Thread.Sleep(1000);
+    System.Collections.Generic.IList<MTGOSDK.API.Chat.Message> msgs;
+    try { msgs = g.LogChannel.Messages; } catch { continue; }
+    for (int i = seen; i < msgs.Count; i++)
+    {
+      string who = "", txt = "";
+      try { who = msgs[i].User?.Name ?? ""; } catch { }
+      try { txt = (msgs[i].Text ?? "").Replace("\n", " ").Replace("\r", " ").Trim(); } catch { }
+      Line($"    {(who.Length > 0 ? who + ": " : "")}{txt}");
+    }
+    seen = msgs.Count;
+  }
+}
+
+// Enumerate the games the client currently has (live watched = InProgressGame,
+// replays = ReplayGame), wrapped as SDK Game objects.
+static System.Collections.Generic.List<MTGOSDK.API.Play.Games.Game> FindGames()
+{
+  var games = new System.Collections.Generic.List<MTGOSDK.API.Play.Games.Game>();
+  foreach (var tn in new[] {
+    "WotC.MtGO.Client.Model.Play.InProgressGameEvent.InProgressGame",
+    "WotC.MtGO.Client.Model.Play.ReplayGameEvent.ReplayGame" })
+  {
+    try { foreach (var inst in MTGOSDK.Core.Remoting.RemoteClient.GetInstances(tn))
+          { try { games.Add(new MTGOSDK.API.Play.Games.Game(inst)); } catch { } } }
+    catch (Exception ex) { Line($"(no {tn.Substring(tn.LastIndexOf('.') + 1)} instances — {ex.Message.Split('\n')[0]})"); }
+  }
+  return games;
 }
 
 // Parse an optional `--bots=a,b,c` override for the bot pool. Returns null when
@@ -1898,6 +2076,92 @@ using (var exec = new TradeExecutor { AllowCommit = allowCommit })
         presentBinder: "SwapOffer");
       if (esc is null) { Line($"Swap not started with {partner} (no YES, or the invite wasn't accepted). Nothing moved."); exec.CancelCurrent(); WaitForNoTrade(); break; }
       RunSwapCycle(exec, esc, partner, giveCard, giveQty, getNames, allowCommit);
+      break;
+    }
+
+    case "gamelog":
+    {
+      // READ-ONLY spectate capture: dump the action log + state of any game the
+      // client is currently WATCHING (or replaying). Game.LogChannel is "the log
+      // channel for all game actions" -- the full play-by-play. This does NOT start
+      // watching; watch a game manually in MTGO first (Play -> a room like
+      // "Free For all Best of 3" -> double-click a match to WATCH it), then run this.
+      // Usage: gamelog [--stream]   (--stream tails new log lines live)
+      bool stream = args.Any(a => a.Equals("--stream", StringComparison.OrdinalIgnoreCase));
+      var games = FindGames();
+      if (games.Count == 0)
+      {
+        Line("No games found on the client.");
+        Line("In MTGO: Play -> a room (e.g. Free For All Best of 3) -> double-click a match to WATCH it, then re-run `gamelog`.");
+        break;
+      }
+      bool state = args.Any(a => a.Equals("--state", StringComparison.OrdinalIgnoreCase));
+      Line($"Found {games.Count} game(s) on the client.");
+      foreach (var g in games)
+      {
+        DumpGameLog(g, 60);
+        if (state) { Line("  -- board state --"); DumpGameState(g); }
+      }
+      if (stream) StreamGameLog(games[0]);
+      break;
+    }
+
+    case "spectate":
+    {
+      // AUTO-SPECTATE: drive the client to WATCH a live game itself, then dump its
+      // action log. `target` is a game id (from `gamelog`) or a player-name substring.
+      // Read-only observation (registers you as a watcher; no game/trade state change).
+      // Usage: spectate <gameId|playerName> [--stream]   OR   spectate --any [--stream]
+      bool any = args.Any(a => a.Equals("--any", StringComparison.OrdinalIgnoreCase));
+      string? target = args.Skip(1).FirstOrDefault(a => !a.StartsWith("--"));
+      bool stream = args.Any(a => a.Equals("--stream", StringComparison.OrdinalIgnoreCase));
+
+      // Build the candidate list: an explicit id/player, or (with --any) every live
+      // Started game the client can see — we try each until one accepts a watcher
+      // (tournament matches often disallow spectators, so the first isn't always it).
+      var candidates = new System.Collections.Generic.List<string>();
+      if (!string.IsNullOrWhiteSpace(target)) candidates.Add(target);
+      else if (any)
+      {
+        foreach (var gm in FindGames())
+          try { if (gm.Status.ToString() == "Started") candidates.Add(gm.Id.ToString()); } catch { }
+        if (candidates.Count == 0)
+        {
+          Line("No in-progress (Started) games are loaded on the client.");
+          Line("Open the Play lobby / a room's Watch (Games) list in MTGO so live matches appear, then retry `spectate --any`.");
+          break;
+        }
+        Line($"{candidates.Count} live game(s) to try (some competitive matches disallow watchers)...");
+      }
+      else
+      {
+        Line("Usage: spectate <gameId|playerName> [--stream] [--state]   OR   spectate --any [--stream] [--state]");
+        Line("Tip: run `gamelog` first to list live game ids + players, then `spectate <id>`.");
+        break;
+      }
+
+      bool ok = false; int gid = -1; string detail = "";
+      foreach (var cand in candidates)
+      {
+        Line($"Attempting to watch '{cand}'...");
+        (ok, gid, detail) = exec.WatchGame(cand);
+        Line($"  -> ok={ok} game={gid} — {detail}");
+        if (ok) break;
+      }
+      if (!ok)
+      {
+        Line("Could not start watching any candidate. Open a CASUAL room (e.g. Free For All");
+        Line("Best of 3) so watchable games load — competitive/tournament matches block spectators.");
+        break;
+      }
+
+      System.Threading.Thread.Sleep(2000);   // let the first log entries stream in
+      var watched = FindGames().FirstOrDefault(x => { try { return x.Id == gid; } catch { return false; } });
+      if (watched is null) { Line($"(game {gid} not found after watch — re-run `gamelog`)"); break; }
+      DumpGameLog(watched, 60);
+      if (args.Any(a => a.Equals("--state", StringComparison.OrdinalIgnoreCase)))
+      { Line("\n-- board state --"); DumpGameState(watched); }
+      if (stream) StreamGameLog(watched);
       break;
     }
 

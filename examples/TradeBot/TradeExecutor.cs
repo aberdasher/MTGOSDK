@@ -48,6 +48,16 @@ public sealed class TradeExecutor : IDisposable
   const string A_FinalApprove = ActionsNs + ".SendFlsEscrowFinalApproveReqAction";
   const string A_Cancel       = ActionsNs + ".SendDosEscrowCancelReqAction";
 
+  // Play-domain (spectate) types. A watchable game the client knows about lives as
+  // an InProgressGame; you watch it by dispatching a WatchGameAction into its owning
+  // Match (Match.Process(Object) is NON-generic — a plain .Process(action) works).
+  // The match handler MatchNotJoinedEventUnderwayState.WatchGameHandler sends the
+  // FlsGameWatchReq; on success the state machine streams game data and the game's
+  // LogChannel populates. LocalUserIsWatching flips true once connected.
+  const string InProgressGameT   = "WotC.MtGO.Client.Model.Play.InProgressGameEvent.InProgressGame";
+  const string ReplayGameT       = "WotC.MtGO.Client.Model.Play.ReplayGameEvent.ReplayGame";
+  const string PlayerEventActionsT = "WotC.MtGO.Client.Model.Play.ClientActions.PlayerEventActions";
+
   // MTGO's own trade-window view-model (Shiny.Trade). Requesting a partner card
   // through THIS builds the item-update message (permission code etc.) via the
   // client's own logic, instead of us synthesizing a CollectionItem and guessing
@@ -428,6 +438,91 @@ public sealed class TradeExecutor : IDisposable
       Log($"[cleanup] cancel failed: {ex.GetType().Name}: {ex.Message}" +
           (inner != null ? $" || inner: {inner.GetType().Name}: {inner.Message}" : ""));
     }
+  }
+
+  // Read a game's player names via the SDK Game wrapper (several IPC hops).
+  static List<string> ReadPlayerNames(object cand)
+  {
+    var names = new List<string>();
+    try { foreach (var p in new MTGOSDK.API.Play.Games.Game(cand).Players)
+          { try { names.Add(p.Name); } catch { } } } catch { }
+    return names;
+  }
+
+  /// <summary>
+  /// Spectate a live game the client can see (an InProgressGame). <paramref name="target"/>
+  /// is a game id (e.g. "957359540") or a player-name substring. Dispatches
+  /// PlayerEventActions.WatchGame() into the game's owning Match (Match.Process is
+  /// non-generic), then polls LocalUserIsWatching. Read-only observation — no game or
+  /// trade state changes, but it does register you as a watcher (visible to players).
+  /// Returns (ok, gameId, detail).
+  /// </summary>
+  public (bool ok, int gameId, string detail) WatchGame(string target, int waitSec = 30)
+  {
+    bool wantId = int.TryParse(target, out int idWanted);
+
+    dynamic? rawGame = null; int gid = -1; string players = "?";
+    try
+    {
+      foreach (var cand in RemoteClient.GetInstances(InProgressGameT))
+      {
+        dynamic g = Unbind((object)cand);
+        int id = Try<int>(() => (int)g.Id);
+        // When matching by id, don't pay to read player names on every game — only
+        // read them once we've matched (name reads are several IPC hops per game).
+        List<string>? names = null;
+        bool hit;
+        if (wantId) hit = id == idWanted;
+        else { names = ReadPlayerNames(cand); hit = names.Any(n => n.IndexOf(target, StringComparison.OrdinalIgnoreCase) >= 0); }
+        if (hit)
+        {
+          rawGame = g; gid = id;
+          names ??= ReadPlayerNames(cand);
+          players = names.Count > 0 ? string.Join(" vs ", names) : "?";
+          break;
+        }
+      }
+    }
+    catch (Exception ex) { return (false, -1, $"could not enumerate games: {ex.Message.Split('\n')[0]}"); }
+
+    if (rawGame is null) return (false, -1, $"no in-progress game matched '{target}'");
+
+    if (Try<bool>(() => (bool)rawGame.LocalUserIsWatching))
+    { Log($"[watch] already watching game {gid} ({players})."); return (true, gid, "already watching"); }
+
+    dynamic match;
+    try { match = Unbind((object)rawGame.Match); }
+    catch (Exception ex) { return (false, gid, $"could not read game.Match: {ex.Message.Split('\n')[0]}"); }
+
+    string stateName = Try(() => (string)match.CurrentEventState.GetType().Name) ?? "?";
+    bool allowed = Try<bool>(() => (bool)match.AreWatchersAllowed);
+    Log($"[watch] game {gid} ({players}) — match state={stateName} AreWatchersAllowed={allowed}");
+
+    // Many competitive/tournament matches disable spectating — bail before dispatching.
+    if (!allowed) return (false, gid, $"watchers not allowed for this match (state {stateName})");
+
+    dynamic action;
+    try { action = RemoteClient.InvokeMethod(PlayerEventActionsT, "WatchGame", null); }
+    catch (Exception ex) { return (false, gid, $"could not build WatchGameAction: {ex.Message.Split('\n')[0]}"); }
+
+    bool processed = false; string perr = "";
+    try { OnUI(() => { processed = (bool)match.Process(action); }); }
+    catch (Exception ex) { perr = ex.Message.Split('\n')[0]; }
+    Log($"[watch] match.Process(WatchGameAction) -> {processed}{(perr.Length > 0 ? " (" + perr + ")" : "")}");
+
+    // A false Process means the match rejected it (wrong state) — don't waste the poll.
+    if (!processed) return (false, gid, $"match did not accept WatchGameAction (state {stateName})");
+
+    // Poll until the watch connects: LocalUserIsWatching flips, or turn/log populate.
+    for (int i = 0; i < waitSec; i++)
+    {
+      System.Threading.Thread.Sleep(1000);
+      if (Try<bool>(() => (bool)rawGame.LocalUserIsWatching)) return (true, gid, $"watching (LocalUserIsWatching, {i + 1}s)");
+      if (Try<int>(() => (int)rawGame.CurrentTurn) > 0)       return (true, gid, $"watching (turn advanced, {i + 1}s)");
+    }
+    return (processed, gid, processed
+        ? "dispatched; watch not confirmed within timeout (may still be connecting)"
+        : "match did not accept WatchGameAction (likely wrong state or watchers not allowed)");
   }
 
   /// <summary>
