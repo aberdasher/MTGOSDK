@@ -303,6 +303,80 @@ public sealed class TradeExecutor : IDisposable
     Log("[trade] advanced binder selection (SendTradeInvitationReqAction) — invite dispatched");
   }
 
+  const string BinderSelectorVM  = "Shiny.Trade.ViewModels.BinderSelectorDialogViewModel";
+  const string SelectableBinderT = "Shiny.Trade.ViewModels.SelectableBinder";
+
+  /// <summary>
+  /// Make <paramref name="binderName"/> the client's LAST-USED binder. The trade
+  /// invite (SendTradeInvitationReqAction, dispatched by AdvanceBinderSelection) is
+  /// parameterless, so the binder it PRESENTS comes from this ambient state
+  /// (ICollectionGroupingManager.LastUsedBinder, which has a public setter). Set
+  /// this to the Lending binder right before advancing so the partner sees only it.
+  /// Returns true if set. Non-committing.
+  /// </summary>
+  public bool SetLastUsedBinder(string binderName)
+  {
+    var binder = MTGOSDK.API.Collection.CollectionManager.Binders
+      .FirstOrDefault(b => string.Equals(Try(() => b.Name) ?? "", binderName, StringComparison.OrdinalIgnoreCase));
+    if (binder is null) { Log($"[binder] '{binderName}' not found — cannot set as last-used."); return false; }
+    try
+    {
+      dynamic mgr = Unbind((object)ObjectProvider.Get(IGroupingManager, true, false, false));
+      dynamic ib  = Unbind((object)binder);
+      OnUI(() => { mgr.LastUsedBinder = ib; });
+      Log($"[binder] LastUsedBinder = '{binderName}' (id={Try(() => binder.Id)}).");
+      return true;
+    }
+    catch (Exception ex) { Log($"[binder] set LastUsedBinder failed: {ex.GetType().Name}: {ex.Message.Split('\n')[0]}"); return false; }
+  }
+
+  /// <summary>
+  /// At InviteSelectBinder, present a SPECIFIC binder so the partner sees ONLY that
+  /// binder's cards. Drives MTGO's own binder-selector dialog VM the way a human
+  /// does: Initialize(escrow) → set Selected to a SelectableBinder wrapping the
+  /// named binder → ExecuteOkCommand (records the chosen binder for THIS escrow AND
+  /// dispatches the invite). Non-committing. Returns true iff the OK command ran;
+  /// on any failure returns false so the caller can fall back to
+  /// AdvanceBinderSelection (which still dispatches the invite, but with the
+  /// default/last-used binder).
+  /// </summary>
+  public bool PresentBinder(TradeEscrow escrow, string binderName)
+  {
+    var binder = MTGOSDK.API.Collection.CollectionManager.Binders
+      .FirstOrDefault(b => string.Equals(Try(() => b.Name) ?? "", binderName, StringComparison.OrdinalIgnoreCase));
+    if (binder is null) { Log($"[binder] '{binderName}' not found — cannot present it."); return false; }
+
+    bool ok = false;
+    try
+    {
+      OnUI(() =>
+      {
+        dynamic esc = Unbind(escrow);
+        // Build our own dialog VM wired to THIS escrow (same as MTGO's own, which
+        // opens invisibly from the injected thread — we drive ours directly).
+        dynamic dlg = RemoteClient.CreateInstance(BinderSelectorVM);
+        try { dlg.Initialize(esc); }
+        catch (Exception ex) { Log($"[binder] dialog.Initialize threw (continuing): {ex.Message.Split('\n')[0]}"); }
+
+        dynamic ib  = Unbind((object)binder);                          // IBinder
+        dynamic sel = RemoteClient.CreateInstance(SelectableBinderT, ib, dlg); // (IBinder, dialogVM)
+        dlg.Selected = sel;
+
+        bool can = Try<bool>(() => (bool)dlg.CanExecuteOkCommand());
+        if (can) { dlg.ExecuteOkCommand(); ok = true; }
+        else Log("[binder] CanExecuteOkCommand=false after selecting — cannot present via dialog.");
+      });
+    }
+    catch (Exception ex)
+    {
+      Log($"[binder] PresentBinder failed: {ex.GetType().Name}: {ex.Message.Split('\n')[0]}");
+      return false;
+    }
+    Log(ok ? $"[binder] presented '{binderName}' via dialog OkCommand — invite dispatched."
+           : $"[binder] could not present '{binderName}' via dialog.");
+    return ok;
+  }
+
   public void Cancel(TradeEscrow escrow)
   {
     dynamic remote = Unbind(escrow);
@@ -713,6 +787,31 @@ public sealed class TradeExecutor : IDisposable
     => CreateBinder(binderName, new[] { cardName });
 
   /// <summary>
+  /// Find a printing (catId) of <paramref name="cardName"/> that THIS account
+  /// actually OWNS (quantity &gt; 0). A binder only surfaces owned copies of the
+  /// EXACT printing, so a binder built from GetCard(name) (which returns
+  /// printing[0]) shows EMPTY to a trade partner when the owned copy is a different
+  /// printing. Returns (catId, quantity), or (-1, 0) if none owned. Read-only.
+  /// </summary>
+  public (int catId, int qty) ResolveOwnedPrinting(string cardName)
+  {
+    System.Collections.Generic.HashSet<int> printings;
+    try { printings = MTGOSDK.API.Collection.CollectionManager.GetCardIds(cardName).ToHashSet(); }
+    catch { return (-1, 0); }
+    try
+    {
+      foreach (var it in MTGOSDK.API.Collection.CollectionManager.Collection.Items)
+      {
+        int id  = Try(() => it.Id) ?? -1;
+        int qty = Try(() => it.Quantity) ?? 0;
+        if (qty > 0 && printings.Contains(id)) return (id, qty);
+      }
+    }
+    catch (Exception ex) { Log($"[owned] collection scan failed: {ex.Message.Split('\n')[0]}"); }
+    return (-1, 0);
+  }
+
+  /// <summary>
   /// Create (or reuse) a trade binder named <paramref name="binderName"/>
   /// containing one of each of <paramref name="cardNames"/> (quantity 1 each).
   /// Operates entirely on THIS (the bot's) account. Returns the Binder, or null.
@@ -728,13 +827,28 @@ public sealed class TradeExecutor : IDisposable
     }
 
     // Resolve each card name to its underlying ICardDefinition (skip unresolved).
+    // PREFER a printing we actually OWN — otherwise the binder shows EMPTY to a
+    // trade partner (they only see owned copies of the exact printing).
     var defs = new List<dynamic>();
     foreach (var cn in cardNames)
     {
       dynamic d = null;
-      try { d = Unbind(MTGOSDK.API.Collection.CollectionManager.GetCard(cn)); }
+      try
+      {
+        var (ownedCat, ownedQty) = ResolveOwnedPrinting(cn);
+        if (ownedCat > 0)
+        {
+          d = Unbind(MTGOSDK.API.Collection.CollectionManager.GetCard(ownedCat));
+          Log($"[binder] resolved '{cn}' -> OWNED printing catId={ownedCat} (qty {ownedQty}).");
+        }
+        else
+        {
+          d = Unbind(MTGOSDK.API.Collection.CollectionManager.GetCard(cn));
+          Log($"[binder] '{cn}': NOT owned in any printing — using default printing; binder will show EMPTY to partners.");
+        }
+      }
       catch (Exception ex) { Log($"[binder] could not resolve '{cn}' — skipping ({ex.Message.Split('\n')[0]})"); }
-      if (d != null) { defs.Add(d); Log($"[binder] resolved '{cn}'."); }
+      if (d != null) defs.Add(d);
     }
     if (defs.Count == 0) { Log("[binder] no cards resolved — aborting."); return null; }
 

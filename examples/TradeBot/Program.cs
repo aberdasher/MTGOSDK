@@ -104,7 +104,7 @@ static bool WaitForNoTrade(int maxMs = 6000)
 // Returns the negotiating escrow, or null if it didn't get there (bot busy /
 // declined / timed out). Does NOT retry internally — the caller decides whether
 // to retry the same bot or ROTATE to a different one (so we never spam a bot).
-static MTGOSDK.API.Trade.TradeEscrow? TryReachNegotiation(TradeBot.TradeExecutor exec, string bot)
+static MTGOSDK.API.Trade.TradeEscrow? TryReachNegotiation(TradeBot.TradeExecutor exec, string bot, string? presentBinder = null)
 {
   try { exec.RequestTrade(bot); }
   catch (Exception ex) { Line($"(initiate threw but escrow likely opened: {ex.Message.Split('\n')[0]})"); }
@@ -130,7 +130,16 @@ static MTGOSDK.API.Trade.TradeEscrow? TryReachNegotiation(TradeBot.TradeExecutor
     {
       if (!advanced)
       {
-        try { exec.AdvanceBinderSelection(e0); advanced = true; }
+        try
+        {
+          // If a specific binder was requested (GIVE side), make it the last-used
+          // binder FIRST so the parameterless invite action presents ONLY it, then
+          // dispatch the invite via the proven AdvanceBinderSelection (the dialog
+          // OkCommand path does NOT advance the escrow — verified live).
+          if (presentBinder != null) exec.SetLastUsedBinder(presentBinder);
+          exec.AdvanceBinderSelection(e0);
+          advanced = true;
+        }
         catch (Exception ex) { Line($"(binder advance threw: {ex.Message.Split('\n')[0]})"); }
       }
     }
@@ -238,7 +247,7 @@ bool allowCommit = (mode == "autofullgrab" || mode == "lend") && args.Contains("
 
 Line("=== MTGOSDK TradeBot prototype ===");
 Line($"mode={mode}  allowCommit={allowCommit.ToString().ToLowerInvariant()}" +
-     (allowCommit ? "  *** WILL COMMIT (final approve) — acquiring a FREE card ***" : "  (no commit)") + "\n");
+     (allowCommit ? $"  *** WILL COMMIT (final approve) — {(mode == "lend" ? "GIVING a card away" : "acquiring a free card")} ***" : "  (no commit)") + "\n");
 
 // Ledger view needs no MTGO connection.
 if (mode == "ledger")
@@ -1185,6 +1194,101 @@ using (var exec = new TradeExecutor { AllowCommit = allowCommit })
       break;
     }
 
+    case "owned":
+    {
+      // READ-ONLY: for a card name, list every printing (catId) and how many THIS
+      // account owns of each — to pick a printing a lend binder can actually show.
+      // Usage: owned <cardname>
+      string name = arg1.Length > 0 ? arg1 : (args.Skip(1).FirstOrDefault() ?? "");
+      if (name.Length == 0) { Line("Usage: owned <cardname>"); break; }
+      exec.Attach();
+      System.Collections.Generic.List<int> ids;
+      try { ids = MTGOSDK.API.Collection.CollectionManager.GetCardIds(name).ToList(); }
+      catch (Exception ex) { Line($"No card named '{name}' ({ex.Message.Split('\n')[0]})."); break; }
+      Line($"'{name}' has {ids.Count} printing(s): {string.Join(", ", ids)}");
+      var col = MTGOSDK.API.Collection.CollectionManager.Collection;
+      var ownedByCat = new System.Collections.Generic.Dictionary<int,int>();
+      try { foreach (var it in col.Items) { int id = it.Id; if (ids.Contains(id)) ownedByCat[id] = (ownedByCat.TryGetValue(id, out var q) ? q : 0) + it.Quantity; } }
+      catch (Exception ex) { Line($"(collection scan failed: {ex.Message.Split('\n')[0]})"); }
+      int total = 0;
+      foreach (var id in ids) { int q = ownedByCat.TryGetValue(id, out var v) ? v : 0; total += q; Line($"  catId={id,-8} owned={q}"); }
+      var (oc, oq) = exec.ResolveOwnedPrinting(name);
+      Line(oc > 0 ? $"\nOwned printing a binder can present: catId={oc} (qty {oq}). Total owned across printings: {total}."
+                  : $"\nYou own NONE of '{name}' in any printing — a lend binder of it would show empty.");
+      break;
+    }
+
+    case "lendinvite":
+    {
+      // ATTEMPT the give-side SETUP only: DM the recipient, then initiate a trade
+      // that PRESENTS the dedicated Lending binder (so they see only <card>).
+      // STRICTLY DRY-RUN — there is NO commit path here, so it can never give
+      // anything. Always cancels at the end. This is the "message then make the
+      // lending binder available" step, isolated from the actual hand-over.
+      // Usage: lendinvite <recipient> [cardname] --yes
+      string recipient = arg1;
+      string card = args.Skip(2).FirstOrDefault(a => !a.StartsWith("--")) ?? "Azimaet Drake";
+      if (recipient.Length == 0) { Line("Usage: lendinvite <recipient> [cardname] --yes"); break; }
+      if (!yes) { Line($"Refusing: DMs '{recipient}' and sends a trade invite presenting the Lending binder ('{card}'). Dry-run — commits/gives NOTHING. Re-run with --yes."); break; }
+      Line($"Lend-invite to {recipient}: DM, then present the Lending binder ('{card}').  [dry-run — gives nothing, always cancels]");
+
+      exec.Attach();
+
+      // 0) ensure the dedicated single-card Lending binder exists.
+      var lendBinder = exec.CreateSingleCardBinder("Lending", card);
+      if (lendBinder is null) { Line("Could not create/find the Lending binder — aborting."); break; }
+      Line($"Lending binder ready: '{lendBinder.Name}' (id={lendBinder.Id}, items={lendBinder.ItemCount}).");
+
+      // 1) make sure the client knows the recipient (buddy-add if needed), then DM.
+      if (!exec.EnsureKnownUser(recipient))
+      { Line($"Could not resolve '{recipient}' (spelling? they may need to accept the buddy request) — aborting."); break; }
+      try { exec.SendDM(recipient, $"Hi {recipient} — I'd like to lend you {card}. Sending you a trade now; grab it from my Lending binder."); }
+      catch (Exception ex) { Line($"DM failed: {ex.Message} — aborting."); break; }
+      System.Threading.Thread.Sleep(1500);
+      exec.DumpDMTail(recipient);
+
+      // 2) initiate + PRESENT the Lending binder (dispatches the invite).
+      var esc = TryReachNegotiation(exec, recipient, presentBinder: "Lending");
+      if (esc is null)
+      {
+        Line($"\nInvite dispatched, but no trade negotiation opened (recipient offline, or didn't accept the invite in time). Nothing given.");
+        exec.CancelCurrent(); WaitForNoTrade();
+        break;
+      }
+      Line($"\n>>> TRADE OPEN with {esc.TradePartnerName} — Lending binder presented ({card}). They can grab it. <<<");
+
+      // 3) HOLD open + observe (NEVER commit). Cancel at the end — gives nothing.
+      //    Highlight the moment WE GIVE becomes non-empty = they grabbed from the
+      //    presented binder (proof it was available with the right card).
+      string lastGive = "", lastState = "";
+      bool sawGrab = false;
+      for (int i = 0; i < 90; i++)
+      {
+        System.Threading.Thread.Sleep(1000);
+        MTGOSDK.API.Trade.TradeEscrow? c = null;
+        try { c = MTGOSDK.API.Trade.TradeManager.CurrentTrade; } catch { }
+        if (c is null) { Line("Trade closed by the other side."); esc = null; break; }
+        esc = c;
+        string give = TradeBot.TradeExecutor.Summarize(c.TradedItems);
+        string state = c.State.ToString();
+        if (give != lastGive || state != lastState)
+        {
+          Line($"  t+{i,3}s state={state}  WE GIVE: {give}");
+          lastGive = give; lastState = state;
+        }
+        if (!sawGrab && !string.IsNullOrWhiteSpace(give) && give != "(none)" && give != "(empty)")
+        { Line($"  *** {esc.TradePartnerName} grabbed from the Lending binder: {give} ***"); sawGrab = true; }
+      }
+      if (sawGrab) Line("\nConfirmed: the Lending binder was available and its card was grabbable.");
+      if (esc != null)
+      {
+        Line("\n[dry-run] Done observing — cancelling (nothing committed, nothing given).");
+        exec.CancelCurrent(); WaitForNoTrade();
+      }
+      try { exec.SendDM(recipient, "That was a test invite — cancelling for now. Thanks!"); } catch { }
+      break;
+    }
+
     case "lend":
     {
       // TARGETED LEND (custodian / GIVE side) — UNTESTED end to end (needs a
@@ -1216,7 +1320,7 @@ using (var exec = new TradeExecutor { AllowCommit = allowCommit })
       try { exec.SendDM(recipient, $"Great — sending the trade now. Grab the {card} from my offer and submit."); } catch { }
 
       // 2) initiate + advance binder (the recipient must accept the invite in MTGO)
-      var esc = TryReachNegotiation(exec, recipient);
+      var esc = TryReachNegotiation(exec, recipient, presentBinder: "Lending");
       if (esc is null)
       {
         Line($"Could not open a trade with {recipient} (did they accept the invite in time?).");
