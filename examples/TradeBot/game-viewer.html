@@ -31,8 +31,10 @@
   .brand{display:flex;flex-direction:column;min-width:0}
   .brand .k{font-size:10px;letter-spacing:.15em;text-transform:uppercase;color:var(--accent)}
   .brand .g{font-weight:650;font-size:14px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:28vw}
-  .turn{display:flex;align-items:center;gap:8px;padding:4px 10px;background:var(--raised);border:1px solid var(--line);border-radius:8px;white-space:nowrap}
-  .turn b{font-size:14px}.turn .ph{color:var(--accent);font-weight:600;font-size:13px}
+  .turn{display:flex;align-items:center;gap:8px;padding:4px 10px;background:var(--raised);border:1px solid var(--line);border-radius:8px;white-space:nowrap;width:270px;overflow:hidden}
+  .turn b{font-size:14px;flex:none}
+  .turn .ph{color:var(--accent);font-weight:600;font-size:13px;flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis}
+  .turn .dn{flex:none}
   .dn{font-size:12px;padding:1px 7px;border-radius:6px;border:1px solid var(--line)}
   .dn.night{color:#9db4d6;background:color-mix(in srgb,#3a4a6a 30%,transparent)} .dn.day{color:var(--accent);background:color-mix(in srgb,var(--accent) 14%,transparent)}
   .transport{display:flex;align-items:center;gap:8px;flex:1;min-width:280px}
