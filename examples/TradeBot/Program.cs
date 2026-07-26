@@ -2399,8 +2399,9 @@ using (var exec = new TradeExecutor { AllowCommit = allowCommit })
       int maxMin = 90;
       var mm = FlagVal("--max-min");
       if (mm != null && int.TryParse(mm, out var mmv)) maxMin = Math.Max(1, mmv);
-      string summary = TradeBot.MatchWatcher.WatchAndReportPair(exec, parts[0], parts[1], FlagVal("--session"), maxMin, dry);
-      Line(summary);
+      // WatchAndReportPair already prints its own summary line (so does the daemon path);
+      // don't re-print the returned string here.
+      TradeBot.MatchWatcher.WatchAndReportPair(exec, parts[0], parts[1], FlagVal("--session"), maxMin, dry);
       break;
     }
 
