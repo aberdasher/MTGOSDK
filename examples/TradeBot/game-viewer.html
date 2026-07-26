@@ -113,7 +113,9 @@
   .ct .atk{position:absolute;right:2px;top:2px;font-size:10px;z-index:3;filter:drop-shadow(0 0 2px #000)}
 
   #arrows{position:fixed;inset:0;width:100vw;height:100vh;pointer-events:none;z-index:20}
-  #arrows path.arrow{fill:none;stroke:var(--bad);stroke-width:2.5;opacity:.9;stroke-linecap:round}
+  #arrows path{fill:none;stroke-width:2.5;opacity:.9;stroke-linecap:round}
+  #arrows path.attack{stroke:var(--bad)}
+  #arrows path.target{stroke:var(--seat0);stroke-width:2;stroke-dasharray:5 4;opacity:.8}
 
   .center .cturn{font-family:var(--mono);font-size:12px;color:var(--muted)} .center .cturn b{color:var(--ink)}
   .stackzone{display:flex;align-items:center;gap:8px;flex-wrap:wrap;max-width:56%}
@@ -140,9 +142,8 @@
     <div class="turn"><b class="num" id="turn">—</b><span class="ph" id="phase"></span><span class="dn" id="dn" hidden></span></div>
     <div class="transport">
       <button class="tbtn" id="prevturn" title="Previous turn">⟪</button>
-      <button class="tbtn" id="prev" title="Previous step (←)">‹</button>
-      <button class="tbtn" id="play" title="Play / pause (space)">▶</button>
-      <button class="tbtn" id="next" title="Next step (→)">›</button>
+      <button class="tbtn" id="prev" title="Step back (←)">‹ Back</button>
+      <button class="tbtn" id="next" title="Step forward (→ or space)">Step ›</button>
       <button class="tbtn" id="nextturn" title="Next turn">⟫</button>
       <div class="timeline"><input type="range" id="slider" min="0" max="0" value="0" /><div class="marks" id="marks"></div></div>
       <select id="turnsel" title="Jump to turn"></select>
@@ -163,6 +164,8 @@
   <svg id="arrows"><defs>
     <marker id="ah" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
       <path d="M0 0 L10 5 L0 10 z" fill="var(--bad)"/></marker>
+    <marker id="ah2" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M0 0 L10 5 L0 10 z" fill="var(--seat0)"/></marker>
   </defs></svg>
 </div>
 
@@ -173,7 +176,7 @@
   const SEAT=["--seat0","--seat1","--seat2","--seat3"], SEAT_HEX={ "--seat0":"#4a90d9","--seat1":"#d0574a","--seat2":"#57a468","--seat3":"#c9a24a" };
   const PIP={W:"#f3edd6",U:"#5a9bd8",B:"#8d7fa0",R:"#d0674f",G:"#63ab74",C:"#b9bcc4"};
   const $=id=>document.getElementById(id);
-  let header=null,states=[],logs=[],overlays=[],reveals=[],result=null,idx=0,playing=false,timer=null,artOn=true,cur=null;
+  let header=null,states=[],logs=[],overlays=[],reveals=[],result=null,idx=0,artOn=true,cur=null;
   const badArt=new Set(), tokenArt=new Map();
 
   function parse(text){ header=null;states=[];logs=[];overlays=[];reveals=[];result=null;let ord=0;
@@ -308,7 +311,7 @@
     const centerEl=()=>{ const c=document.createElement("div"); c.className="center";
       const ct=document.createElement("div"); ct.className="cturn"; ct.innerHTML=`<b>Turn ${s.turn}</b> · ${s.phase||""}`+(s.prompt?` · <span style="color:var(--muted)">${esc(clean(s.prompt))}</span>`:""); c.appendChild(ct);
       if(stack.length){ const sz=document.createElement("div"); sz.className="stackzone"; const sl=document.createElement("span"); sl.className="sl"; sl.textContent="Stack"; sz.appendChild(sl);
-        stack.forEach(x=>{ const si=document.createElement("span"); si.className="si"; si.textContent=(names[x.controller]||"?")+": "+(x.name||"?")+((x.targets&&x.targets.length)?" → "+x.targets.join(", "):""); sz.appendChild(si);}); c.appendChild(sz); }
+        stack.forEach(x=>{ const si=document.createElement("span"); si.className="si"; if(x.id!=null)si.dataset.cid=x.id; si.textContent=(names[x.controller]||"?")+": "+(x.name||"?")+((x.targets&&x.targets.length)?" → "+x.targets.join(", "):""); sz.appendChild(si);}); c.appendChild(sz); }
       const rc=revealAt(s._ord); if(rc.length){ const rz=document.createElement("div"); rz.className="revealzone"; rz.textContent="Revealed: "+rc.map(x=>x.name).join(", "); c.appendChild(rz); }
       return c; };
     if(duel){
@@ -322,21 +325,27 @@
     requestAnimationFrame(()=>drawCombat(s));
   }
 
-  // combat arrows
-  function drawCombat(s){ const svg=$("arrows"); [...svg.querySelectorAll("path.arrow")].forEach(n=>n.remove()); if(!s)return;
-    const table=$("table"); const byId={}; table.querySelectorAll(".ct[data-cid]").forEach(el=>byId[el.dataset.cid]=el);
-    const av={}; table.querySelectorAll(".avatar[data-player]").forEach(el=>av[el.dataset.player]=el);
+  // combat (red) + spell/ability target (blue dashed) arrows
+  function drawCombat(s){ const svg=$("arrows"); [...svg.querySelectorAll("path.attack,path.target")].forEach(n=>n.remove()); if(!s)return;
+    const table=$("table"); const byId={}; table.querySelectorAll("[data-cid]").forEach(el=>{ if(!byId[el.dataset.cid])byId[el.dataset.cid]=el; });
+    const av={},avByName={}; table.querySelectorAll(".avatar[data-player]").forEach(el=>av[el.dataset.player]=el);
+    (s.players||[]).forEach(p=>{ if(av[p.index])avByName[(p.name||"").toLowerCase()]=av[p.index]; });
+    const nameToTile={}; s.cards.forEach(c=>{ if(byId[c.id]&&!nameToTile[c.name])nameToTile[c.name]=byId[c.id]; });
     const cen=el=>{const r=el.getBoundingClientRect();return [r.left+r.width/2,r.top+r.height/2];};
+    // combat: attacker -> blocker(s), or -> opponent when unblocked
     s.cards.forEach(c=>{ if(!c.attacking||c.zone!=="Battlefield")return; const from=byId[c.id]; if(!from)return;
       const blockers=s.cards.filter(x=>x.blocks&&x.blocks.includes(c.name)); const tg=[];
       if(blockers.length){ blockers.forEach(b=>{ if(byId[b.id])tg.push(byId[b.id]); }); }
       else { const opp=Object.keys(av).find(k=>+k!==c.controller); if(opp!=null&&av[opp])tg.push(av[opp]); }
-      const [x1,y1]=cen(from); tg.forEach(t=>{ const [x2,y2]=cen(t); arrow(svg,x1,y1,x2,y2); }); });
+      const [x1,y1]=cen(from); tg.forEach(t=>{ const [x2,y2]=cen(t); arrow(svg,x1,y1,x2,y2,"attack"); }); });
+    // spell/ability targets: source -> each resolved target (card tile or player avatar)
+    s.cards.forEach(c=>{ if(!c.targets||!c.targets.length)return; const from=byId[c.id]; if(!from)return; const [x1,y1]=cen(from);
+      c.targets.forEach(tn=>{ const el=avByName[(tn||"").toLowerCase()]||nameToTile[tn]; if(el&&el!==from){ const [x2,y2]=cen(el); arrow(svg,x1,y1,x2,y2,"target"); } }); });
   }
-  function arrow(svg,x1,y1,x2,y2){ const p=document.createElementNS("http://www.w3.org/2000/svg","path");
+  function arrow(svg,x1,y1,x2,y2,cls){ const p=document.createElementNS("http://www.w3.org/2000/svg","path");
     const mx=(x1+x2)/2,my=(y1+y2)/2,dx=x2-x1,dy=y2-y1,len=Math.hypot(dx,dy)||1,cu=Math.min(28,len*0.14);
     const cx=mx-dy/len*cu, cy=my+dx/len*cu; p.setAttribute("d",`M${x1} ${y1} Q ${cx} ${cy} ${x2} ${y2}`);
-    p.setAttribute("class","arrow"); p.setAttribute("marker-end","url(#ah)"); svg.appendChild(p); }
+    p.setAttribute("class",cls); p.setAttribute("marker-end",cls==="target"?"url(#ah2)":"url(#ah)"); svg.appendChild(p); }
 
   // timeline turn marks + jump
   let turnStarts=[];
@@ -345,7 +354,7 @@
     const n=states.length; let lastTurn=null;
     for(let i=0;i<n;i++){ const t=states[i].turn; if(t!==lastTurn){ turnStarts.push({turn:t,i});
       const m=document.createElement("div"); m.className="mark"; m.dataset.turn=t; m.style.left=(n>1?(i/(n-1)*100):0)+"%"; m.textContent=t; m.title="Turn "+t+" — "+(states[i].phase||"");
-      m.onclick=()=>{ setPlay(false); go(i); }; marks.appendChild(m);
+      m.onclick=()=>go(i); marks.appendChild(m);
       const o=document.createElement("option"); o.value=t; o.textContent="Turn "+t; sel.appendChild(o); lastTurn=t; } }
   }
   function markCur(){ const t=states[idx].turn; [...$("marks").children].forEach(m=>m.classList.toggle("cur",+m.dataset.turn===t)); }
@@ -360,15 +369,14 @@
   function lastLE(o){ let m=-1; for(const l of logs){ if(l._ord<=o&&l._ord>m)m=l._ord; } return m; }
 
   function go(i){ idx=Math.max(0,Math.min(states.length-1,i)); render(); }
-  function setPlay(on){ playing=on; $("play").textContent=on?"❚❚":"▶"; if(timer){clearInterval(timer);timer=null;} if(on)timer=setInterval(()=>{ if(idx>=states.length-1){setPlay(false);return;} go(idx+1); },1200); }
-  $("prev").onclick=()=>{setPlay(false);go(idx-1);}; $("next").onclick=()=>{setPlay(false);go(idx+1);}; $("play").onclick=()=>setPlay(!playing);
-  $("prevturn").onclick=()=>{setPlay(false);jumpTurn(-1);}; $("nextturn").onclick=()=>{setPlay(false);jumpTurn(1);};
-  $("slider").oninput=e=>{setPlay(false);go(+e.target.value);};
-  $("turnsel").onchange=e=>{ const t=+e.target.value; const st=turnStarts.find(x=>x.turn===t); if(st){setPlay(false);go(st.i);} };
+  $("prev").onclick=()=>go(idx-1); $("next").onclick=()=>go(idx+1);
+  $("prevturn").onclick=()=>jumpTurn(-1); $("nextturn").onclick=()=>jumpTurn(1);
+  $("slider").oninput=e=>go(+e.target.value);
+  $("turnsel").onchange=e=>{ const t=+e.target.value; const st=turnStarts.find(x=>x.turn===t); if(st)go(st.i); };
   $("logtoggle").onclick=()=>{ $("app").classList.toggle("nolog"); $("logtoggle").classList.toggle("on"); requestAnimationFrame(()=>drawCombat(cur)); };
   $("arttoggle").onclick=()=>{ artOn=!artOn; $("arttoggle").classList.toggle("on",artOn); render(); };
   document.addEventListener("keydown",e=>{ if(e.target.tagName==="INPUT"||e.target.tagName==="SELECT")return;
-    if(e.key==="ArrowLeft"){setPlay(false);go(idx-1);e.preventDefault();} else if(e.key==="ArrowRight"){setPlay(false);go(idx+1);e.preventDefault();} else if(e.key===" "){setPlay(!playing);e.preventDefault();} });
+    if(e.key==="ArrowLeft"){go(idx-1);e.preventDefault();} else if(e.key==="ArrowRight"||e.key===" "){go(idx+1);e.preventDefault();} });
   $("file").onchange=e=>{ const f=e.target.files[0]; if(!f)return; const rd=new FileReader(); rd.onload=()=>{ badArt.clear();tokenArt.clear(); parse(rd.result); $("slider").max=Math.max(0,states.length-1); buildTimeline(); go(0); }; rd.readAsText(f); };
   window.addEventListener("resize",()=>drawCombat(cur));
   $("table").addEventListener("scroll",()=>drawCombat(cur),true);
