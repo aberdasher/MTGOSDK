@@ -22,52 +22,58 @@
   *{box-sizing:border-box}
   body{margin:0;background:var(--bg);color:var(--ink);font-family:var(--sans);font-size:14px;-webkit-font-smoothing:antialiased}
   .app{display:flex;flex-direction:column;height:100vh;min-height:0}
-  h2,h3{margin:0;font-weight:650}
+  h2{margin:0;font-weight:650}
   button{font:inherit;color:inherit;cursor:pointer}
+  select{font:inherit;color:var(--ink);background:var(--raised);border:1px solid var(--line);border-radius:7px;padding:4px 6px}
   .num{font-variant-numeric:tabular-nums}
 
-  .topbar{display:flex;align-items:center;gap:14px;padding:7px 13px;background:var(--panel);border-bottom:1px solid var(--line);flex-wrap:wrap;z-index:6}
+  .topbar{display:flex;align-items:center;gap:12px;padding:6px 13px;background:var(--panel);border-bottom:1px solid var(--line);flex-wrap:wrap;z-index:30}
   .brand{display:flex;flex-direction:column;min-width:0}
   .brand .k{font-size:10px;letter-spacing:.15em;text-transform:uppercase;color:var(--accent)}
-  .brand .g{font-weight:650;font-size:14px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:34vw}
+  .brand .g{font-weight:650;font-size:14px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:28vw}
   .turn{display:flex;align-items:center;gap:8px;padding:4px 10px;background:var(--raised);border:1px solid var(--line);border-radius:8px;white-space:nowrap}
   .turn b{font-size:14px}.turn .ph{color:var(--accent);font-weight:600;font-size:13px}
   .dn{font-size:12px;padding:1px 7px;border-radius:6px;border:1px solid var(--line)}
   .dn.night{color:#9db4d6;background:color-mix(in srgb,#3a4a6a 30%,transparent)} .dn.day{color:var(--accent);background:color-mix(in srgb,var(--accent) 14%,transparent)}
-  .transport{display:flex;align-items:center;gap:9px;flex:1;min-width:240px}
-  .transport input[type=range]{flex:1;accent-color:var(--accent);height:4px}
-  .tbtn{background:var(--raised);border:1px solid var(--line);border-radius:7px;width:32px;height:29px;display:grid;place-items:center}
+  .transport{display:flex;align-items:center;gap:8px;flex:1;min-width:280px}
+  .tbtn{background:var(--raised);border:1px solid var(--line);border-radius:7px;min-width:30px;height:28px;padding:0 6px;display:grid;place-items:center}
   .tbtn:hover{border-color:var(--accent-dim)}
-  .tick{font-family:var(--mono);font-size:12px;color:var(--muted);white-space:nowrap;min-width:62px;text-align:right}
-  .toolbtn{font-size:12px;color:var(--muted);padding:5px 9px;border:1px solid var(--line);border-radius:7px;background:var(--raised)}
+  .timeline{flex:1;position:relative;min-width:180px}
+  .timeline input[type=range]{width:100%;accent-color:var(--accent);height:4px;margin:0}
+  .marks{position:relative;height:15px;margin-top:1px}
+  .mark{position:absolute;top:0;transform:translateX(-50%);font-family:var(--mono);font-size:9px;color:var(--faint);cursor:pointer;white-space:nowrap;text-align:center}
+  .mark::before{content:"";display:block;width:1px;height:5px;background:var(--faint);margin:0 auto 1px}
+  .mark:hover{color:var(--accent)} .mark:hover::before{background:var(--accent)}
+  .mark.cur{color:var(--accent);font-weight:700} .mark.cur::before{background:var(--accent);height:7px}
+  .tick{font-family:var(--mono);font-size:12px;color:var(--muted);white-space:nowrap;min-width:56px;text-align:right}
+  .toolbtn{font-size:12px;color:var(--muted);padding:4px 9px;border:1px solid var(--line);border-radius:7px;background:var(--raised)}
   .toolbtn:hover,.toolbtn.on{border-color:var(--accent-dim);color:var(--ink)}
-  .load{font-size:12px;color:var(--muted);display:inline-flex;gap:6px;padding:5px 9px;border:1px dashed var(--line);border-radius:7px}
+  .load{font-size:12px;color:var(--muted);display:inline-flex;gap:6px;padding:4px 9px;border:1px dashed var(--line);border-radius:7px}
   .load input{display:none}.load:hover{border-color:var(--accent-dim);color:var(--ink)}
 
-  .body{display:flex;flex:1;min-height:0}
+  .body{display:flex;flex:1;min-height:0;position:relative}
   .table{flex:1;min-width:0;overflow:auto;display:flex;flex-direction:column;background:var(--bg)}
-
-  /* duel: two facing sides + center strip */
   .table.duel{overflow:hidden}
   .side{flex:1;min-height:0;display:flex;flex-direction:column;padding:6px 10px;gap:5px;overflow:auto;position:relative}
   .side.top{background:radial-gradient(120% 90% at 50% 0%, var(--felt-a), var(--felt-b))}
   .side.bottom{background:radial-gradient(120% 90% at 50% 100%, var(--felt-a), var(--felt-b));flex-direction:column-reverse}
-  .side::before{content:"";position:absolute;inset:0;border:2px solid var(--seat);opacity:.32;pointer-events:none;border-radius:4px}
+  .side::before{content:"";position:absolute;inset:0;border:2px solid var(--seat);opacity:.3;pointer-events:none;border-radius:4px}
   .side.act::before{opacity:.9;box-shadow:inset 0 0 26px -6px var(--seat)}
   .side.dead{filter:grayscale(.55);opacity:.55}
-  .center{flex:none;min-height:34px;display:flex;align-items:center;gap:14px;justify-content:center;padding:3px 10px;
-    background:linear-gradient(90deg,transparent,var(--feltc),transparent);border-top:1px solid var(--line);border-bottom:1px solid var(--line);position:relative}
+  .center{flex:none;min-height:32px;display:flex;align-items:center;gap:14px;justify-content:center;padding:3px 10px;
+    background:linear-gradient(90deg,transparent,var(--feltc),transparent);border-top:1px solid var(--line);border-bottom:1px solid var(--line)}
+  .table.multi{padding:9px;gap:9px} .table.multi .side{border-radius:12px;border:1px solid var(--line);flex:none}
 
-  /* multiplayer fallback: stacked mats */
-  .table.multi{padding:9px;gap:9px}
-  .table.multi .side{border-radius:12px;border:1px solid var(--line);flex:none}
-
-  /* player bar */
-  .pbar{display:flex;align-items:center;gap:12px;flex:none;padding:2px 2px}
+  .pbar{display:flex;align-items:center;gap:12px;flex:none;padding:2px}
   .avatar{width:34px;height:34px;border-radius:50%;background:var(--seat);color:#10141a;display:grid;place-items:center;font-weight:800;font-size:14px;flex:none;border:2px solid color-mix(in srgb,var(--seat) 60%,#000)}
   .pname{font-weight:700;font-size:15px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-  .life{font-family:var(--mono);font-weight:800;font-size:26px;line-height:1}
+  .life{font-family:var(--mono);font-weight:800;font-size:26px;line-height:1;display:inline-block}
   .life.low{color:var(--bad)}
+  .life.chg{animation:lifePulse .55s}
+  @keyframes lifePulse{0%{transform:scale(1)}28%{transform:scale(1.4)}100%{transform:scale(1)}}
+  .delta{font-family:var(--mono);font-size:13px;font-weight:800;margin-left:2px;animation:deltaFade 1.6s forwards}
+  .delta.up{color:var(--good)} .delta.down{color:var(--bad)}
+  @keyframes deltaFade{0%{opacity:0;transform:translateY(7px)}18%{opacity:1;transform:translateY(0)}78%{opacity:1}100%{opacity:0;transform:translateY(-8px)}}
   .meta{font-family:var(--mono);font-size:11px;color:var(--muted);display:flex;gap:2px 9px;flex-wrap:wrap}
   .statusbadge{font-family:var(--mono);font-size:9.5px;font-weight:700;letter-spacing:.05em;padding:1px 6px;border-radius:5px}
   .statusbadge.won{background:color-mix(in srgb,var(--good) 22%,transparent);color:var(--good);border:1px solid var(--good)}
@@ -76,21 +82,17 @@
   .pip{width:15px;height:15px;border-radius:50%;font-size:9px;font-weight:700;display:grid;place-items:center;color:#141414;border:1px solid rgba(0,0,0,.35)}
   .badge{font-family:var(--mono);font-size:10px;padding:1px 6px;border-radius:5px;background:var(--raised);border:1px solid var(--line);color:var(--muted)}
   .badge.cmd{color:var(--bad);border-color:color-mix(in srgb,var(--bad) 55%,var(--line))}
-  .hand{display:flex;align-items:center;gap:2px}
-  .hand .hlbl{font-family:var(--mono);font-size:10px;color:var(--faint);margin-right:3px}
+  .hand{display:flex;align-items:center;gap:2px}.hand .hlbl{font-family:var(--mono);font-size:10px;color:var(--faint);margin-right:3px}
   .cardback{width:13px;height:19px;border-radius:2px;border:1px solid #0c1a2c;background:repeating-linear-gradient(45deg,#26476e,#26476e 2px,#1c3554 2px,#1c3554 4px)}
   .piles{display:flex;gap:5px;flex-wrap:wrap;margin-left:auto}
   .pile{display:flex;align-items:center;gap:5px;font-family:var(--mono);font-size:10.5px;color:var(--muted);padding:3px 7px;border-radius:6px;background:var(--raised);border:1px solid var(--line);position:relative}
-  .pile .pc{width:11px;height:15px;border-radius:2px;background:var(--faint);box-shadow:2px 0 0 -1px var(--felt-b),3px 0 0 -1px var(--faint)}
-  .pile b{color:var(--ink)}
+  .pile .pc{width:11px;height:15px;border-radius:2px;background:var(--faint);box-shadow:2px 0 0 -1px var(--felt-b),3px 0 0 -1px var(--faint)} .pile b{color:var(--ink)}
   .pile[data-list]:hover::after{content:attr(data-list);position:absolute;bottom:120%;right:0;z-index:30;width:max-content;max-width:340px;white-space:normal;background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:7px 9px;font-size:11px;color:var(--ink);box-shadow:0 10px 30px -12px #000}
 
-  /* battlefield rows */
   .frow{display:flex;flex-wrap:wrap;gap:5px 6px;align-content:flex-start;min-height:calc(var(--card-h) + 4px);padding:2px}
-  .frow.lands{min-height:calc(var(--card-h) * .62)}
+  .frow.lands{min-height:calc(var(--card-h) * .6)}
   .fnote{font-size:11px;color:var(--faint);font-style:italic;align-self:center;padding:4px}
 
-  /* card tile with art + overlays */
   .ct{position:relative;width:var(--card-w);height:var(--card-h);border-radius:5px;flex:none;
     background:linear-gradient(180deg,color-mix(in srgb,var(--tc) 26%,#11151b),#0c1015);
     border:1px solid color-mix(in srgb,var(--tc) 45%,#000);overflow:hidden;box-shadow:0 2px 5px -2px #000}
@@ -100,8 +102,8 @@
   .ct.sick{filter:brightness(.72) saturate(.8)}
   .ct.facedown{background:repeating-linear-gradient(45deg,#26476e,#26476e 4px,#1c3554 4px,#1c3554 8px);border-color:#3a5f8a}
   .ct img.art{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;display:block;background:#0c1015}
+  .ct.hasart .frame{display:none} .ct.noimg img.art{display:none}
   .ct .frame{position:absolute;inset:0;border-top:3px solid var(--tc);padding:3px 4px;display:flex;flex-direction:column}
-  .ct.hasart .frame{display:none}
   .ct .fn{font-size:8.5px;line-height:1.05;font-weight:600;max-height:30px;overflow:hidden}
   .ct .ftype{font-size:7px;color:var(--muted);margin-top:1px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
   .ct .pt{position:absolute;right:2px;bottom:2px;font-family:var(--mono);font-size:10px;font-weight:800;color:#fff;background:rgba(0,0,0,.7);border-radius:4px;padding:0 3px;z-index:3}
@@ -109,11 +111,12 @@
   .ct .ctr{position:absolute;left:2px;top:2px;display:flex;gap:1px;z-index:3}
   .ct .ctr span{font-family:var(--mono);font-size:8px;background:var(--accent);color:#141414;border-radius:3px;padding:0 2px;font-weight:800}
   .ct .atk{position:absolute;right:2px;top:2px;font-size:10px;z-index:3;filter:drop-shadow(0 0 2px #000)}
-  .ct.noimg img.art{display:none}
 
-  .center .cturn{font-family:var(--mono);font-size:12px;color:var(--muted)}
-  .center .cturn b{color:var(--ink)}
-  .stackzone{display:flex;align-items:center;gap:8px;flex-wrap:wrap;max-width:60%}
+  #arrows{position:fixed;inset:0;width:100vw;height:100vh;pointer-events:none;z-index:20}
+  #arrows path.arrow{fill:none;stroke:var(--bad);stroke-width:2.5;opacity:.9;stroke-linecap:round}
+
+  .center .cturn{font-family:var(--mono);font-size:12px;color:var(--muted)} .center .cturn b{color:var(--ink)}
+  .stackzone{display:flex;align-items:center;gap:8px;flex-wrap:wrap;max-width:56%}
   .stackzone .sl{font-size:10px;letter-spacing:.1em;text-transform:uppercase;color:var(--accent)}
   .stackzone .si{font-size:11px;color:var(--ink);background:var(--raised);border:1px solid var(--accent-dim);border-radius:6px;padding:2px 7px}
   .revealzone{font-size:11px;color:var(--seat0)}
@@ -136,10 +139,13 @@
     <div class="brand"><span class="k">MTGO Replay</span><span class="g" id="gtitle">—</span></div>
     <div class="turn"><b class="num" id="turn">—</b><span class="ph" id="phase"></span><span class="dn" id="dn" hidden></span></div>
     <div class="transport">
-      <button class="tbtn" id="prev" title="Previous tick (←)">‹</button>
+      <button class="tbtn" id="prevturn" title="Previous turn">⟪</button>
+      <button class="tbtn" id="prev" title="Previous step (←)">‹</button>
       <button class="tbtn" id="play" title="Play / pause (space)">▶</button>
-      <button class="tbtn" id="next" title="Next tick (→)">›</button>
-      <input type="range" id="slider" min="0" max="0" value="0" />
+      <button class="tbtn" id="next" title="Next step (→)">›</button>
+      <button class="tbtn" id="nextturn" title="Next turn">⟫</button>
+      <div class="timeline"><input type="range" id="slider" min="0" max="0" value="0" /><div class="marks" id="marks"></div></div>
+      <select id="turnsel" title="Jump to turn"></select>
       <span class="tick" id="tick">0 / 0</span>
     </div>
     <button class="toolbtn on" id="arttoggle" title="Toggle card art">Art</button>
@@ -151,30 +157,29 @@
     <aside class="logpane">
       <h2>Play-by-play</h2>
       <div class="log" id="log"></div>
-      <div class="hint"><kbd>←</kbd> <kbd>→</kbd> step · <kbd>space</kbd> play · hover a pile for contents. Card art loads from Scryfall when you open the file locally.</div>
+      <div class="hint"><kbd>←</kbd> <kbd>→</kbd> step · <kbd>space</kbd> play · click a turn on the timeline · hover a pile. Card art loads from Scryfall when opened as a local file.</div>
     </aside>
   </div>
+  <svg id="arrows"><defs>
+    <marker id="ah" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M0 0 L10 5 L0 10 z" fill="var(--bad)"/></marker>
+  </defs></svg>
 </div>
 
 <script type="application/x-ndjson" id="sample"></script>
 <script>
 (function(){
   "use strict";
-  const SEAT=["--seat0","--seat1","--seat2","--seat3"];
-  const SEAT_HEX={ "--seat0":"#4a90d9","--seat1":"#d0574a","--seat2":"#57a468","--seat3":"#c9a24a" };
+  const SEAT=["--seat0","--seat1","--seat2","--seat3"], SEAT_HEX={ "--seat0":"#4a90d9","--seat1":"#d0574a","--seat2":"#57a468","--seat3":"#c9a24a" };
   const PIP={W:"#f3edd6",U:"#5a9bd8",B:"#8d7fa0",R:"#d0674f",G:"#63ab74",C:"#b9bcc4"};
   const $=id=>document.getElementById(id);
-  let header=null,states=[],logs=[],overlays=[],reveals=[],result=null,idx=0,playing=false,timer=null,artOn=true;
-  const badArt=new Set();  // names Scryfall can't resolve — skip retrying
+  let header=null,states=[],logs=[],overlays=[],reveals=[],result=null,idx=0,playing=false,timer=null,artOn=true,cur=null;
+  const badArt=new Set(), tokenArt=new Map();
 
-  function parse(text){
-    header=null;states=[];logs=[];overlays=[];reveals=[];result=null;let ord=0;
-    for(const raw of text.split(/\r?\n/)){ const line=raw.trim(); if(!line)continue; let r; try{r=JSON.parse(line);}catch{continue;}
-      r._ord=ord++;
+  function parse(text){ header=null;states=[];logs=[];overlays=[];reveals=[];result=null;let ord=0;
+    for(const raw of text.split(/\r?\n/)){ const line=raw.trim(); if(!line)continue; let r; try{r=JSON.parse(line);}catch{continue;} r._ord=ord++;
       if(r.type==="header")header=r; else if(r.type==="state")states.push(r); else if(r.type==="log")logs.push(r);
-      else if(r.type==="players")overlays.push(r); else if(r.type==="revealed")reveals.push(r); else if(r.type==="result")result=r; }
-    idx=0;
-  }
+      else if(r.type==="players")overlays.push(r); else if(r.type==="revealed")reveals.push(r); else if(r.type==="result")result=r; } idx=0; }
   function overlayAt(o){ let c=null; for(const x of overlays){ if(x._ord<=o)c=x; else break; } const m={}; if(c)for(const p of c.players)m[p.index]=p; return m; }
   function revealAt(o){ let c=null; for(const x of reveals){ if(x._ord<=o)c=x; else break; } return c&&c.cards?c.cards:[]; }
   function clean(t){ if(!t)return ""; return t.replace(/@\[([^@]*)@:[^\]]*\]/g,"$1").replace(/@P/g,"").replace(/@\{[^}]*\}/g,"").trim(); }
@@ -186,31 +191,36 @@
     if(t.includes("enchant"))return "var(--t-ench)"; return "var(--t-other)"; }
   function shortType(c){ const t=(c.type||""),d=t.indexOf("—"),m=(d>=0?t.slice(0,d):t).trim();
     return m.replace("Legendary","Leg.").replace("Creature","Crea.").replace("Enchantment","Ench.").replace("Artifact","Art.").replace("Planeswalker","PW"); }
-  const isLand=c=>(c.type||"").toLowerCase().includes("land");
-  const isCreature=c=>(c.type||"").toLowerCase().includes("creature");
-  const isPW=c=>(c.type||"").toLowerCase().includes("planeswalker");
+  const isLand=c=>(c.type||"").toLowerCase().includes("land"), isCreature=c=>(c.type||"").toLowerCase().includes("creature"), isPW=c=>(c.type||"").toLowerCase().includes("planeswalker");
   function shortCtr(k){ return k.replace("PlusOnePlusOne","+1").replace("MinusOneMinusOne","-1").replace("Loyalty","L").replace("Counters","").slice(0,4); }
-
+  const byName=(a,b)=>(a.name||"").localeCompare(b.name||"");
   function artUrl(name){ return "https://api.scryfall.com/cards/named?exact="+encodeURIComponent(name)+"&format=image&version=small"; }
+
+  function loadArt(img,c){
+    if(!c.token){ img.src=artUrl(c.name); return; }
+    const base=(c.name||"").replace(/ Token$/i,"").trim();  // tokens: Scryfall named endpoint won't resolve; use search
+    if(tokenArt.has(base)){ const u=tokenArt.get(base); if(u)img.src=u; else img.onerror(); return; }
+    fetch("https://api.scryfall.com/cards/search?q="+encodeURIComponent('!"'+base+'" type:token')+"&order=released&dir=desc&unique=art")
+      .then(r=>r.ok?r.json():Promise.reject())
+      .then(j=>{ const d=j&&j.data&&j.data[0]; const u=d&&(d.image_uris?d.image_uris.small:(d.card_faces&&d.card_faces[0].image_uris&&d.card_faces[0].image_uris.small));
+        tokenArt.set(base,u||null); if(u)img.src=u; else img.onerror(); })
+      .catch(()=>{ tokenArt.set(base,null); img.onerror(); });
+  }
 
   function cardTile(c){
     const el=document.createElement("div");
     el.className="ct"+(c.tapped?" tapped":"")+(c.attacking?" attacking":"")+(c.blocking?" blocking":"")+(c.summoningSick?" sick":"")+(c.faceDown?" facedown":"");
-    el.style.setProperty("--tc",tint(c));
+    el.style.setProperty("--tc",tint(c)); if(c.id!=null)el.dataset.cid=c.id;
     let title=(c.name||"?")+(c.type?"\n"+c.type:"");
-    // frame (fallback / shown until/unless art loads)
     const fr=document.createElement("div"); fr.className="frame";
     if(!c.faceDown){ const fn=document.createElement("div"); fn.className="fn"; fn.textContent=c.name||"?"; fr.appendChild(fn);
       const ft=document.createElement("div"); ft.className="ftype"; ft.textContent=shortType(c); fr.appendChild(ft); }
     el.appendChild(fr);
-    // art
     if(artOn && !c.faceDown && c.name && !badArt.has(c.name)){
       const img=document.createElement("img"); img.className="art"; img.loading="lazy"; img.alt=c.name;
-      img.onload=()=>el.classList.add("hasart");
-      img.onerror=()=>{ el.classList.add("noimg"); badArt.add(c.name); };
-      img.src=artUrl(c.name); el.appendChild(img);
+      img.onload=()=>el.classList.add("hasart"); img.onerror=()=>{ el.classList.add("noimg"); if(!c.token)badArt.add(c.name); };
+      el.appendChild(img); loadArt(img,c);
     }
-    // overlays (on top of art)
     if(!c.faceDown){
       if(c.power!=null){ const pt=document.createElement("div"); pt.className="pt"; pt.textContent=c.power+"/"+c.toughness+(c.damage?"·"+c.damage:""); el.appendChild(pt); }
       else if(c.loyalty!=null){ const l=document.createElement("div"); l.className="loy"; l.textContent=c.loyalty; el.appendChild(l); }
@@ -230,9 +240,9 @@
   function pileChip(label,cards){ const el=document.createElement("span"); el.className="pile"; const pc=document.createElement("span"); pc.className="pc"; el.appendChild(pc);
     const t=document.createElement("span"); t.innerHTML=esc(label)+" <b>"+cards.length+"</b>"; el.appendChild(t); if(cards.length)el.setAttribute("data-list",label+": "+cards.map(c=>c.name).join(", ")); return el; }
 
-  function playerBar(p,info,names){
+  function playerBar(p,info,names,prevLife){
     const bar=document.createElement("div"); bar.className="pbar";
-    const av=document.createElement("div"); av.className="avatar"; av.textContent=(p.name||"?").slice(0,1).toUpperCase(); bar.appendChild(av);
+    const av=document.createElement("div"); av.className="avatar"; av.dataset.player=p.index; av.textContent=(p.name||"?").slice(0,1).toUpperCase(); bar.appendChild(av);
     const col=document.createElement("div"); col.style.minWidth="0"; col.style.flex="1";
     const r1=document.createElement("div"); r1.style.display="flex"; r1.style.alignItems="center"; r1.style.gap="8px";
     const nm=document.createElement("span"); nm.className="pname"; nm.textContent=p.name; r1.appendChild(nm);
@@ -246,47 +256,45 @@
     const pips=manaPips(p.mana); if(pips)chips.appendChild(pips);
     if(chips.childNodes.length)col.appendChild(chips);
     bar.appendChild(col);
-    const life=document.createElement("span"); life.className="life num"+(p.life<=5?" low":""); life.textContent=p.life; bar.appendChild(life);
+    const lifeWrap=document.createElement("span"); lifeWrap.style.whiteSpace="nowrap";
+    const life=document.createElement("span"); const chg=(prevLife!=null&&prevLife!==p.life);
+    life.className="life num"+(p.life<=5?" low":"")+(chg?" chg":""); life.textContent=p.life; lifeWrap.appendChild(life);
+    if(chg){ const d=p.life-prevLife; const del=document.createElement("span"); del.className="delta "+(d>0?"up":"down"); del.textContent=(d>0?"+":"")+d; lifeWrap.appendChild(del); }
+    bar.appendChild(lifeWrap);
     bar.appendChild(cardBacks(p.hand));
     return bar;
   }
 
-  // returns a .side element for player p with rows [bar, lands, creatures]
-  function buildSide(p,info,names,bf,zbp){
-    const side=document.createElement("div"); side.className="side";
-    const seatKey=SEAT[p.index%4]; side.style.setProperty("--seat",`var(${seatKey})`); side.style.setProperty("--seat-ink",SEAT_HEX[seatKey]);
+  function buildSide(p,info,names,bf,zbp,prevLife){
+    const side=document.createElement("div"); side.className="side"; const seatKey=SEAT[p.index%4];
+    side.style.setProperty("--seat",`var(${seatKey})`); side.style.setProperty("--seat-ink",SEAT_HEX[seatKey]);
     if(info&&(info.eliminated||info.status==="HasLost"))side.classList.add("dead");
-
-    const bar=playerBar(p,info,names);
-    // piles into the bar (right)
+    const bar=playerBar(p,info,names,prevLife);
     const piles=document.createElement("div"); piles.className="piles"; const zmap=zbp[p.index]||{};
     const order=["Graveyard","Exile","Command","Commander","Revealed","Pile1","Pile2","Pile3","Effects","Aside"];
     Object.keys(zmap).sort((a,b)=>{const ia=order.indexOf(a),ib=order.indexOf(b);return (ia<0?9:ia)-(ib<0?9:ib);}).forEach(z=>piles.appendChild(pileChip(z,zmap[z])));
     bar.appendChild(piles);
-
     const perms=(bf[p.index]||[]);
-    const creatures=perms.filter(c=>isCreature(c)||isPW(c)).sort(byName);
-    const lands=perms.filter(isLand).sort(byName);
-    const other=perms.filter(c=>!isCreature(c)&&!isPW(c)&&!isLand(c)).sort(byName);
+    const creatures=perms.filter(c=>isCreature(c)||isPW(c)).sort(byName), lands=perms.filter(isLand).sort(byName), other=perms.filter(c=>!isCreature(c)&&!isPW(c)&&!isLand(c)).sort(byName);
     const rowC=document.createElement("div"); rowC.className="frow"; creatures.forEach(c=>rowC.appendChild(cardTile(c)));
     const rowL=document.createElement("div"); rowL.className="frow lands"; other.concat(lands).forEach(c=>rowL.appendChild(cardTile(c)));
-
     side.appendChild(bar);
     if(!perms.length){ const n=document.createElement("div"); n.className="fnote"; n.textContent="— no permanents —"; side.appendChild(n); }
-    else { side.appendChild(rowL); side.appendChild(rowC); }   // lands then creatures (creatures nearest center)
+    else { side.appendChild(rowL); side.appendChild(rowC); }
     return side;
   }
-  function byName(a,b){ return (a.name||"").localeCompare(b.name||""); }
 
   function render(){
     if(!states.length){ $("gtitle").textContent="Load a recording to begin"; return; }
-    const s=states[idx];
+    const s=states[idx]; cur=s;
     const names={}; (s.players||[]).forEach(p=>names[p.index]=p.name);
+    const prev=idx>0?states[idx-1]:null; const prevLife={}; if(prev)(prev.players||[]).forEach(p=>prevLife[p.index]=p.life);
     const ov=overlayAt(s._ord);
     $("gtitle").textContent=header?header.players.map(p=>p.name).join("  vs  "):"game";
     $("turn").textContent="Turn "+s.turn; $("phase").textContent=s.phase||"";
     const dn=$("dn"); if(s.dayNight){dn.hidden=false;dn.className="dn "+s.dayNight;dn.textContent=s.dayNight==="night"?"☾ Night":"☀ Day";}else dn.hidden=true;
-    $("tick").textContent=(idx+1)+" / "+states.length; $("slider").value=idx;
+    $("tick").textContent=(idx+1)+" / "+states.length; $("slider").value=idx; $("turnsel").value=s.turn;
+    markCur();
 
     const bf={},zbp={},stack=[];
     for(const c of s.cards){ const z=c.zone||"";
@@ -295,46 +303,76 @@
       else{const o=(c.owner!=null?c.owner:c.controller);(zbp[o]=zbp[o]||{});(zbp[o][z||"?"]=zbp[o][z||"?"]||[]).push(c);} }
 
     const table=$("table"); table.innerHTML="";
-    const ps=(s.players||[]).slice().sort((a,b)=>a.index-b.index);
-    const duel = ps.length===2;
+    const ps=(s.players||[]).slice().sort((a,b)=>a.index-b.index); const duel=ps.length===2;
     table.className="table "+(duel?"duel":"multi");
-
     const centerEl=()=>{ const c=document.createElement("div"); c.className="center";
       const ct=document.createElement("div"); ct.className="cturn"; ct.innerHTML=`<b>Turn ${s.turn}</b> · ${s.phase||""}`+(s.prompt?` · <span style="color:var(--muted)">${esc(clean(s.prompt))}</span>`:""); c.appendChild(ct);
       if(stack.length){ const sz=document.createElement("div"); sz.className="stackzone"; const sl=document.createElement("span"); sl.className="sl"; sl.textContent="Stack"; sz.appendChild(sl);
         stack.forEach(x=>{ const si=document.createElement("span"); si.className="si"; si.textContent=(names[x.controller]||"?")+": "+(x.name||"?")+((x.targets&&x.targets.length)?" → "+x.targets.join(", "):""); sz.appendChild(si);}); c.appendChild(sz); }
       const rc=revealAt(s._ord); if(rc.length){ const rz=document.createElement("div"); rz.className="revealzone"; rz.textContent="Revealed: "+rc.map(x=>x.name).join(", "); c.appendChild(rz); }
       return c; };
-
     if(duel){
-      const top=buildSide(ps[0],ov[ps[0].index],names,bf,zbp); top.classList.add("top"); if(s.promptedPlayer===ps[0].index)top.classList.add("act");
-      const bot=buildSide(ps[1],ov[ps[1].index],names,bf,zbp); bot.classList.add("bottom"); if(s.promptedPlayer===ps[1].index)bot.classList.add("act");
+      const top=buildSide(ps[0],ov[ps[0].index],names,bf,zbp,prevLife[ps[0].index]); top.classList.add("top"); if(s.promptedPlayer===ps[0].index)top.classList.add("act");
+      const bot=buildSide(ps[1],ov[ps[1].index],names,bf,zbp,prevLife[ps[1].index]); bot.classList.add("bottom"); if(s.promptedPlayer===ps[1].index)bot.classList.add("act");
       table.appendChild(top); table.appendChild(centerEl()); table.appendChild(bot);
     } else {
-      ps.forEach((p,i)=>{ const side=buildSide(p,ov[p.index],names,bf,zbp); if(s.promptedPlayer===p.index)side.classList.add("act"); table.appendChild(side);
-        if(i===0) table.appendChild(centerEl()); });
+      ps.forEach((p,i)=>{ const side=buildSide(p,ov[p.index],names,bf,zbp,prevLife[p.index]); if(s.promptedPlayer===p.index)side.classList.add("act"); table.appendChild(side); if(i===0)table.appendChild(centerEl()); });
     }
     renderLog(s._ord);
+    requestAnimationFrame(()=>drawCombat(s));
   }
 
-  function renderLog(curOrd){
-    const box=$("log"); box.innerHTML=""; let nowEl=null; const last=lastLE(curOrd);
+  // combat arrows
+  function drawCombat(s){ const svg=$("arrows"); [...svg.querySelectorAll("path.arrow")].forEach(n=>n.remove()); if(!s)return;
+    const table=$("table"); const byId={}; table.querySelectorAll(".ct[data-cid]").forEach(el=>byId[el.dataset.cid]=el);
+    const av={}; table.querySelectorAll(".avatar[data-player]").forEach(el=>av[el.dataset.player]=el);
+    const cen=el=>{const r=el.getBoundingClientRect();return [r.left+r.width/2,r.top+r.height/2];};
+    s.cards.forEach(c=>{ if(!c.attacking||c.zone!=="Battlefield")return; const from=byId[c.id]; if(!from)return;
+      const blockers=s.cards.filter(x=>x.blocks&&x.blocks.includes(c.name)); const tg=[];
+      if(blockers.length){ blockers.forEach(b=>{ if(byId[b.id])tg.push(byId[b.id]); }); }
+      else { const opp=Object.keys(av).find(k=>+k!==c.controller); if(opp!=null&&av[opp])tg.push(av[opp]); }
+      const [x1,y1]=cen(from); tg.forEach(t=>{ const [x2,y2]=cen(t); arrow(svg,x1,y1,x2,y2); }); });
+  }
+  function arrow(svg,x1,y1,x2,y2){ const p=document.createElementNS("http://www.w3.org/2000/svg","path");
+    const mx=(x1+x2)/2,my=(y1+y2)/2,dx=x2-x1,dy=y2-y1,len=Math.hypot(dx,dy)||1,cu=Math.min(28,len*0.14);
+    const cx=mx-dy/len*cu, cy=my+dx/len*cu; p.setAttribute("d",`M${x1} ${y1} Q ${cx} ${cy} ${x2} ${y2}`);
+    p.setAttribute("class","arrow"); p.setAttribute("marker-end","url(#ah)"); svg.appendChild(p); }
+
+  // timeline turn marks + jump
+  let turnStarts=[];
+  function buildTimeline(){
+    const marks=$("marks"); marks.innerHTML=""; const sel=$("turnsel"); sel.innerHTML=""; turnStarts=[];
+    const n=states.length; let lastTurn=null;
+    for(let i=0;i<n;i++){ const t=states[i].turn; if(t!==lastTurn){ turnStarts.push({turn:t,i});
+      const m=document.createElement("div"); m.className="mark"; m.dataset.turn=t; m.style.left=(n>1?(i/(n-1)*100):0)+"%"; m.textContent=t; m.title="Turn "+t+" — "+(states[i].phase||"");
+      m.onclick=()=>{ setPlay(false); go(i); }; marks.appendChild(m);
+      const o=document.createElement("option"); o.value=t; o.textContent="Turn "+t; sel.appendChild(o); lastTurn=t; } }
+  }
+  function markCur(){ const t=states[idx].turn; [...$("marks").children].forEach(m=>m.classList.toggle("cur",+m.dataset.turn===t)); }
+  function jumpTurn(dir){ const t=states[idx].turn; const curStart=turnStarts.find(x=>x.turn===t);
+    const arr=turnStarts; let k=arr.indexOf(curStart); if(k<0)return;
+    if(dir<0){ if(idx>curStart.i)go(curStart.i); else if(k>0)go(arr[k-1].i); } else { if(k<arr.length-1)go(arr[k+1].i); } }
+
+  function renderLog(curOrd){ const box=$("log"); box.innerHTML=""; let nowEl=null; const last=lastLE(curOrd);
     for(const l of logs){ const past=l._ord<=curOrd,now=past&&l._ord===last; const d=document.createElement("div"); d.className="ln"+(past?" past":"")+(now?" now":""); d.textContent=esc(clean(l.text)); box.appendChild(d); if(now)nowEl=d; }
     if(result){ const r=document.createElement("div"); r.className="result"; r.innerHTML=`<b>Result:</b> ${result.finalStatus||""}`+(result.winners&&result.winners.length?` — winner: <b>${result.winners.join(", ")}</b>`:""); box.appendChild(r); }
-    if(nowEl)nowEl.scrollIntoView({block:"center",behavior:"smooth"});
-  }
+    if(nowEl)nowEl.scrollIntoView({block:"center",behavior:"smooth"}); }
   function lastLE(o){ let m=-1; for(const l of logs){ if(l._ord<=o&&l._ord>m)m=l._ord; } return m; }
 
   function go(i){ idx=Math.max(0,Math.min(states.length-1,i)); render(); }
   function setPlay(on){ playing=on; $("play").textContent=on?"❚❚":"▶"; if(timer){clearInterval(timer);timer=null;} if(on)timer=setInterval(()=>{ if(idx>=states.length-1){setPlay(false);return;} go(idx+1); },1200); }
   $("prev").onclick=()=>{setPlay(false);go(idx-1);}; $("next").onclick=()=>{setPlay(false);go(idx+1);}; $("play").onclick=()=>setPlay(!playing);
+  $("prevturn").onclick=()=>{setPlay(false);jumpTurn(-1);}; $("nextturn").onclick=()=>{setPlay(false);jumpTurn(1);};
   $("slider").oninput=e=>{setPlay(false);go(+e.target.value);};
-  $("logtoggle").onclick=()=>{ $("app").classList.toggle("nolog"); $("logtoggle").classList.toggle("on"); };
+  $("turnsel").onchange=e=>{ const t=+e.target.value; const st=turnStarts.find(x=>x.turn===t); if(st){setPlay(false);go(st.i);} };
+  $("logtoggle").onclick=()=>{ $("app").classList.toggle("nolog"); $("logtoggle").classList.toggle("on"); requestAnimationFrame(()=>drawCombat(cur)); };
   $("arttoggle").onclick=()=>{ artOn=!artOn; $("arttoggle").classList.toggle("on",artOn); render(); };
-  document.addEventListener("keydown",e=>{ if(e.target.tagName==="INPUT")return;
+  document.addEventListener("keydown",e=>{ if(e.target.tagName==="INPUT"||e.target.tagName==="SELECT")return;
     if(e.key==="ArrowLeft"){setPlay(false);go(idx-1);e.preventDefault();} else if(e.key==="ArrowRight"){setPlay(false);go(idx+1);e.preventDefault();} else if(e.key===" "){setPlay(!playing);e.preventDefault();} });
-  $("file").onchange=e=>{ const f=e.target.files[0]; if(!f)return; const rd=new FileReader(); rd.onload=()=>{ badArt.clear(); parse(rd.result); $("slider").max=Math.max(0,states.length-1); go(0); }; rd.readAsText(f); };
+  $("file").onchange=e=>{ const f=e.target.files[0]; if(!f)return; const rd=new FileReader(); rd.onload=()=>{ badArt.clear();tokenArt.clear(); parse(rd.result); $("slider").max=Math.max(0,states.length-1); buildTimeline(); go(0); }; rd.readAsText(f); };
+  window.addEventListener("resize",()=>drawCombat(cur));
+  $("table").addEventListener("scroll",()=>drawCombat(cur),true);
 
-  parse($("sample").textContent||""); $("slider").max=Math.max(0,states.length-1); render();
+  parse($("sample").textContent||""); $("slider").max=Math.max(0,states.length-1); buildTimeline(); render();
 })();
 </script>
