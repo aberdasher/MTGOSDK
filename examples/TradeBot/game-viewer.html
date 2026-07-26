@@ -130,9 +130,10 @@
   #arrows path.target{stroke:var(--seat0);stroke-width:2;stroke-dasharray:5 4;opacity:.8}
 
   .center .cturn{font-family:var(--mono);font-size:12px;color:var(--muted)} .center .cturn b{color:var(--ink)}
-  .stackzone{display:flex;align-items:center;gap:8px;flex-wrap:wrap;max-width:56%}
-  .stackzone .sl{font-size:10px;letter-spacing:.1em;text-transform:uppercase;color:var(--accent)}
-  .stackzone .si{font-size:11px;color:var(--ink);background:var(--raised);border:1px solid var(--accent-dim);border-radius:6px;padding:2px 7px}
+  .stackzone{display:flex;align-items:flex-end;gap:8px;flex-wrap:wrap;max-width:70%;padding:2px 0}
+  .stackzone .sl{font-size:10px;letter-spacing:.1em;text-transform:uppercase;color:var(--accent);align-self:center}
+  .stackitem{display:flex;flex-direction:column;align-items:center;gap:2px}
+  .stacklbl{font-family:var(--mono);font-size:9px;color:var(--muted);max-width:64px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
   .revealzone{font-size:11px;color:var(--seat0)}
 
   .logpane{width:290px;flex:none;background:var(--panel);border-left:1px solid var(--line);display:flex;flex-direction:column;min-height:0}
@@ -333,7 +334,10 @@
     const centerEl=()=>{ const c=document.createElement("div"); c.className="center";
       const ct=document.createElement("div"); ct.className="cturn"; ct.innerHTML=`<b>Turn ${s.turn}</b> · ${s.phase||""}`+(s.prompt?` · <span style="color:var(--muted)">${esc(clean(s.prompt))}</span>`:""); c.appendChild(ct);
       if(stack.length){ const sz=document.createElement("div"); sz.className="stackzone"; const sl=document.createElement("span"); sl.className="sl"; sl.textContent="Stack"; sz.appendChild(sl);
-        stack.forEach(x=>{ const si=document.createElement("span"); si.className="si"; if(x.id!=null)si.dataset.cid=x.id; si.textContent=(names[x.controller]||"?")+": "+(x.name||"?")+((x.targets&&x.targets.length)?" → "+x.targets.join(", "):""); sz.appendChild(si);}); c.appendChild(sz); }
+        stack.forEach(x=>{ const it=document.createElement("div"); it.className="stackitem";
+          it.appendChild(cardTile(x));   // card tile (with art); carries data-cid so target arrows anchor here
+          const lbl=document.createElement("div"); lbl.className="stacklbl"; lbl.textContent=names[x.controller]||"?"; it.appendChild(lbl);
+          sz.appendChild(it); }); c.appendChild(sz); }
       const rc=revealAt(s._ord); if(rc.length){ const rz=document.createElement("div"); rz.className="revealzone"; rz.textContent="Revealed: "+rc.map(x=>x.name).join(", "); c.appendChild(rz); }
       return c; };
     if(duel){
