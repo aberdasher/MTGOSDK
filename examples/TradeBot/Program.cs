@@ -2266,18 +2266,25 @@ using (var exec = new TradeExecutor { AllowCommit = allowCommit })
       // Read-only observation (registers you as a watcher; no game/trade state change).
       // Usage: spectate <gameId|playerName> [--stream]   OR   spectate --any [--stream]
       bool any = args.Any(a => a.Equals("--any", StringComparison.OrdinalIgnoreCase));
+      bool twoOnly = args.Any(a => a.Equals("--2p", StringComparison.OrdinalIgnoreCase));   // only 2-player games (duels)
       string? target = args.Skip(1).FirstOrDefault(a => !a.StartsWith("--"));
       bool stream = args.Any(a => a.Equals("--stream", StringComparison.OrdinalIgnoreCase));
 
       // Build the candidate list: an explicit id/player, or (with --any) every live
       // Started game the client can see — we try each until one accepts a watcher
       // (tournament matches often disallow spectators, so the first isn't always it).
+      // With --2p, restrict to 2-player games (skip 4-player FFA/Commander).
       var candidates = new System.Collections.Generic.List<string>();
       if (!string.IsNullOrWhiteSpace(target)) candidates.Add(target);
       else if (any)
       {
         foreach (var gm in FindGames())
-          try { if (gm.Status.ToString() == "Started") candidates.Add(gm.Id.ToString()); } catch { }
+          try
+          {
+            if (gm.Status.ToString() != "Started") continue;
+            if (twoOnly) { int pc = 0; try { pc = gm.Players.Count; } catch { } if (pc != 2) continue; }
+            candidates.Add(gm.Id.ToString());
+          } catch { }
         if (candidates.Count == 0)
         {
           Line("No in-progress (Started) games are loaded on the client.");

@@ -87,7 +87,15 @@
   .piles{display:flex;gap:5px;flex-wrap:wrap;margin-left:auto}
   .pile{display:flex;align-items:center;gap:5px;font-family:var(--mono);font-size:10.5px;color:var(--muted);padding:3px 7px;border-radius:6px;background:var(--raised);border:1px solid var(--line);position:relative}
   .pile .pc{width:11px;height:15px;border-radius:2px;background:var(--faint);box-shadow:2px 0 0 -1px var(--felt-b),3px 0 0 -1px var(--faint)} .pile b{color:var(--ink)}
+  .pile.clk{cursor:pointer} .pile.clk:hover{border-color:var(--accent-dim);color:var(--ink)} .pile.open{border-color:var(--accent);color:var(--ink)}
   .pile[data-list]:hover::after{content:attr(data-list);position:absolute;bottom:120%;right:0;z-index:30;width:max-content;max-width:340px;white-space:normal;background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:7px 9px;font-size:11px;color:var(--ink);box-shadow:0 10px 30px -12px #000}
+  #popout{position:fixed;z-index:60;top:50%;left:50%;transform:translate(-50%,-50%);width:min(600px,88vw);max-height:76vh;overflow:auto;
+    background:var(--panel);border:1px solid var(--accent-dim);border-radius:12px;padding:10px 12px;box-shadow:0 26px 70px -22px #000}
+  .pop-head{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:9px;font-size:13px;position:sticky;top:0;background:var(--panel);padding-bottom:4px}
+  .pop-head b{color:var(--accent)} .pop-head .z{font-family:var(--mono);color:var(--muted)}
+  .pop-x{background:var(--raised);border:1px solid var(--line);border-radius:6px;width:26px;height:24px;color:var(--ink)}
+  .pop-x:hover{border-color:var(--bad)}
+  .pop-grid{display:flex;flex-wrap:wrap;gap:6px}
 
   .frow{display:flex;flex-wrap:wrap;gap:5px 6px;align-content:flex-start;min-height:calc(var(--card-h) + 4px);padding:2px}
   .frow.lands{min-height:calc(var(--card-h) * .6)}
@@ -161,6 +169,7 @@
       <div class="hint"><kbd>←</kbd> <kbd>→</kbd> step · <kbd>space</kbd> play · click a turn on the timeline · hover a pile. Card art loads from Scryfall when opened as a local file.</div>
     </aside>
   </div>
+  <div id="popout" hidden></div>
   <svg id="arrows"><defs>
     <marker id="ah" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
       <path d="M0 0 L10 5 L0 10 z" fill="var(--bad)"/></marker>
@@ -176,7 +185,7 @@
   const SEAT=["--seat0","--seat1","--seat2","--seat3"], SEAT_HEX={ "--seat0":"#4a90d9","--seat1":"#d0574a","--seat2":"#57a468","--seat3":"#c9a24a" };
   const PIP={W:"#f3edd6",U:"#5a9bd8",B:"#8d7fa0",R:"#d0674f",G:"#63ab74",C:"#b9bcc4"};
   const $=id=>document.getElementById(id);
-  let header=null,states=[],logs=[],overlays=[],reveals=[],result=null,idx=0,artOn=true,cur=null;
+  let header=null,states=[],logs=[],overlays=[],reveals=[],result=null,idx=0,artOn=true,cur=null,openZone=null;
   const badArt=new Set(), tokenArt=new Map();
 
   function parse(text){ header=null;states=[];logs=[];overlays=[];reveals=[];result=null;let ord=0;
@@ -240,8 +249,13 @@
     for(const sym of Object.keys(mana)){ const L=(sym.match(/[WUBRGC]/)||["C"])[0]; for(let k=0;k<mana[sym];k++){ const p=document.createElement("span"); p.className="pip"; p.style.background=PIP[L]||PIP.C; p.textContent=L; f.appendChild(p);} } return f; }
   function cardBacks(n){ const f=document.createElement("span"); f.className="hand"; const lb=document.createElement("span"); lb.className="hlbl"; lb.textContent="hand "+n; f.appendChild(lb);
     for(let i=0;i<Math.min(n,10);i++){ const b=document.createElement("span"); b.className="cardback"; f.appendChild(b);} return f; }
-  function pileChip(label,cards){ const el=document.createElement("span"); el.className="pile"; const pc=document.createElement("span"); pc.className="pc"; el.appendChild(pc);
-    const t=document.createElement("span"); t.innerHTML=esc(label)+" <b>"+cards.length+"</b>"; el.appendChild(t); if(cards.length)el.setAttribute("data-list",label+": "+cards.map(c=>c.name).join(", ")); return el; }
+  function pileChip(label,cards,pidx){ const isOpen=openZone&&openZone.player===pidx&&openZone.zone===label;
+    const el=document.createElement("span"); el.className="pile clk"+(isOpen?" open":"");
+    const pc=document.createElement("span"); pc.className="pc"; el.appendChild(pc);
+    const t=document.createElement("span"); t.innerHTML=esc(label)+" <b>"+cards.length+"</b>"; el.appendChild(t);
+    if(cards.length)el.setAttribute("data-list",label+": "+cards.map(c=>c.name).join(", "));
+    el.onclick=e=>{ e.stopPropagation(); openZone=isOpen?null:{player:pidx,zone:label}; render(); };
+    return el; }
 
   function playerBar(p,info,names,prevLife){
     const bar=document.createElement("div"); bar.className="pbar";
@@ -275,7 +289,7 @@
     const bar=playerBar(p,info,names,prevLife);
     const piles=document.createElement("div"); piles.className="piles"; const zmap=zbp[p.index]||{};
     const order=["Graveyard","Exile","Command","Commander","Revealed","Pile1","Pile2","Pile3","Effects","Aside"];
-    Object.keys(zmap).sort((a,b)=>{const ia=order.indexOf(a),ib=order.indexOf(b);return (ia<0?9:ia)-(ib<0?9:ib);}).forEach(z=>piles.appendChild(pileChip(z,zmap[z])));
+    Object.keys(zmap).sort((a,b)=>{const ia=order.indexOf(a),ib=order.indexOf(b);return (ia<0?9:ia)-(ib<0?9:ib);}).forEach(z=>piles.appendChild(pileChip(z,zmap[z],p.index)));
     bar.appendChild(piles);
     const perms=(bf[p.index]||[]);
     const creatures=perms.filter(c=>isCreature(c)||isPW(c)).sort(byName), lands=perms.filter(isLand).sort(byName), other=perms.filter(c=>!isCreature(c)&&!isPW(c)&&!isLand(c)).sort(byName);
@@ -322,7 +336,23 @@
       ps.forEach((p,i)=>{ const side=buildSide(p,ov[p.index],names,bf,zbp,prevLife[p.index]); if(s.promptedPlayer===p.index)side.classList.add("act"); table.appendChild(side); if(i===0)table.appendChild(centerEl()); });
     }
     renderLog(s._ord);
+    showPopout();
     requestAnimationFrame(()=>drawCombat(s));
+  }
+
+  // pop-out zone inspector (graveyard / exile / revealed / command / …) with card art
+  function showPopout(){ const pop=$("popout"); if(!openZone||!cur){ pop.hidden=true; return; }
+    const cards=cur.cards.filter(c=>{ const o=(c.owner!=null?c.owner:c.controller); return o===openZone.player && (c.zone||"")===openZone.zone; });
+    const pname=((cur.players||[]).find(p=>p.index===openZone.player)||{}).name||("P"+openZone.player);
+    pop.hidden=false; pop.innerHTML="";
+    const head=document.createElement("div"); head.className="pop-head";
+    const h=document.createElement("span"); h.innerHTML=`<b>${esc(openZone.zone)}</b> <span class="z">· ${cards.length} · ${esc(pname)}</span>`; head.appendChild(h);
+    const x=document.createElement("button"); x.className="pop-x"; x.textContent="✕"; x.onclick=()=>{ openZone=null; render(); }; head.appendChild(x);
+    pop.appendChild(head);
+    const grid=document.createElement("div"); grid.className="pop-grid";
+    if(!cards.length){ const n=document.createElement("div"); n.className="fnote"; n.textContent="(empty)"; grid.appendChild(n); }
+    else cards.slice().sort(byName).forEach(c=>grid.appendChild(cardTile(c)));
+    pop.appendChild(grid);
   }
 
   // combat (red) + spell/ability target (blue dashed) arrows
@@ -375,8 +405,9 @@
   $("turnsel").onchange=e=>{ const t=+e.target.value; const st=turnStarts.find(x=>x.turn===t); if(st)go(st.i); };
   $("logtoggle").onclick=()=>{ $("app").classList.toggle("nolog"); $("logtoggle").classList.toggle("on"); requestAnimationFrame(()=>drawCombat(cur)); };
   $("arttoggle").onclick=()=>{ artOn=!artOn; $("arttoggle").classList.toggle("on",artOn); render(); };
-  document.addEventListener("keydown",e=>{ if(e.target.tagName==="INPUT"||e.target.tagName==="SELECT")return;
+  document.addEventListener("keydown",e=>{ if(e.key==="Escape"&&openZone){openZone=null;render();return;} if(e.target.tagName==="INPUT"||e.target.tagName==="SELECT")return;
     if(e.key==="ArrowLeft"){go(idx-1);e.preventDefault();} else if(e.key==="ArrowRight"||e.key===" "){go(idx+1);e.preventDefault();} });
+  document.addEventListener("click",e=>{ if(openZone && !e.target.closest("#popout") && !e.target.closest(".pile")){ openZone=null; render(); } });
   $("file").onchange=e=>{ const f=e.target.files[0]; if(!f)return; const rd=new FileReader(); rd.onload=()=>{ badArt.clear();tokenArt.clear(); parse(rd.result); $("slider").max=Math.max(0,states.length-1); buildTimeline(); go(0); }; rd.readAsText(f); };
   window.addEventListener("resize",()=>drawCombat(cur));
   $("table").addEventListener("scroll",()=>drawCombat(cur),true);
