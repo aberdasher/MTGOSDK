@@ -28,6 +28,11 @@
                      PlayerEventActions.WatchGame() into the game's Match), then dump
                      + stream its action log. --any auto-picks the first live game.
                      Read-only observation (registers as a watcher; no state change).
+    autoreport --pair=<a>,<b> [--session=<id>] [--dry-run]   OR   autoreport --daemon [--poll=N] [--dry-run]
+                     Auto-report freeform Bo3 draft-match results to DraftBot: watch a
+                     pairing to completion, then POST who won to DRAFTBOT_API_BASE (bearer
+                     DRAFTBOT_API_TOKEN). --daemon polls DraftBot's /pairings/active and
+                     reports each pairing as it finishes. --dry-run observes without POSTing.
 
   Availability gating: bots advertise "open"/"free" vs "busy" in their post
   message; the acquire modes read that (read-only, no ping) and only invite open
@@ -2346,6 +2351,59 @@ using (var exec = new TradeExecutor { AllowCommit = allowCommit })
       break;
     }
 
+    case "autoreport":
+    {
+      // Auto-report freeform Bo3 draft-match results to DraftBot. Read-only observation
+      // -> report who won. Two forms:
+      //   autoreport --pair=<a>,<b> [--session=<id>] [--dry-run] [--max-min=N]   one-shot test
+      //   autoreport --daemon [--poll=N] [--dry-run]                            worker loop
+      // Reporting requires DRAFTBOT_API_BASE + DRAFTBOT_API_TOKEN (except --dry-run, which
+      // observes + computes the result but does not POST).
+      string? FlagVal(string name)
+      {
+        var eq = args.FirstOrDefault(a => a.StartsWith(name + "=", StringComparison.OrdinalIgnoreCase));
+        if (eq != null) return eq.Substring(name.Length + 1);
+        int idx = Array.FindIndex(args, a => a.Equals(name, StringComparison.OrdinalIgnoreCase));
+        if (idx >= 0 && idx + 1 < args.Length && !args[idx + 1].StartsWith("--")) return args[idx + 1];
+        return null;
+      }
+
+      bool dry = args.Any(a => a.Equals("--dry-run", StringComparison.OrdinalIgnoreCase));
+      bool daemon = args.Any(a => a.Equals("--daemon", StringComparison.OrdinalIgnoreCase));
+
+      if (!dry && !TradeBot.MatchReporter.IsConfigured)
+        Line("(note: DRAFTBOT_API_BASE/DRAFTBOT_API_TOKEN not set — reporting will no-op; add --dry-run to just observe)");
+
+      if (daemon)
+      {
+        int poll = 60;
+        var pv = FlagVal("--poll");
+        if (pv != null && int.TryParse(pv, out var pp)) poll = Math.Max(10, pp);
+        TradeBot.MatchWatcher.RunDaemon(exec, poll, dry);   // runs until Ctrl+C
+        break;
+      }
+
+      string? pair = FlagVal("--pair");
+      if (pair is null)
+      {
+        Line("Usage: autoreport --pair=<a>,<b> [--session=<id>] [--dry-run] [--max-min=N]");
+        Line("       autoreport --daemon [--poll=N] [--dry-run]");
+        break;
+      }
+      var parts = pair.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+      if (parts.Length != 2)
+      {
+        Line("--pair needs two comma-separated MTGO usernames, e.g. --pair=alice,bob");
+        break;
+      }
+      int maxMin = 90;
+      var mm = FlagVal("--max-min");
+      if (mm != null && int.TryParse(mm, out var mmv)) maxMin = Math.Max(1, mmv);
+      string summary = TradeBot.MatchWatcher.WatchAndReportPair(exec, parts[0], parts[1], FlagVal("--session"), maxMin, dry);
+      Line(summary);
+      break;
+    }
+
     case "worker":
     {
       // Drain a FOLDER of trade-order JSON files, executing each against MTGO one at
@@ -2428,6 +2486,7 @@ using (var exec = new TradeExecutor { AllowCommit = allowCommit })
       Line("  low-level : opentrade <bot> --yes | takecard <card> --yes | grab <bot> --yes | invite <user> --yes");
       Line("  test      : stagetest <bot> [card] --yes  (controlled TakeCard test: stage -> observe -> cancel)");
       Line("  outward   : post \"<msg>\" --yes | clearpost --yes");
+      Line("  observe   : gamelog [--stream] | spectate <id|player>|--any [--2p] [--record] | autoreport --pair=a,b|--daemon [--dry-run]");
       break;
   }
 

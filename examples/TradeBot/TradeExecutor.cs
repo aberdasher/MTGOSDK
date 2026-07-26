@@ -526,6 +526,49 @@ public sealed class TradeExecutor : IDisposable
   }
 
   /// <summary>
+  /// Find a live game whose players include BOTH <paramref name="a"/> and
+  /// <paramref name="b"/> (name substrings, case-insensitive), connect as a watcher,
+  /// and return the SDK <see cref="MTGOSDK.API.Play.Match"/> wrapper so the caller can
+  /// follow the Bo3 to completion. Reuses <see cref="WatchGame"/> for the watch dispatch.
+  /// The match wrapper is returned as soon as the game is found — even if the watch
+  /// didn't fully confirm — because the match object is often pollable regardless.
+  /// Returns (ok, gameId, match, detail).
+  /// </summary>
+  public (bool ok, int gameId, MTGOSDK.API.Play.Match? match, string detail)
+    WatchMatchForPair(string a, string b, int waitSec = 30)
+  {
+    object? hitInst = null; int gid = -1; string players = "?";
+    try
+    {
+      foreach (var cand in RemoteClient.GetInstances(InProgressGameT))
+      {
+        // cand is dynamic (GetInstances), so type names explicitly — otherwise
+        // names.Any(lambda) becomes a dynamic dispatch (CS1977).
+        List<string> names = ReadPlayerNames((object)cand);
+        bool hasA = names.Any(n => n.IndexOf(a, StringComparison.OrdinalIgnoreCase) >= 0);
+        bool hasB = names.Any(n => n.IndexOf(b, StringComparison.OrdinalIgnoreCase) >= 0);
+        if (hasA && hasB)
+        {
+          hitInst = cand;
+          gid = Try<int>(() => (int)Unbind((object)cand).Id);
+          players = names.Count > 0 ? string.Join(" vs ", names) : "?";
+          break;
+        }
+      }
+    }
+    catch (Exception ex) { return (false, -1, null, $"could not enumerate games: {ex.Message.Split('\n')[0]}"); }
+
+    if (hitInst is null) return (false, -1, null, $"no in-progress game with both '{a}' and '{b}'");
+
+    MTGOSDK.API.Play.Match? sdkMatch = null;
+    try { sdkMatch = new MTGOSDK.API.Play.Games.Game(hitInst).Match; }
+    catch (Exception ex) { return (false, gid, null, $"found game {gid} but could not wrap its match: {ex.Message.Split('\n')[0]}"); }
+
+    var w = WatchGame(gid.ToString(), waitSec);
+    return (w.ok, gid, sdkMatch, $"{w.detail} [{players}]");
+  }
+
+  /// <summary>
   /// Request a specific card FROM the partner (grab it into our receive side) by
   /// catalog id + quantity. Builds a CollectionItem[] via ctor-args (catalogId,
   /// permissionCode, quantity, annotation) and dispatches SendTradeItemUpdateAction.
