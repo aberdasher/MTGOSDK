@@ -88,6 +88,8 @@
   .pile{display:flex;align-items:center;gap:5px;font-family:var(--mono);font-size:10.5px;color:var(--muted);padding:3px 7px;border-radius:6px;background:var(--raised);border:1px solid var(--line);position:relative}
   .pile .pc{width:11px;height:15px;border-radius:2px;background:var(--faint);box-shadow:2px 0 0 -1px var(--felt-b),3px 0 0 -1px var(--faint)} .pile b{color:var(--ink)}
   .pile.clk{cursor:pointer} .pile.clk:hover{border-color:var(--accent-dim);color:var(--ink)} .pile.open{border-color:var(--accent);color:var(--ink)}
+  .pile.empty{opacity:.5}
+  .zonebar{display:flex;flex-wrap:wrap;gap:5px;padding:2px;flex:none}
   .pile[data-list]:hover::after{content:attr(data-list);position:absolute;bottom:120%;right:0;z-index:30;width:max-content;max-width:340px;white-space:normal;background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:7px 9px;font-size:11px;color:var(--ink);box-shadow:0 10px 30px -12px #000}
   #popout{position:fixed;z-index:60;top:50%;left:50%;transform:translate(-50%,-50%);width:min(600px,88vw);max-height:76vh;overflow:auto;
     background:var(--panel);border:1px solid var(--accent-dim);border-radius:12px;padding:10px 12px;box-shadow:0 26px 70px -22px #000}
@@ -250,7 +252,7 @@
   function cardBacks(n){ const f=document.createElement("span"); f.className="hand"; const lb=document.createElement("span"); lb.className="hlbl"; lb.textContent="hand "+n; f.appendChild(lb);
     for(let i=0;i<Math.min(n,10);i++){ const b=document.createElement("span"); b.className="cardback"; f.appendChild(b);} return f; }
   function pileChip(label,cards,pidx){ const isOpen=openZone&&openZone.player===pidx&&openZone.zone===label;
-    const el=document.createElement("span"); el.className="pile clk"+(isOpen?" open":"");
+    const el=document.createElement("span"); el.className="pile clk"+(isOpen?" open":"")+(cards.length?"":" empty");
     const pc=document.createElement("span"); pc.className="pc"; el.appendChild(pc);
     const t=document.createElement("span"); t.innerHTML=esc(label)+" <b>"+cards.length+"</b>"; el.appendChild(t);
     if(cards.length)el.setAttribute("data-list",label+": "+cards.map(c=>c.name).join(", "));
@@ -287,15 +289,19 @@
     side.style.setProperty("--seat",`var(${seatKey})`); side.style.setProperty("--seat-ink",SEAT_HEX[seatKey]);
     if(info&&(info.eliminated||info.status==="HasLost"))side.classList.add("dead");
     const bar=playerBar(p,info,names,prevLife);
-    const piles=document.createElement("div"); piles.className="piles"; const zmap=zbp[p.index]||{};
-    const order=["Graveyard","Exile","Command","Commander","Revealed","Pile1","Pile2","Pile3","Effects","Aside"];
-    Object.keys(zmap).sort((a,b)=>{const ia=order.indexOf(a),ib=order.indexOf(b);return (ia<0?9:ia)-(ib<0?9:ib);}).forEach(z=>piles.appendChild(pileChip(z,zmap[z],p.index)));
-    bar.appendChild(piles);
+    const zmap=zbp[p.index]||{};
+    // Zone chips in their OWN fixed row so they never move as the bar/counts change,
+    // and always show these three (count 0 when empty) so Exile/etc. never vanish.
+    const zonebar=document.createElement("div"); zonebar.className="zonebar";
+    const FIXED=["Graveyard","Exile","Command"];
+    FIXED.forEach(z=>zonebar.appendChild(pileChip(z,zmap[z]||[],p.index)));
+    const order=["Commander","Revealed","Pile1","Pile2","Pile3","Effects","Aside"];
+    Object.keys(zmap).filter(z=>!FIXED.includes(z)).sort((a,b)=>{const ia=order.indexOf(a),ib=order.indexOf(b);return (ia<0?9:ia)-(ib<0?9:ib);}).forEach(z=>zonebar.appendChild(pileChip(z,zmap[z],p.index)));
     const perms=(bf[p.index]||[]);
     const creatures=perms.filter(c=>isCreature(c)||isPW(c)).sort(byName), lands=perms.filter(isLand).sort(byName), other=perms.filter(c=>!isCreature(c)&&!isPW(c)&&!isLand(c)).sort(byName);
     const rowC=document.createElement("div"); rowC.className="frow"; creatures.forEach(c=>rowC.appendChild(cardTile(c)));
     const rowL=document.createElement("div"); rowL.className="frow lands"; other.concat(lands).forEach(c=>rowL.appendChild(cardTile(c)));
-    side.appendChild(bar);
+    side.appendChild(bar); side.appendChild(zonebar);
     if(!perms.length){ const n=document.createElement("div"); n.className="fnote"; n.textContent="— no permanents —"; side.appendChild(n); }
     else { side.appendChild(rowL); side.appendChild(rowC); }
     return side;
