@@ -515,11 +515,13 @@ static MTGOSDK.API.Trade.TradeEscrow? HandshakeThenInitiate(
   if (!exec.EnsureKnownUser(partner))
   { Line($"Could not resolve '{partner}' (spelling? they may need to accept the buddy request) — aborting."); return null; }
 
-  try { exec.SendDM(partner, readyMsg); }
-  catch (Exception ex) { Line($"DM failed: {ex.Message} — aborting."); return null; }
-
-  Line($"Waiting up to {yesTimeoutSec / 60} min for {partner} to reply YES (no timer pressure — take your time)...");
-  if (!exec.WaitForDMYes(partner, yesTimeoutSec))
+  // Presence-aware: send the prompt now AND re-send whenever they come online (a DM to an
+  // offline user can be dropped by MTGO), returning on their YES. This is what makes an
+  // offline recipient work — when they log back in they get a fresh prompt they can see.
+  Line(yesTimeoutSec >= int.MaxValue / 2
+    ? $"Prompt sent to {partner} — waiting (no timeout) for them to be online + reply YES; re-sending on each reconnect."
+    : $"Prompt sent to {partner} — waiting up to {yesTimeoutSec / 60} min for them to be online + reply YES.");
+  if (!exec.SendPromptWhenOnlineAndWaitForYes(partner, readyMsg, yesTimeoutSec))
   { Line($"No YES from {partner} within the window — aborting (no invite was sent)."); return null; }
 
   try { exec.SendDM(partner, "Great — sending the trade now; accept the invite when it pops up."); } catch { }
@@ -779,18 +781,24 @@ static bool RunGrabCycle(TradeBot.TradeExecutor exec, MTGOSDK.API.Trade.TradeEsc
 // handshake, present it, wait for them to grab all of it (reminding on an early
 // submit / cancelling on extras), submit our deposit, re-verify, then approve.
 static bool RunLend(TradeBot.TradeExecutor exec, string recipient,
-    System.Collections.Generic.List<(string name, int qty)> intended, bool allowCommit)
+    System.Collections.Generic.List<(string name, int qty)> intended, bool allowCommit,
+    bool keepOpen = false, int yesTimeoutSec = 300)
 {
   var giveNames = intended.SelectMany(it => System.Linq.Enumerable.Repeat(it.name, System.Math.Max(1, it.qty))).ToList();
+  // Human-readable list, e.g. "3x Kozilek's Command". Used for BOTH console and DMs —
+  // do NOT wrap it in [ ] in a DM: MTGO chat treats [text] as a card-link and renders a
+  // comma/qty blob as empty (recipient saw "Ready for ?").
   string cardList = string.Join(", ", intended.Select(it => it.qty > 1 ? $"{it.qty}x {it.name}" : it.name));
+  int totalQty = intended.Sum(it => it.qty);
+  string cardCount = totalQty == 1 ? "the card" : $"all {totalQty} cards";
 
   var lendBinder = exec.EnsureBinderExact("Lending", giveNames);
   if (lendBinder is null) { Line("Could not build the Lending binder — aborting."); return false; }
   Line($"Lending binder ready: '{lendBinder.Name}' (id={lendBinder.Id}, items={lendBinder.ItemCount}).");
 
   var esc = HandshakeThenInitiate(exec, recipient,
-    $"Ready for [{cardList}]? Reply YES and I'll send you a trade — then accept it and grab {(intended.Count == 1 ? "the card" : $"all {intended.Count} cards")} from my offer.",
-    presentBinder: "Lending");
+    $"Ready for {cardList}? Reply YES and I'll send you a trade — then accept it and grab {cardCount} from my offer.",
+    presentBinder: "Lending", yesTimeoutSec: keepOpen ? int.MaxValue : yesTimeoutSec);
   if (esc is null)
   {
     try { exec.SendDM(recipient, "Couldn't open the trade — reply YES when you're ready and I'll retry."); } catch { }
@@ -800,7 +808,9 @@ static bool RunLend(TradeBot.TradeExecutor exec, string recipient,
 
   bool ready = false;
   string lastRemindKey = "";
-  for (int i = 0; i < 300 && !ready; i++)
+  // keepOpen: no grab-window timeout — hold the offer until they finish grabbing or the
+  // trade closes (the c==null check below breaks out on a close/cancel).
+  for (int i = 0; (keepOpen || i < 300) && !ready; i++)
   {
     System.Threading.Thread.Sleep(1000);
     var c = MTGOSDK.API.Trade.TradeManager.CurrentTrade;
@@ -812,7 +822,7 @@ static bool RunLend(TradeBot.TradeExecutor exec, string recipient,
     {
       Line($"They grabbed something not offered ({string.Join(", ", extra)}) — cancelling for safety.");
       exec.CancelCurrent(); WaitForNoTrade();
-      try { exec.SendDM(recipient, $"Cancelled — you grabbed {string.Join(", ", extra)}, which isn't part of this lend. Please grab ONLY [{cardList}], then reply YES to retry."); } catch { }
+      try { exec.SendDM(recipient, $"Cancelled — you grabbed {string.Join(", ", extra)}, which isn't part of this lend. Please grab ONLY {cardList}, then reply YES to retry."); } catch { }
       return false;
     }
     if (exact) { ready = true; break; }
@@ -837,7 +847,7 @@ static bool RunLend(TradeBot.TradeExecutor exec, string recipient,
   {
     Line("They didn't grab the full set in time — cancelling.");
     exec.CancelCurrent(); WaitForNoTrade();
-    try { exec.SendDM(recipient, $"Cancelled — didn't get all of [{cardList}] grabbed in time. Reply YES to retry."); } catch { }
+    try { exec.SendDM(recipient, $"Cancelled — didn't get all of {cardList} grabbed in time. Reply YES to retry."); } catch { }
     return false;
   }
   Line("GUARDRAIL passed: we give exactly the intended set and receive nothing.");
@@ -880,7 +890,7 @@ static bool RunLend(TradeBot.TradeExecutor exec, string recipient,
     if (i % 3 == 0) Line($"  t+{i,2}s state={c.State}");
     if (c.State == MTGOSDK.API.Trade.Enums.TradeState.Closed) break;
   }
-  try { exec.SendDM(recipient, $"Done — enjoy [{cardList}]!"); } catch { }
+  try { exec.SendDM(recipient, $"Done — enjoy {cardList}!"); } catch { }
   Line("\nLedger (latest):");
   var lpl = TradeBot.TradeExecutor.LedgerPath;
   if (System.IO.File.Exists(lpl)) foreach (var l in System.IO.File.ReadAllLines(lpl).Reverse().Take(1)) Line("  " + l);
@@ -992,10 +1002,19 @@ bool yes = args.Contains("--yes");
 bool attachOnly = args.Contains("--attach-only");
 string arg1 = args.Skip(1).FirstOrDefault(a => !a.StartsWith("--")) ?? "";
 
+// Optional: run as a CHOSEN account by loading a specific env file (any filename) instead
+// of the default upward .env search. Used by `serve` to pick the custodian (e.g. Sealed01):
+//   serve --env=C:/Users/you/.env --commit
+string? envPath = null;
+{
+  var e = args.FirstOrDefault(a => a.StartsWith("--env=", StringComparison.OrdinalIgnoreCase));
+  if (e != null) envPath = e.Substring("--env=".Length);
+}
+
 // The ONLY modes a commit (final approve) can happen in: autofullgrab (acquire a
 // free card) and lend (give a card), each requiring an explicit --commit flag.
 // Every other mode stays hard-off (AllowCommit=false) even if --commit is passed.
-bool allowCommit = (mode == "autofullgrab" || mode == "lend" || mode == "swap" || mode == "grabfrom" || mode == "worker") && args.Contains("--commit");
+bool allowCommit = (mode == "autofullgrab" || mode == "lend" || mode == "swap" || mode == "grabfrom" || mode == "worker" || mode == "serve") && args.Contains("--commit");
 
 Line("=== MTGOSDK TradeBot prototype ===");
 Line($"mode={mode}  allowCommit={allowCommit.ToString().ToLowerInvariant()}" +
@@ -1105,8 +1124,8 @@ using (var exec = new TradeExecutor { AllowCommit = allowCommit })
     // the settle wait above). Credentials come from a .env file (searched from
     // the repo root upward: USERNAME= / PASSWORD=) or environment variables of
     // the same names. The password is read into a SecureString, never written.
-    try { DotEnv.LoadFile(); }
-    catch (System.IO.FileNotFoundException) { /* no .env — fall through to env vars */ }
+    try { if (envPath != null) DotEnv.LoadFrom(envPath); else DotEnv.LoadFile(); }
+    catch (System.IO.FileNotFoundException) { /* no env file — fall through to env vars */ }
 
     string uname = "";
     try { uname = DotEnv.Get("USERNAME"); }
@@ -2079,15 +2098,90 @@ using (var exec = new TradeExecutor { AllowCommit = allowCommit })
       var giveCards = cardsFlag != null
         ? cardsFlag.Substring("--cards=".Length).Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).ToList()
         : new System.Collections.Generic.List<string> { args.Skip(2).FirstOrDefault(a => !a.StartsWith("--")) ?? "Azimaet Drake" };
-      var intended = giveCards.Select(n => (name: n, qty: 1)).ToList();
-      string cardList = string.Join(", ", giveCards);
+      // Aggregate duplicate names into (name, count): "3x of one card" must be ONE
+      // (Kozilek's Command, 3) entry, not three (…, 1) entries. The guardrail compares
+      // per-name totals, so three qty-1 entries make a single "qty 2" grab misread as
+      // "extra" instead of "missing 1", and it cancels a valid partial grab.
+      var intended = giveCards
+          .GroupBy(n => n, StringComparer.OrdinalIgnoreCase)
+          .Select(g => (name: g.Key, qty: g.Count()))
+          .ToList();
+      string cardList = string.Join(", ", intended.Select(it => it.qty > 1 ? $"{it.qty}x {it.name}" : it.name));
       if (recipient.Length == 0) { Line("Usage: lend <recipient> [card] [--cards=\"A,B,C\"] [--commit] --yes"); break; }
       if (giveCards.Count == 0) { Line("Nothing to lend — give a card or --cards=\"...\"."); break; }
       if (!yes) { Line($"Refusing: DMs '{recipient}', opens a trade, and GIVES [{cardList}]{(allowCommit ? " (WILL COMMIT the give)" : " (dry-run: stops before commit)")}. Re-run with --yes."); break; }
       Line($"Lending [{cardList}] to {recipient}." + (allowCommit ? "  *** WILL COMMIT ***" : "  [dry-run: reaches approval-ready then cancels — gives nothing]"));
 
+      bool keepOpen = args.Any(a => a.Equals("--keepopen", StringComparison.OrdinalIgnoreCase)
+                                 || a.Equals("--listen", StringComparison.OrdinalIgnoreCase));
       exec.Attach();
-      RunLend(exec, recipient, intended, allowCommit);
+      // keepOpen: wait indefinitely for their YES (single DM), no grab-window timeout, and
+      // re-open the desk after any non-completed attempt. A successful commit returns true
+      // and stops. Stop the task to end. Without it: original single 5-min-window attempt.
+      while (true)
+      {
+        bool committed = RunLend(exec, recipient, intended, allowCommit, keepOpen);
+        if (committed || !keepOpen) break;
+        Line("\n[keepopen] attempt ended without a completed give — re-opening the desk. Reply YES to try again (stop this task to end).");
+      }
+      break;
+    }
+
+    case "serve":
+    {
+      // GIVE-SIDE INTERNAL SERVICE. A continuously-running, token-protected HTTP API in
+      // front of an async job queue: POST /request enqueues a lend (custodian gives cards
+      // to a user); ONE worker runs jobs sequentially; clients poll GET /jobs/{id}. Bound
+      // to loopback by default. Per-job `commit` gates each give AND the process must be
+      // started with --commit to enable committing at all. Moves REAL assets — keep it
+      // internal (loopback / Tailscale) and protect the token.
+      //   serve --env=<sealed.env> [--commit] [--port=8787] [--bind=127.0.0.1] [--token=<t>] [--timeout=600]
+      if (envPath != null) { try { DotEnv.LoadFrom(envPath); } catch { } }  // so the token may live in the env
+
+      int port = 8787;
+      { var p = args.FirstOrDefault(a => a.StartsWith("--port=", StringComparison.OrdinalIgnoreCase));
+        if (p != null && int.TryParse(p.Substring("--port=".Length), out var pv)) port = pv; }
+      string bind = "127.0.0.1";
+      { var b = args.FirstOrDefault(a => a.StartsWith("--bind=", StringComparison.OrdinalIgnoreCase));
+        if (b != null && b.Length > "--bind=".Length) bind = b.Substring("--bind=".Length); }
+      int perJobTimeout = 600;
+      { var t = args.FirstOrDefault(a => a.StartsWith("--timeout=", StringComparison.OrdinalIgnoreCase));
+        if (t != null && int.TryParse(t.Substring("--timeout=".Length), out var tv) && tv > 0) perJobTimeout = tv; }
+
+      // Bearer token: --token= > env TRADEBOT_API_TOKEN > generated + printed once.
+      string token = "";
+      { var tk = args.FirstOrDefault(a => a.StartsWith("--token=", StringComparison.OrdinalIgnoreCase));
+        if (tk != null) token = tk.Substring("--token=".Length); }
+      if (token.Length == 0) { try { token = DotEnv.Get("TRADEBOT_API_TOKEN"); } catch { } }
+      if (token.Length == 0)
+      {
+        token = Guid.NewGuid().ToString("N");
+        Line("[serve] no --token= / TRADEBOT_API_TOKEN set — generated a token for THIS run:");
+        Line($"        {token}");
+      }
+
+      exec.Attach();
+      var svc = new TradeBot.TradeService(
+        token: token, bind: bind, port: port, account: whoami ?? "?", perJobTimeoutSec: perJobTimeout,
+        lendFn: (user, intended, jobCommit, timeoutSec) =>
+        {
+          // Belt + suspenders: give only if the process allows commits AND the job asks to.
+          bool effectiveCommit = allowCommit && jobCommit;
+          bool committed = RunLend(exec, user, intended, allowCommit: effectiveCommit,
+                                   keepOpen: false, yesTimeoutSec: timeoutSec);
+          string set = string.Join(", ", intended.Select(it => it.qty > 1 ? $"{it.qty}x {it.name}" : it.name));
+          string detail = committed
+            ? $"committed — gave {set}"
+            : effectiveCommit
+              ? "not completed (declined / offline / grab incomplete / guardrail)"
+              : $"dry-run — nothing given (service commit {(allowCommit ? "on" : "off")}, job commit={jobCommit})";
+          return (committed, detail);
+        },
+        log: s => Line(s));
+
+      Line($"[serve] give-side service as {whoami}; per-job wait {perJobTimeout}s; " +
+           $"commits {(allowCommit ? "ENABLED (--commit)" : "DISABLED — dry-run only")}.");
+      svc.Run();   // blocks the process on the accept loop until stopped
       break;
     }
 

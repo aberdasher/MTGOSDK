@@ -257,7 +257,13 @@ public sealed class TradeExecutor : IDisposable
   // ─────────────────────────────────────────────────────────────────────────
   public TradeEscrow? RequestTrade(string partnerName)
   {
-    dynamic user = Unbind(new User(partnerName));
+    // Resolve case-INSENSITIVELY, same as the DM/resolve path (ResolveUserId). Using
+    // `new User(name)` here is case-SENSITIVE (UserManager.GetUser default ignoreCase:
+    // false) and throws "User '<name>' cannot be found." whenever the caller's casing
+    // differs from the real handle (e.g. 'basic_' vs 'Basic_') — even though the DM
+    // handshake to the same person just succeeded. GetUser(name, true) returns the
+    // canonical user so the invite actually opens.
+    dynamic user = Unbind(MTGOSDK.API.Users.UserManager.GetUser(partnerName, true));
     dynamic mgr  = Unbind((object)TradeMgr());
     OnUI(() => mgr.RequestTradeWithUser(user));   // opens the binder-selection UI dialog
     Log($"[trade] invite sent to {partnerName}");
@@ -874,6 +880,67 @@ public sealed class TradeExecutor : IDisposable
     return false;
   }
 
+  /// <summary>
+  /// True if <paramref name="username"/> is logged in AND visible (online) right now.
+  /// Read-only; false if they're offline, in "appear offline", or can't be resolved.
+  /// </summary>
+  public bool IsUserOnline(string username)
+    => Try<bool>(() => (bool)MTGOSDK.API.Users.UserManager.GetUser(username, true).IsLoggedIn);
+
+  /// <summary>
+  /// Presence-aware handshake. Sends <paramref name="prompt"/> once now, then RE-sends it on
+  /// every offline→online transition — a DM to an OFFLINE user can be silently dropped by
+  /// MTGO, so a single send can be lost; re-sending when they reconnect guarantees the prompt
+  /// lands when they're there to see it. Returns true the moment they reply YES (caught off
+  /// the DM channel whether or not the prompt reached them). Waits up to
+  /// <paramref name="timeoutSec"/> seconds (int.MaxValue = until they do). Read-only bar DMs.
+  /// </summary>
+  public bool SendPromptWhenOnlineAndWaitForYes(string username, string prompt, int timeoutSec)
+  {
+    int uid = ResolveUserId(username);
+    if (uid <= 0) return false;
+    var channel = ChannelManager.GetPrivateChannel(uid);
+    int seen = Try(() => channel.Messages.Count) ?? 0;
+
+    // One attempt now (covers "already online" + any queue-if-offline behavior)...
+    try { SendDM(username, prompt); } catch (Exception ex) { Log($"[dm] initial prompt threw: {ex.Message.Split('\n')[0]}"); }
+    bool wasOnline = IsUserOnline(username);
+
+    for (int i = 0; i < timeoutSec; i++)
+    {
+      // ...then re-send on each offline→online edge so a dropped offline DM is replaced by
+      // one they can actually see.
+      bool online = IsUserOnline(username);
+      if (online && !wasOnline)
+      {
+        try { SendDM(username, prompt); Log($"[presence] {username} came online — prompt re-sent."); }
+        catch (Exception ex) { Log($"[dm] re-send threw: {ex.Message.Split('\n')[0]}"); }
+      }
+      wasOnline = online;
+
+      // Watch for a new YES (independent of presence — any yes they type fires the trade).
+      try
+      {
+        var msgs = channel.Messages;
+        for (int m = seen; m < msgs.Count; m++)
+        {
+          string who = SenderName(msgs[m]);
+          string raw = (Try(() => msgs[m].Text) ?? "").Trim();
+          Log($"[dm-log] {(who.Length > 0 ? who : "(?)")}: {raw}");
+          string txt = raw.ToLowerInvariant();
+          bool isYes = txt == "y" || txt == "yes" || txt.StartsWith("yes") || txt.StartsWith("y ");
+          if (isYes && (who.Length == 0 || string.Equals(who, username, StringComparison.OrdinalIgnoreCase)))
+            return true;
+        }
+        seen = msgs.Count;
+      }
+      catch { }
+
+      System.Threading.Thread.Sleep(1000);
+    }
+    return false;
+  }
+
   /// <summary>Diagnostic: dump the last <paramref name="n"/> messages in the DM channel.</summary>
   public void DumpDMTail(string username, int n = 8)
   {
@@ -965,17 +1032,27 @@ public sealed class TradeExecutor : IDisposable
     int recvCount = 0;
     try { recvCount = esc.PartnerTradedItems.CollectionItems.Count; } catch { }
 
+    // Tolerant name match: MTGO can return a typographic apostrophe (U+2019) where the
+    // caller typed a straight ' — strip both (and trim) so "Kozilek's Command" matches
+    // regardless. Without this, a legitimately-offered grab reads as "not offered".
+    static string Norm(string s) =>
+        (s ?? "").Replace("’", "").Replace("‘", "").Replace("'", "").Trim();
+    bool NameMatch(string given, string want) =>
+        Norm(given).IndexOf(Norm(want), StringComparison.OrdinalIgnoreCase) >= 0;
+
     var missing = new List<string>();
     foreach (var want in intended)
     {
-      int got = give.Where(g => (g.name ?? "").IndexOf(want.name, StringComparison.OrdinalIgnoreCase) >= 0).Sum(g => g.qty);
+      int got = give.Where(g => NameMatch(g.name, want.name)).Sum(g => g.qty);
       if (got < want.qty) { int short_ = want.qty - got; missing.Add(short_ > 1 ? $"{short_}x {want.name}" : want.name); }
     }
     var extra = new List<string>();
     foreach (var g in give)
     {
-      var match = intended.FirstOrDefault(w => (g.name ?? "").IndexOf(w.name, StringComparison.OrdinalIgnoreCase) >= 0);
-      int allowed = match.name != null ? match.qty : 0;
+      // Total allowed for this given card = SUM of every intended qty whose name matches,
+      // so 3x of ONE card is fully allowed however `intended` is split. (A single "qty 2"
+      // grab of a 3x lend is then "missing 1", never "extra".)
+      int allowed = intended.Where(w => NameMatch(g.name, w.name)).Sum(w => w.qty);
       if (g.qty > allowed) { int over = g.qty - allowed; extra.Add($"{over}x {g.name}"); }
     }
     bool exact = missing.Count == 0 && extra.Count == 0 && recvCount == 0;

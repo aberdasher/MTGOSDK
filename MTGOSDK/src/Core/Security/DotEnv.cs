@@ -88,6 +88,25 @@ public static class DotEnv
         throw new FileNotFoundException("Could not find .env file.");
     }
 
+    ReadInto(filepath);
+  }
+
+  /// <summary>
+  /// Load a SPECIFIC env file by exact path (any filename, not just ".env") so a service
+  /// can run as a chosen account. Throws <see cref="FileNotFoundException"/> if missing.
+  /// </summary>
+  /// <param name="path">The exact path to the env file.</param>
+  public static void LoadFrom(string path)
+  {
+    if (!File.Exists(path)) throw new FileNotFoundException($"env file not found: {path}");
+    ReadInto(path);
+  }
+
+  /// <summary>
+  /// Parse KEY=VALUE / KEY:VALUE lines from <paramref name="filepath"/> into the store.
+  /// </summary>
+  private static void ReadInto(string filepath)
+  {
     using (StreamReader reader = new(filepath))
     {
       // Temporary buffers for each key and value pair.
