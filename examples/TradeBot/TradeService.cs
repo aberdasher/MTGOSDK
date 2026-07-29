@@ -55,6 +55,8 @@ public sealed class TradeService
   readonly int _perJobTimeoutSec;
   // (user, intended[(name,qty)], commit, yesTimeoutSec) => (ok, detail)
   readonly Func<string, List<(string name, int qty)>, bool, int, (bool ok, string detail)> _lendFn;
+  // (user, card, commit, yesTimeoutSec) => (ok, detail)  — receive one card, give nothing
+  readonly Func<string, string, bool, int, (bool ok, string detail)> _grabFn;
   readonly Action<string> _log;
 
   readonly ConcurrentDictionary<string, TradeJob> _jobs = new();
@@ -64,10 +66,11 @@ public sealed class TradeService
 
   public TradeService(string token, string bind, int port, string account, int perJobTimeoutSec,
     Func<string, List<(string name, int qty)>, bool, int, (bool ok, string detail)> lendFn,
+    Func<string, string, bool, int, (bool ok, string detail)> grabFn,
     Action<string> log)
   {
     _token = token; _bind = bind; _port = port; _account = account;
-    _perJobTimeoutSec = perJobTimeoutSec; _lendFn = lendFn; _log = log;
+    _perJobTimeoutSec = perJobTimeoutSec; _lendFn = lendFn; _grabFn = grabFn; _log = log;
   }
 
   /// <summary>Start the worker + HTTP listener. BLOCKS (accept loop) until the process ends.</summary>
@@ -89,7 +92,7 @@ public sealed class TradeService
     }
 
     _log($"[serve] listening on {prefix}   custodian={_account}   (Bearer token required)");
-    _log("[serve] routes: GET /health | POST /request {user,cards[],commit} | GET /jobs/{id} | GET /jobs");
+    _log("[serve] routes: GET /health | POST /request {user,cards[],commit} | POST /deposit {user,cards[1],commit} | GET /jobs/{id} | GET /jobs");
 
     while (true)
     {
@@ -137,28 +140,35 @@ public sealed class TradeService
       else Write(ctx, 404, new { error = "no such job", id });
       return;
     }
-    if (method == "POST" && path == "/request")
-    {
-      string body;
-      using (var r = new StreamReader(req.InputStream, req.ContentEncoding ?? Encoding.UTF8)) body = r.ReadToEnd();
-      RequestDto dto;
-      try { dto = JsonSerializer.Deserialize<RequestDto>(body, JsonIn) ?? new RequestDto(); }
-      catch (Exception ex) { Write(ctx, 400, new { error = "bad json", detail = ex.Message }); return; }
-
-      string user = (dto.User ?? "").Trim();
-      var cards = (dto.Cards ?? new()).Select(c => (c ?? "").Trim()).Where(c => c.Length > 0).ToList();
-      if (user.Length == 0) { Write(ctx, 400, new { error = "user required" }); return; }
-      if (cards.Count == 0) { Write(ctx, 400, new { error = "cards required (non-empty array; repeat a name for qty>1)" }); return; }
-
-      var job = new TradeJob { Id = NewId(), User = user, Cards = cards, Commit = dto.Commit ?? false };
-      _jobs[job.Id] = job;
-      _queue.Add(job);
-      _log($"[serve] queued {job.Id}: request user={user} cards=[{string.Join(", ", cards)}] commit={job.Commit}");
-      Write(ctx, 202, Project(job));
-      return;
-    }
+    if (method == "POST" && path == "/request") { HandleEnqueue(ctx, req, "request"); return; }  // give
+    if (method == "POST" && path == "/deposit") { HandleEnqueue(ctx, req, "deposit"); return; }  // receive
 
     Write(ctx, 404, new { error = "not found", path, method });
+  }
+
+  // Parse {user, cards[], commit}, validate, and enqueue a job of `type`
+  // ("request" = custodian gives to user; "deposit" = custodian receives from user).
+  void HandleEnqueue(HttpListenerContext ctx, HttpListenerRequest req, string type)
+  {
+    string body;
+    using (var r = new StreamReader(req.InputStream, req.ContentEncoding ?? Encoding.UTF8)) body = r.ReadToEnd();
+    RequestDto dto;
+    try { dto = JsonSerializer.Deserialize<RequestDto>(body, JsonIn) ?? new RequestDto(); }
+    catch (Exception ex) { Write(ctx, 400, new { error = "bad json", detail = ex.Message }); return; }
+
+    string user = (dto.User ?? "").Trim();
+    var cards = (dto.Cards ?? new()).Select(c => (c ?? "").Trim()).Where(c => c.Length > 0).ToList();
+    if (user.Length == 0) { Write(ctx, 400, new { error = "user required" }); return; }
+    if (cards.Count == 0) { Write(ctx, 400, new { error = "cards required (non-empty array; repeat a name for qty>1)" }); return; }
+    // v1 deposit is single-card (reuses the tested one-card grab flow). Multi-card TODO.
+    if (type == "deposit" && cards.Count != 1)
+    { Write(ctx, 400, new { error = "deposit v1 takes exactly ONE card per request (multi-card deposit not yet supported)" }); return; }
+
+    var job = new TradeJob { Id = NewId(), Type = type, User = user, Cards = cards, Commit = dto.Commit ?? false };
+    _jobs[job.Id] = job;
+    _queue.Add(job);
+    _log($"[serve] queued {job.Id}: {type} user={user} cards=[{string.Join(", ", cards)}] commit={job.Commit}");
+    Write(ctx, 202, Project(job));
   }
 
   // Length-checked constant-time compare so the bearer token isn't leaked by timing.
@@ -176,17 +186,26 @@ public sealed class TradeService
     {
       job.State = JobState.Running;
       job.StartedAt = DateTime.UtcNow.ToString("o");
-      _log($"[serve] running {job.Id} (request user={job.User}) ...");
+      _log($"[serve] running {job.Id} ({job.Type} user={job.User}) ...");
       try
       {
-        // Aggregate duplicate names into (name, qty) — same shape the lend flow expects.
-        var intended = job.Cards
-          .GroupBy(n => n, StringComparer.OrdinalIgnoreCase)
-          .Select(g => (name: g.Key, qty: g.Count()))
-          .ToList();
-        var (ok, detail) = _lendFn(job.User, intended, job.Commit, _perJobTimeoutSec);
-        job.State = ok ? JobState.Done : JobState.Failed;
-        job.Detail = detail;
+        (bool ok, string detail) r;
+        if (job.Type == "deposit")
+        {
+          // Receive one card (validated single at enqueue), give nothing.
+          r = _grabFn(job.User, job.Cards[0], job.Commit, _perJobTimeoutSec);
+        }
+        else
+        {
+          // request (give): aggregate duplicate names into (name, qty).
+          var intended = job.Cards
+            .GroupBy(n => n, StringComparer.OrdinalIgnoreCase)
+            .Select(g => (name: g.Key, qty: g.Count()))
+            .ToList();
+          r = _lendFn(job.User, intended, job.Commit, _perJobTimeoutSec);
+        }
+        job.State = r.ok ? JobState.Done : JobState.Failed;
+        job.Detail = r.detail;
       }
       catch (Exception ex) { job.State = JobState.Failed; job.Detail = ex.Message; }
       job.FinishedAt = DateTime.UtcNow.ToString("o");

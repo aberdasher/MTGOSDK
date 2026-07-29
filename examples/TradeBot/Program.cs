@@ -913,14 +913,15 @@ static bool RunSwapFlow(TradeBot.TradeExecutor exec, string partner, string give
 }
 
 // GRAB: receive one card, give nothing. Handshake, then runs the grab cycle.
-static bool RunGrabFlow(TradeBot.TradeExecutor exec, string partner, string card, bool allowCommit)
+static bool RunGrabFlow(TradeBot.TradeExecutor exec, string partner, string card, bool allowCommit,
+    int yesTimeoutSec = 300)
 {
   System.Collections.Generic.List<int> cats;
   try { cats = MTGOSDK.API.Collection.CollectionManager.GetCardIds(card).ToList(); }
   catch { Line($"Unknown card '{card}'."); return false; }
   var esc = HandshakeThenInitiate(exec, partner,
     $"Ready to give me the {card}? Reply YES, accept the trade, and present a binder that HAS the {card} (pick it before accepting). I'll grab it; take nothing from my side.",
-    presentBinder: null);
+    presentBinder: null, yesTimeoutSec: yesTimeoutSec);
   if (esc is null) { try { exec.SendDM(partner, "Couldn't open the trade — reply YES when ready and I'll retry."); } catch { } return false; }
   return RunGrabCycle(exec, esc, partner, card, cats, allowCommit);
 }
@@ -2177,9 +2178,21 @@ using (var exec = new TradeExecutor { AllowCommit = allowCommit })
               : $"dry-run — nothing given (service commit {(allowCommit ? "on" : "off")}, job commit={jobCommit})";
           return (committed, detail);
         },
+        grabFn: (user, card, jobCommit, timeoutSec) =>
+        {
+          // Deposit: custodian RECEIVES one card from the user, gives nothing (one-way grab).
+          bool effectiveCommit = allowCommit && jobCommit;
+          bool committed = RunGrabFlow(exec, user, card, allowCommit: effectiveCommit, yesTimeoutSec: timeoutSec);
+          string detail = committed
+            ? $"committed — received {card}"
+            : effectiveCommit
+              ? "not completed (declined / offline / card not presented / took-from-us / guardrail)"
+              : $"dry-run — nothing received (service commit {(allowCommit ? "on" : "off")}, job commit={jobCommit})";
+          return (committed, detail);
+        },
         log: s => Line(s));
 
-      Line($"[serve] give-side service as {whoami}; per-job wait {perJobTimeout}s; " +
+      Line($"[serve] trade service (give + deposit) as {whoami}; per-job wait {perJobTimeout}s; " +
            $"commits {(allowCommit ? "ENABLED (--commit)" : "DISABLED — dry-run only")}.");
       svc.Run();   // blocks the process on the accept loop until stopped
       break;
