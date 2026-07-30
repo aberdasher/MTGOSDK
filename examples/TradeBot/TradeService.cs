@@ -51,7 +51,7 @@ public sealed class TradeService
   readonly string _token;
   readonly string _bind;
   readonly int _port;
-  readonly string _account;
+  readonly MtgoConnection _conn;
   readonly int _perJobTimeoutSec;
   // (user, intended[(name,qty)], commit, yesTimeoutSec) => (ok, detail)
   readonly Func<string, List<(string name, int qty)>, bool, int, (bool ok, string detail)> _lendFn;
@@ -64,12 +64,12 @@ public sealed class TradeService
 
   static readonly JsonSerializerOptions JsonIn = new() { PropertyNameCaseInsensitive = true };
 
-  public TradeService(string token, string bind, int port, string account, int perJobTimeoutSec,
+  public TradeService(string token, string bind, int port, MtgoConnection conn, int perJobTimeoutSec,
     Func<string, List<(string name, int qty)>, bool, int, (bool ok, string detail)> lendFn,
     Func<string, string, bool, int, (bool ok, string detail)> grabFn,
     Action<string> log)
   {
-    _token = token; _bind = bind; _port = port; _account = account;
+    _token = token; _bind = bind; _port = port; _conn = conn;
     _perJobTimeoutSec = perJobTimeoutSec; _lendFn = lendFn; _grabFn = grabFn; _log = log;
   }
 
@@ -78,6 +78,8 @@ public sealed class TradeService
   {
     var worker = new Thread(WorkerLoop) { IsBackground = true, Name = "trade-worker" };
     worker.Start();
+    var monitor = new Thread(MonitorLoop) { IsBackground = true, Name = "conn-monitor" };
+    monitor.Start();
 
     var listener = new HttpListener();
     string prefix = $"http://{_bind}:{_port}/";
@@ -91,7 +93,7 @@ public sealed class TradeService
       return;
     }
 
-    _log($"[serve] listening on {prefix}   custodian={_account}   (Bearer token required)");
+    _log($"[serve] listening on {prefix}   custodian={_conn.Account}   (Bearer token required)");
     _log("[serve] routes: GET /health | POST /request {user,cards[],commit} | POST /deposit {user,cards[1],commit} | GET /jobs/{id} | GET /jobs");
 
     while (true)
@@ -124,7 +126,8 @@ public sealed class TradeService
 
     if (method == "GET" && path == "/health")
     {
-      Write(ctx, 200, new { ok = true, custodian = _account, queued = _queue.Count, jobs = _jobs.Count });
+      Write(ctx, 200, new { ok = !_conn.Reconnecting, custodian = _conn.Account,
+        reconnecting = _conn.Reconnecting, queued = _queue.Count, jobs = _jobs.Count });
       return;
     }
     if (method == "GET" && path == "/jobs")
@@ -187,6 +190,7 @@ public sealed class TradeService
       job.State = JobState.Running;
       job.StartedAt = DateTime.UtcNow.ToString("o");
       _log($"[serve] running {job.Id} ({job.Type} user={job.User}) ...");
+      _conn.EnsureHealthy();   // block here until MTGO is reachable again (survives a client restart)
       try
       {
         (bool ok, string detail) r;
@@ -210,6 +214,19 @@ public sealed class TradeService
       catch (Exception ex) { job.State = JobState.Failed; job.Detail = ex.Message; }
       job.FinishedAt = DateTime.UtcNow.ToString("o");
       _log($"[serve] {job.Id} -> {job.State.ToString().ToLowerInvariant()} ({job.Detail})");
+    }
+  }
+
+  // Proactively keep the MTGO connection alive so /health is accurate and a reconnect is
+  // already done before the next job runs. The reconnect itself blocks inside EnsureHealthy;
+  // this thread just triggers it during idle periods.
+  void MonitorLoop()
+  {
+    while (true)
+    {
+      try { _conn.EnsureHealthy(); }
+      catch (Exception ex) { _log($"[serve] monitor error: {ex.Message.Split('\n')[0]}"); }
+      Thread.Sleep(20000);
     }
   }
 

@@ -2162,13 +2162,35 @@ using (var exec = new TradeExecutor { AllowCommit = allowCommit })
       }
 
       exec.Attach();
+
+      // Auto-reconnect: RE-ATTACH a fresh client + executor after an MTGO restart (attach,
+      // NOT cold-start — re-login is the user's/MTGO's job, so no MFA is needed here).
+      var conn = new TradeBot.MtgoConnection(client, exec, whoami ?? "?",
+        () =>
+        {
+          Client? c = null;
+          try { c = new Client(new ClientOptions(), loggerFactory: factory); }
+          catch { return (null, null, null); }
+          string? acct = null;
+          for (int i = 0; i < 40 && acct is null; i++)
+          {
+            try { var u = c.CurrentUser; if (u != null && u.Id > 0) acct = u.Name; } catch { }
+            if (acct is null) System.Threading.Thread.Sleep(1500);
+          }
+          if (acct is null) { try { c.Dispose(); } catch { } return (null, null, null); }
+          var e = new TradeBot.TradeExecutor { AllowCommit = allowCommit };
+          e.Attach();
+          return (c, e, acct);
+        },
+        s => Line(s));
+
       var svc = new TradeBot.TradeService(
-        token: token, bind: bind, port: port, account: whoami ?? "?", perJobTimeoutSec: perJobTimeout,
+        token: token, bind: bind, port: port, conn: conn, perJobTimeoutSec: perJobTimeout,
         lendFn: (user, intended, jobCommit, timeoutSec) =>
         {
           // Belt + suspenders: give only if the process allows commits AND the job asks to.
           bool effectiveCommit = allowCommit && jobCommit;
-          bool committed = RunLend(exec, user, intended, allowCommit: effectiveCommit,
+          bool committed = RunLend(conn.Exec, user, intended, allowCommit: effectiveCommit,
                                    keepOpen: false, yesTimeoutSec: timeoutSec);
           string set = string.Join(", ", intended.Select(it => it.qty > 1 ? $"{it.qty}x {it.name}" : it.name));
           string detail = committed
@@ -2182,7 +2204,7 @@ using (var exec = new TradeExecutor { AllowCommit = allowCommit })
         {
           // Deposit: custodian RECEIVES one card from the user, gives nothing (one-way grab).
           bool effectiveCommit = allowCommit && jobCommit;
-          bool committed = RunGrabFlow(exec, user, card, allowCommit: effectiveCommit, yesTimeoutSec: timeoutSec);
+          bool committed = RunGrabFlow(conn.Exec, user, card, allowCommit: effectiveCommit, yesTimeoutSec: timeoutSec);
           string detail = committed
             ? $"committed — received {card}"
             : effectiveCommit
