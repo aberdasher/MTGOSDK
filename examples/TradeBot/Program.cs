@@ -928,6 +928,55 @@ static bool RunGrabFlow(TradeBot.TradeExecutor exec, string partner, string card
   return RunGrabCycle(exec, esc, partner, card, cats, allowCommit, qty);
 }
 
+// UNIFIED DISPATCH — a trade is "what we GIVE + what we RECEIVE"; route to the right flow.
+// This is the SINGLE source of truth for give/recv/swap selection (the old `worker` mode
+// inlined this, and the serve had it half-split across two delegates). The serve worker
+// and any CLI both call this, so the routing lives in exactly one place.
+//   give-only                    -> RunLend   (custodian gives; guardrail: receive nothing)
+//   single receive-only          -> RunGrabFlow (custodian receives qty of one card; give nothing)
+//   single give(qty1) + receive  -> RunSwapFlow (give one card, request the listed cards)
+// `allowCommit` here is the EFFECTIVE commit (caller already ANDed process + job commit).
+static (bool ok, string detail) RunTrade(TradeBot.TradeExecutor exec, string partner,
+    System.Collections.Generic.List<(string name, int qty)> give,
+    System.Collections.Generic.List<(string name, int qty)> receive,
+    bool allowCommit, int yesTimeoutSec = 300)
+{
+  give = (give ?? new()).Where(i => !string.IsNullOrWhiteSpace(i.name) && i.qty > 0).ToList();
+  receive = (receive ?? new()).Where(i => !string.IsNullOrWhiteSpace(i.name) && i.qty > 0).ToList();
+  if (string.IsNullOrWhiteSpace(partner)) return (false, "no partner");
+  if (give.Count == 0 && receive.Count == 0) return (false, "nothing to give or receive");
+
+  static string Fmt(System.Collections.Generic.List<(string name, int qty)> xs) =>
+    string.Join(", ", xs.Select(i => i.qty > 1 ? $"{i.qty}x {i.name}" : i.name));
+
+  bool giveOnly = give.Count > 0 && receive.Count == 0;
+  bool recvOnly = give.Count == 0 && receive.Count > 0;
+
+  if (giveOnly)
+  {
+    bool ok = RunLend(exec, partner, give, allowCommit: allowCommit, keepOpen: false, yesTimeoutSec: yesTimeoutSec);
+    return (ok, ok ? (allowCommit ? $"committed — gave {Fmt(give)}" : $"dry-run — reached ready, gave nothing ({Fmt(give)})")
+                   : "not completed (declined / offline / grab incomplete / guardrail)");
+  }
+  if (recvOnly && receive.Count == 1)
+  {
+    var r = receive[0];
+    bool ok = RunGrabFlow(exec, partner, r.name, allowCommit: allowCommit, yesTimeoutSec: yesTimeoutSec, qty: r.qty);
+    return (ok, ok ? (allowCommit ? $"committed — received {Fmt(receive)}" : $"dry-run — reached ready, received nothing ({Fmt(receive)})")
+                   : "not completed (declined / offline / cards not presented / took-from-us / guardrail)");
+  }
+  if (give.Count == 1 && give[0].qty == 1 && receive.Count > 0)
+  {
+    // SWAP: give one card, request the listed cards back (qty on the receive side is not
+    // yet honored by the swap cycle — it requests each name once, matching the old worker).
+    var getNames = receive.Select(i => i.name).ToList();
+    bool ok = RunSwapFlow(exec, partner, give[0].name, getNames, allowCommit);
+    return (ok, ok ? (allowCommit ? $"committed — swapped {give[0].name} for {Fmt(receive)}" : $"dry-run — swap reached ready ({give[0].name} for {Fmt(receive)})")
+                   : "not completed (declined / offline / guardrail)");
+  }
+  return (false, "unsupported give/receive combo (v1: give-only lend, single receive-only grab, or single-give+receive swap; multi-give / qty>1 receive-with-give not yet)");
+}
+
 // Given a negotiating escrow, stage the requested card (non-committing) and HOLD
 // the session open while the user reviews + clicks Submit. Never commits
 // (AllowCommit stays false); the final approve is the user's.
@@ -1017,7 +1066,7 @@ string? envPath = null;
 // The ONLY modes a commit (final approve) can happen in: autofullgrab (acquire a
 // free card) and lend (give a card), each requiring an explicit --commit flag.
 // Every other mode stays hard-off (AllowCommit=false) even if --commit is passed.
-bool allowCommit = (mode == "autofullgrab" || mode == "lend" || mode == "swap" || mode == "grabfrom" || mode == "worker" || mode == "serve") && args.Contains("--commit");
+bool allowCommit = (mode == "autofullgrab" || mode == "lend" || mode == "swap" || mode == "grabfrom" || mode == "serve") && args.Contains("--commit");
 
 Line("=== MTGOSDK TradeBot prototype ===");
 Line($"mode={mode}  allowCommit={allowCommit.ToString().ToLowerInvariant()}" +
@@ -1032,15 +1081,6 @@ if (mode == "ledger")
     foreach (var l in System.IO.File.ReadAllLines(lp)) Line("  " + l);
   else
     Line("  (no acquisitions recorded yet)");
-  return;
-}
-
-// Control UI: a local web panel that composes orders + spawns the `worker` process.
-// This process does NOT attach to MTGO (the spawned worker does), so it runs without
-// a live client.
-if (mode == "ui")
-{
-  TradeBot.ControlUi.Run(args);
   return;
 }
 
@@ -2208,36 +2248,37 @@ using (var exec = new TradeExecutor { AllowCommit = allowCommit })
 
       var svc = new TradeBot.TradeService(
         token: token, bind: bind, port: port, conn: conn, perJobTimeoutSec: perJobTimeout,
-        lendFn: (user, intended, jobCommit, timeoutSec) =>
+        tradeFn: (partner, give, receive, jobCommit, timeoutSec) =>
         {
-          // Belt + suspenders: give only if the process allows commits AND the job asks to.
+          // Belt + suspenders: commit only if the process allows commits AND the job asks to.
+          // ONE dispatch for give / receive / swap — RunTrade owns the routing + the detail text.
           bool effectiveCommit = allowCommit && jobCommit;
-          bool committed = RunLend(conn.Exec, user, intended, allowCommit: effectiveCommit,
-                                   keepOpen: false, yesTimeoutSec: timeoutSec);
-          string set = string.Join(", ", intended.Select(it => it.qty > 1 ? $"{it.qty}x {it.name}" : it.name));
-          string detail = committed
-            ? $"committed — gave {set}"
-            : effectiveCommit
-              ? "not completed (declined / offline / grab incomplete / guardrail)"
-              : $"dry-run — nothing given (service commit {(allowCommit ? "on" : "off")}, job commit={jobCommit})";
-          return (committed, detail);
+          return RunTrade(conn.Exec, partner, give, receive, allowCommit: effectiveCommit, yesTimeoutSec: timeoutSec);
         },
-        grabFn: (user, card, qty, jobCommit, timeoutSec) =>
+        vaultFn: () =>
         {
-          // Deposit: custodian RECEIVES qty of one card from the user, gives nothing (one-way grab).
-          bool effectiveCommit = allowCommit && jobCommit;
-          bool committed = RunGrabFlow(conn.Exec, user, card, allowCommit: effectiveCommit, yesTimeoutSec: timeoutSec, qty: qty);
-          string set = qty > 1 ? $"{qty}x {card}" : card;
-          string detail = committed
-            ? $"committed — received {set}"
-            : effectiveCommit
-              ? "not completed (declined / offline / cards not presented / took-from-us / guardrail)"
-              : $"dry-run — nothing received (service commit {(allowCommit ? "on" : "off")}, job commit={jobCommit})";
-          return (committed, detail);
+          // Owned Event Tickets + a small holdings summary, from ONE collection scan.
+          var col = MTGOSDK.API.Collection.CollectionManager.Collection;
+          System.Collections.Generic.List<int> tixIds;
+          try { tixIds = MTGOSDK.API.Collection.CollectionManager.GetCardIds("Event Ticket").ToList(); }
+          catch { tixIds = new(); }
+          int tix = 0;
+          var byName = new System.Collections.Generic.Dictionary<string, int>();
+          foreach (var it in col.Items)
+          {
+            int q = it.Quantity; if (q <= 0) continue;
+            if (tixIds.Contains(it.Id)) tix += q;
+            string nm; try { nm = it.Card?.Name ?? "?"; } catch { nm = "?"; }
+            byName[nm] = (byName.TryGetValue(nm, out var v) ? v : 0) + q;
+          }
+          var top = byName.Where(k => !string.Equals(k.Key, "Event Ticket", StringComparison.OrdinalIgnoreCase))
+                          .OrderByDescending(k => k.Value).ThenBy(k => k.Key).Take(12)
+                          .Select(k => (name: k.Key, qty: k.Value)).ToList();
+          return (tix, byName.Count, top);
         },
         log: s => Line(s));
 
-      Line($"[serve] trade service (give + deposit) as {whoami}; per-job wait {perJobTimeout}s; " +
+      Line($"[serve] trade service (give / deposit / swap) as {whoami}; per-job wait {perJobTimeout}s; " +
            $"commits {(allowCommit ? "ENABLED (--commit)" : "DISABLED — dry-run only")}.");
       svc.Run();   // blocks the process on the accept loop until stopped
       break;
@@ -2558,72 +2599,14 @@ using (var exec = new TradeExecutor { AllowCommit = allowCommit })
     }
 
     case "worker":
-    {
-      // Drain a FOLDER of trade-order JSON files, executing each against MTGO one at
-      // a time, writing a sibling <name>.status.json (the input file is never
-      // touched). Manual trigger now (drop order files, run this); later a remote
-      // producer writes the SAME JSON and nothing here changes. An order commits only
-      // if BOTH its own commit:true AND the worker is launched with --commit.
-      // Usage: worker [--dir=<path>] [--commit] --yes    (default dir: %USERPROFILE%\mtgosdk-tradebot\orders)
-      string dir = args.FirstOrDefault(a => a.StartsWith("--dir=", StringComparison.OrdinalIgnoreCase))?.Substring("--dir=".Length)
-                   ?? TradeBot.OrderQueue.DefaultDir;
-      System.IO.Directory.CreateDirectory(dir);
-      Line($"Worker: order folder = {dir}");
-      var pending = TradeBot.OrderQueue.Pending(dir);
-      if (pending.Count == 0) { Line("No pending orders (a *.json with no sibling *.status.json). Drop one in and re-run."); break; }
-      if (!yes)
-      {
-        Line($"Refusing: {pending.Count} pending order(s){(allowCommit ? " — would COMMIT those marked commit:true" : " — dry-run, nothing commits")}. Re-run with --yes:");
-        foreach (var o in pending)
-          Line($"  {o.Id}: partner={o.MtgoPartner}  GIVE=[{string.Join(", ", o.Give.Select(i => i.ToString()))}]  RECEIVE=[{string.Join(", ", o.Receive.Select(i => i.ToString()))}]  commit={o.Commit}");
-        break;
-      }
-
-      exec.Attach();
-
-      foreach (var order in pending)
-      {
-        string gs = string.Join(", ", order.Give.Select(i => i.ToString()));
-        string rs = string.Join(", ", order.Receive.Select(i => i.ToString()));
-        Line($"\n===== ORDER {order.Id}  partner={order.MtgoPartner}  GIVE=[{gs}]  RECEIVE=[{rs}]  commit={order.Commit} =====");
-        TradeBot.OrderQueue.WriteStatus(order.SourcePath, new TradeBot.OrderStatus { Id = order.Id, Status = "running", Detail = "executing" });
-
-        bool perOrderCommit = order.Commit && allowCommit;
-        var status = new TradeBot.OrderStatus { Id = order.Id, Gave = order.Give.Select(i => i.ToString()).ToList(), Received = order.Receive.Select(i => i.ToString()).ToList() };
-        try
-        {
-          if (string.IsNullOrWhiteSpace(order.MtgoPartner)) { status.Status = "failed"; status.Detail = "order has no mtgoPartner"; }
-          else
-          {
-            var giveItems = order.Give.Select(i => (name: i.Name, qty: System.Math.Max(1, i.Qty))).ToList();
-            bool giveOnly = order.Give.Count > 0 && order.Receive.Count == 0;
-            bool recvOnly = order.Give.Count == 0 && order.Receive.Count > 0;
-            bool both     = order.Give.Count > 0 && order.Receive.Count > 0;
-            bool? ok = null;
-
-            if (giveOnly) { Line("→ LEND (give-only)"); ok = RunLend(exec, order.MtgoPartner, giveItems, perOrderCommit); }
-            else if (recvOnly && order.Receive.Count == 1 && order.Receive[0].Qty == 1) { Line("→ GRAB (receive-only, single card)"); ok = RunGrabFlow(exec, order.MtgoPartner, order.Receive[0].Name, perOrderCommit); }
-            else if (both && order.Give.Count == 1 && order.Give[0].Qty == 1) { Line("→ SWAP (one give card, request the rest)"); ok = RunSwapFlow(exec, order.MtgoPartner, order.Give[0].Name, order.Receive.Select(i => i.Name).ToList(), perOrderCommit); }
-            else { status.Status = "unsupported"; status.Detail = "unsupported give/receive combo (v1: give-only lend, single receive-only grab, or single-give+receive swap; qty>1 receive / multi-give not yet)."; }
-
-            if (ok.HasValue)
-            {
-              status.Status = ok.Value ? (perOrderCommit ? "completed" : "completed_dryrun") : "cancelled";
-              status.Detail = ok.Value ? (perOrderCommit ? "trade committed" : "reached ready + guardrail OK; dry-run (no commit)") : "cancelled / incomplete — see worker log";
-            }
-          }
-        }
-        catch (Exception ex) { status.Status = "failed"; status.Detail = $"{ex.GetType().Name}: {ex.Message.Split('\n')[0]}"; }
-
-        TradeBot.OrderQueue.WriteStatus(order.SourcePath, status);
-        Line($"===== ORDER {order.Id} → {status.Status} ({status.Detail}) =====");
-
-        // Make sure nothing is left open before the next order.
-        exec.CancelCurrent(); WaitForNoTrade();
-      }
-      Line($"\nWorker done — processed {pending.Count} order(s).");
+    case "ui":
+      // UNIFIED into `serve`: the order-file worker and the standalone `ui` order desk are
+      // gone. `serve` is now one process = one job queue + one worker + one HTTP listener that
+      // serves BOTH the JSON API and an operator dashboard (GET /). Compose trades in the
+      // dashboard or POST /trade {partner, give[], receive[], commit}; the dispatch is RunTrade.
+      Line("`worker` and `ui` were folded into `serve`. Run `serve` and open its dashboard (GET /), or POST /trade.");
+      Line("  serve --env=<path> [--commit] --port=8787 --token=<secret> [--bind=127.0.0.1]");
       break;
-    }
 
     default:
       Line($"Unknown mode '{mode}'. Use:");
@@ -2634,8 +2617,8 @@ using (var exec = new TradeExecutor { AllowCommit = allowCommit })
       Line("  lend      : lend <recipient> [card] --yes           (DM->wait YES->give card w/ guardrail; add --commit to complete)");
       Line("  swap      : swap <partner> [--give=<card>] [--get=<card>] [--listen] --yes  (offer one card, request another; --listen watches for YES continuously; add --commit)");
       Line("  grabfrom  : grabfrom <partner> [card] [--listen] --yes  (receive a card, give nothing; add --commit)");
-      Line("  worker    : worker [--dir=<path>] --yes                 (drain a folder of trade-order JSONs; add --commit for orders marked commit:true)");
-      Line("  ui        : ui [--dir=<path>] [--port=5577]             (local web control panel: compose orders, run the worker, watch status)");
+      Line("  serve     : serve --env=<path> --port=8787 --token=<t> [--bind=127.0.0.1] [--commit]");
+      Line("              (vault service: JSON API + operator dashboard at GET /; give/deposit/swap through one job queue)");
       Line("  low-level : opentrade <bot> --yes | takecard <card> --yes | grab <bot> --yes | invite <user> --yes");
       Line("  test      : stagetest <bot> [card] --yes  (controlled TakeCard test: stage -> observe -> cancel)");
       Line("  outward   : post \"<msg>\" --yes | clearpost --yes");
