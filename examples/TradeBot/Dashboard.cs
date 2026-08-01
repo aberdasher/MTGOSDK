@@ -56,6 +56,12 @@ select{background:var(--panel2);border:1px solid var(--edge);color:var(--ink);bo
 .job .items{color:var(--mut);font-size:12px;margin-top:6px}.job .items b{color:var(--ink);font-weight:500}
 .job .detail{color:var(--mut);font-size:12px;margin-top:4px;font-style:italic}
 .job .t{color:var(--mut);font-size:11px;font-variant-numeric:tabular-nums}
+.loan{border:1px solid var(--edge);border-radius:8px;padding:9px;margin-bottom:8px}
+.loan .top{display:flex;align-items:center;justify-content:space-between;gap:8px}
+.loan .who{font-weight:600}
+.loan .items{color:var(--mut);font-size:12px;margin-top:5px}.loan .items b{color:var(--ink);font-weight:500}
+button.recall{color:var(--acc);border-color:#e0a45855;padding:1px 8px}
+button.recall:hover{border-color:var(--acc)}
 #log{background:var(--panel2);border:1px solid var(--edge);border-radius:8px;padding:10px;height:220px;overflow:auto;font:12px/1.55 ui-monospace,Consolas,monospace;color:#c9d1d9;white-space:pre-wrap}
 .muted{color:var(--mut);font-size:12px}
 .vault{display:flex;align-items:baseline;gap:10px;cursor:pointer;border-radius:7px;padding:4px 6px;margin-left:-6px}
@@ -98,6 +104,10 @@ select{background:var(--panel2);border:1px solid var(--edge);color:var(--ink);bo
       </div>
     </section>
     <section class="card">
+      <h2>On loan <span class="muted" id="loancount"></span></h2>
+      <div id="loans"><div class="muted">nothing out on loan</div></div>
+    </section>
+    <section class="card">
       <h2>Compose trade</h2>
       <label>MTGO partner</label>
       <input type="text" id="partner" placeholder="username">
@@ -136,7 +146,7 @@ select{background:var(--panel2);border:1px solid var(--edge);color:var(--ink);bo
 <script>
 function $(id){return document.getElementById(id);}
 function tok(){return localStorage.getItem('tbtoken')||'';}
-function saveTok(){localStorage.setItem('tbtoken',$('tok').value.trim());$('authwarn').style.display='none';tick();vault();health();}
+function saveTok(){localStorage.setItem('tbtoken',$('tok').value.trim());$('authwarn').style.display='none';tick();vault();health();loansTick();}
 async function api(path,opts){opts=opts||{};opts.headers=Object.assign({'Authorization':'Bearer '+tok()},opts.headers||{});
   const r=await fetch(path,opts);if(r.status===401)$('authwarn').style.display='block';return r;}
 function el(t,a,k){const e=document.createElement(t);for(const x in(a||{}))e.setAttribute(x,a[x]);(k||[]).forEach(c=>e.append(c));return e;}
@@ -166,6 +176,20 @@ async function prune(){const m=$('prunemsg');m.textContent='pruning…';
     m.textContent=r.ok?('pruned '+(d.pruned||0)+' binder(s)'):('failed: '+(d.error||('HTTP '+r.status)));}
   catch(e){m.textContent='error';}
   setTimeout(()=>{m.textContent='';},6000);}
+async function loansTick(){try{const r=await api('/loans');if(!r.ok)return;const {loans}=await r.json();
+  const open=(loans||[]).filter(l=>l.status==='open');
+  $('loancount').textContent=open.length?('· '+open.reduce((a,l)=>a+l.qty,0)+' card(s) out'):'';
+  const box=$('loans');
+  if(!open.length){box.innerHTML='<div class="muted">nothing out on loan</div>';return;}
+  box.innerHTML='';open.forEach(l=>{const d=el('div',{class:'loan'});
+    d.innerHTML='<div class="top"><span class="who">'+esc(l.borrower)+'</span>'
+      +'<button class="mini recall" onclick="recall(\''+l.id+'\')">recall</button></div>'
+      +'<div class="items"><b>'+l.qty+'× '+esc(l.card)+'</b> <span class="muted">· printing '+l.catId+' · lent '+ago(l.lentAt)+'</span></div>';
+    box.append(d);});
+}catch(e){}}
+async function recall(id){try{const r=await api('/loans/'+id+'/recall',{method:'POST'});let d={};try{d=await r.json();}catch(e){}
+  if(!r.ok){alert('recall failed: '+(d.error||('HTTP '+r.status)));return;}
+  tick();loansTick();}catch(e){}}
 $('ocommit').addEventListener('change',e=>{$('cwarn').style.display=e.target.checked?'block':'none';});
 async function queue(){const o={partner:$('partner').value.trim(),give:rows('give'),receive:rows('receive'),commit:$('ocommit').checked,waitMinutes:parseInt($('wait').value)||0};
   if(!o.partner){alert('partner required');return;}
@@ -214,7 +238,7 @@ async function health(){try{const r=await api('/health');if(!r.ok)return;const h
 function esc(s){return String(s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));}
 $('tok').value=tok();
 addRow('give');updateDir();
-tick();vault();health();setInterval(tick,1500);setInterval(vault,15000);setInterval(health,5000);
+tick();vault();health();loansTick();setInterval(tick,1500);setInterval(vault,15000);setInterval(health,5000);setInterval(loansTick,5000);
 </script></body></html>
 """;
 }

@@ -40,6 +40,8 @@ public sealed class TradeJob
   public List<TradeItem> Receive { get; init; } = new();  // user -> custodian
   public bool Commit { get; init; }                    // false => dry-run (reaches approval, cancels)
   public int WaitSec { get; init; } = int.MaxValue;    // readiness wait for partner (online+YES); MaxValue = until ready
+  public int CatId { get; init; }                      // recall: the exact printing to reclaim
+  public string? LoanId { get; init; }                 // recall: the loan being settled
   public volatile bool Cancelled;                      // operator cancel (before/at pickup, or via abort while running)
   public JobState State { get; set; } = JobState.Queued;
   public string Detail { get; set; } = "";
@@ -69,9 +71,12 @@ public sealed class TradeService
   readonly bool _commitArmed;   // master arm (from --commit); false => service can never commit (dashboard reflects this)
   // (partner, give[(name,qty)], receive[(name,qty)], commit, yesTimeoutSec) => (ok, detail)
   readonly Func<string, List<(string name, int qty)>, List<(string name, int qty)>, bool, int, (bool ok, string detail)> _tradeFn;
+  // (partner, card, catId, qty, commit, waitSec) => (ok, detail) — recall: receive the EXACT owed printing
+  readonly Func<string, string, int, int, bool, int, (bool ok, string detail)> _recallFn;
   readonly Action<string> _log;
   // Optional vault read: () => (owned tix, distinct item count, top holdings). Null => /vault n/a.
   readonly Func<(int tix, int distinct, List<(string name, int qty)> top)>? _vaultFn;
+  readonly LoanStore _loans;   // loan ledger — a committed give records an open loan
 
   readonly ConcurrentDictionary<string, TradeJob> _jobs = new();
   readonly BlockingCollection<TradeJob> _queue = new(new ConcurrentQueue<TradeJob>());
@@ -94,11 +99,13 @@ public sealed class TradeService
 
   public TradeService(string token, string bind, int port, MtgoConnection conn, int perJobTimeoutSec, bool commitArmed,
     Func<string, List<(string name, int qty)>, List<(string name, int qty)>, bool, int, (bool ok, string detail)> tradeFn,
+    Func<string, string, int, int, bool, int, (bool ok, string detail)> recallFn,
     Func<(int tix, int distinct, List<(string name, int qty)> top)>? vaultFn,
+    LoanStore loans,
     Action<string> log)
   {
     _token = token; _bind = bind; _port = port; _conn = conn;
-    _perJobTimeoutSec = perJobTimeoutSec; _commitArmed = commitArmed; _tradeFn = tradeFn; _vaultFn = vaultFn;
+    _perJobTimeoutSec = perJobTimeoutSec; _commitArmed = commitArmed; _tradeFn = tradeFn; _recallFn = recallFn; _vaultFn = vaultFn; _loans = loans;
     // Tee every service log line into a ring buffer so the dashboard's GET /log can show it.
     _log = s => { log(s); lock (_logRing) { _logRing.Add($"{DateTime.UtcNow:HH:mm:ss}  {s}"); if (_logRing.Count > 400) _logRing.RemoveRange(0, _logRing.Count - 400); } };
   }
@@ -125,8 +132,8 @@ public sealed class TradeService
 
     _log($"[serve] listening on {prefix}   custodian={_conn.Account}   (Bearer token required)");
     _log($"[serve] dashboard: http://{_bind}:{_port}/  (open in a browser; paste the token)");
-    _log("[serve] routes: GET / (dashboard) | GET /health | GET /vault | GET /autocomplete?q= | GET /log | GET /jobs | GET /jobs/{id} | " +
-         "POST /jobs/{id}/cancel | POST /binders/prune | POST /request | POST /deposit | POST /trade {partner,give[],receive[],waitMinutes,commit}");
+    _log("[serve] routes: GET / (dashboard) | GET /health | GET /vault | GET /loans | GET /autocomplete?q= | GET /log | GET /jobs | GET /jobs/{id} | " +
+         "POST /jobs/{id}/cancel | POST /loans/{id}/recall | POST /binders/prune | POST /request | POST /deposit | POST /trade {partner,give[],receive[],waitMinutes,commit}");
 
     while (true)
     {
@@ -188,6 +195,13 @@ public sealed class TradeService
       return;
     }
     if (method == "GET" && path == "/vault") { HandleVault(ctx); return; }
+    if (method == "GET" && path == "/loans")
+    {
+      var list = _loans.All().Select(l => new { id = l.Id, borrower = l.Borrower, card = l.Card, catId = l.CatId,
+        qty = l.Qty, lentAt = l.LentAt, status = l.Status, returnedAt = l.ReturnedAt }).ToList();
+      Write(ctx, 200, new { loans = list });
+      return;
+    }
     if (method == "GET" && path == "/binders")
     {
       if (_runningJobId != null || _conn.Reconnecting) { Write(ctx, 200, new { binders = Array.Empty<object>(), note = "busy" }); return; }
@@ -200,6 +214,8 @@ public sealed class TradeService
     if (method == "POST" && path == "/deposit") { HandleEnqueue(ctx, req, "deposit"); return; }  // receive
     if (method == "POST" && path == "/trade")   { HandleEnqueue(ctx, req, "trade");   return; }  // give+receive
     if (method == "POST" && path == "/binders/prune") { HandlePrune(ctx); return; }
+    if (method == "POST" && path.StartsWith("/loans/") && path.EndsWith("/recall"))
+    { HandleRecall(ctx, path.Substring("/loans/".Length, path.Length - "/loans/".Length - "/recall".Length)); return; }
 
     Write(ctx, 404, new { error = "not found", path, method });
   }
@@ -298,9 +314,38 @@ public sealed class TradeService
       _conn.Exec.ClearAbort();   // fresh cancel state for this job
       _log($"[serve] running {job.Id} ({job.Type} user={job.User}) — readiness wait: {(job.WaitSec >= int.MaxValue / 2 ? "until partner is ready" : job.WaitSec + "s")}");
       _conn.EnsureHealthy();   // block here until MTGO is reachable again (survives a client restart)
+      long seqBefore = _conn.Exec.CompletedTradeSeq;
       try
       {
-        var r = _tradeFn(job.User, job.GiveTuples(), job.ReceiveTuples(), job.Commit, job.WaitSec);
+        (bool ok, string detail) r;
+        if (job.Type == "recall")
+        {
+          // Recall: receive the EXACT owed printing back, then settle that loan.
+          string rcard = job.Receive.Count > 0 ? job.Receive[0].Name : "";
+          int rqty = job.Receive.Count > 0 ? job.Receive[0].Qty : 1;
+          r = _recallFn(job.User, rcard, job.CatId, rqty, job.Commit, job.WaitSec);
+          if (r.ok && job.LoanId != null)
+          {
+            _loans.MarkReturned(job.LoanId);
+            _log($"[loan] {job.LoanId} settled — got {rcard} (cat {job.CatId}) back from {job.User}.");
+          }
+        }
+        else
+        {
+          r = _tradeFn(job.User, job.GiveTuples(), job.ReceiveTuples(), job.Commit, job.WaitSec);
+          // A committed GIVE is a loan — record each item lent with its EXACT catId. Wait for the
+          // trade-complete handler to publish the structured trade, and match the partner.
+          if (r.ok && job.Type == "request")
+          {
+            for (int i = 0; i < 20 && _conn.Exec.CompletedTradeSeq == seqBefore; i++) Thread.Sleep(150);
+            if (string.Equals(_conn.Exec.LastCompletedPartner, job.User, StringComparison.OrdinalIgnoreCase))
+              foreach (var g in _conn.Exec.LastCompletedGiven)
+              {
+                var loan = _loans.Record(job.User, g.Name, g.CatId, g.Qty);
+                _log($"[loan] {job.User} now holds {g.Qty}x {g.Name} (cat {g.CatId}) — loan {loan.Id}");
+              }
+          }
+        }
         job.State = r.ok ? JobState.Done : JobState.Failed;
         job.Detail = r.detail;
       }
@@ -400,6 +445,24 @@ public sealed class TradeService
     if (running) { _conn.Exec.RequestAbort(); _log($"[serve] cancel requested for RUNNING job {id} — aborting the wait."); }
     else _log($"[serve] cancel requested for queued job {id} — it will be skipped at pickup.");
     Write(ctx, 200, new { id, cancelling = true, running });
+  }
+
+  // Enqueue a recall: reclaim the EXACT lent printing from the borrower, then settle the loan.
+  void HandleRecall(HttpListenerContext ctx, string loanId)
+  {
+    var loan = _loans.Get(loanId);
+    if (loan is null) { Write(ctx, 404, new { error = "no such loan", id = loanId }); return; }
+    if (loan.Status != "open") { Write(ctx, 409, new { error = "loan is not open", status = loan.Status }); return; }
+    var job = new TradeJob
+    {
+      Id = NewId(), Type = "recall", User = loan.Borrower,
+      Receive = new() { new TradeItem { Name = loan.Card, Qty = loan.Qty } },
+      CatId = loan.CatId, LoanId = loan.Id, Commit = true, WaitSec = int.MaxValue,
+    };
+    _jobs[job.Id] = job;
+    _queue.Add(job);
+    _log($"[serve] queued recall {job.Id}: reclaim {loan.Qty}x {loan.Card} (cat {loan.CatId}) from {loan.Borrower} (loan {loan.Id})");
+    Write(ctx, 202, Project(job));
   }
 
   // Delete the bot's transient trade binders (Lending / SwapOffer) that piled up under churn.

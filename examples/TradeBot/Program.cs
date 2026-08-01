@@ -677,7 +677,7 @@ static bool RunSwapCycle(TradeBot.TradeExecutor exec, MTGOSDK.API.Trade.TradeEsc
 // if the card isn't in their offer, or if it's there but can't be pulled (stale VM).
 // Returns true iff committed.
 static bool RunGrabCycle(TradeBot.TradeExecutor exec, MTGOSDK.API.Trade.TradeEscrow esc,
-    string partner, string card, System.Collections.Generic.List<int> cats, bool allowCommit, int qty = 1)
+    string partner, string card, System.Collections.Generic.List<int> cats, bool allowCommit, int qty = 1, int requiredCat = -1)
 {
   string qtyCard = qty > 1 ? $"{qty}x {card}" : card;
   Line($"\nTrade open with {esc.TradePartnerName}. Looking for {qtyCard} in your presented binder...");
@@ -707,24 +707,26 @@ static bool RunGrabCycle(TradeBot.TradeExecutor exec, MTGOSDK.API.Trade.TradeEsc
     // MatchDesiredCards count is unreliable (reports "matched 1" for a printing it never stages).
     // Reading their presented binder gives the one true catId to request; only fall back to the
     // all-printings sweep if that read fails.
+    // For a recall (requiredCat set) require that EXACT printing — refuse a different printing.
     int presentedCat = -1;
-    try { foreach (var it in c.PartnerCollection.CollectionItems) if ((it.Card?.Name ?? "").IndexOf(card, StringComparison.OrdinalIgnoreCase) >= 0) { presentedCat = it.Id; break; } } catch { }
-    if (presentedCat > 0) matchedEver = true;   // genuinely in their presented binder (reliable signal)
+    try { foreach (var it in c.PartnerCollection.CollectionItems) if ((it.Card?.Name ?? "").IndexOf(card, StringComparison.OrdinalIgnoreCase) >= 0 && (requiredCat <= 0 || it.Id == requiredCat)) { presentedCat = it.Id; break; } } catch { }
+    if (presentedCat > 0) matchedEver = true;   // the right card (and, for a recall, the right printing) is present
 
     if (!exec.VerifyReceiveIsOnly(c, card, qty) && ms - lastReq >= 1500)
     {
       lastReq = ms;
-      if (presentedCat > 0) exec.RequestViaWishlist(presentedCat, qty, card);   // exact printing — preferred
-      else foreach (var cat in cats) { exec.RequestViaWishlist(cat, qty, card); if (exec.LastMatchCount > 0) matchedEver = true; }  // fallback: presented binder unreadable
+      if (presentedCat > 0) exec.RequestViaWishlist(presentedCat, qty, card);       // exact printing — preferred
+      else if (requiredCat <= 0) foreach (var cat in cats) { exec.RequestViaWishlist(cat, qty, card); if (exec.LastMatchCount > 0) matchedEver = true; }  // fallback only when no exact printing is required
     }
 
     if (ms - lastNote >= 3000) { lastNote = ms; Line($"  [t+{ms/1000,3}s] {card} is in your offer: {(matchedEver ? "yes" : "not yet")}  |  I've secured it: {(haveIt ? "yes" : "no")}  |  WE RECEIVE: {TradeBot.TradeExecutor.Summarize(c.PartnerTradedItems)}"); }
 
     if (ms >= findMs && !matchedEver && !haveIt)
     {
-      Line($"\n!!! CANCELLING — the {card} isn't in your presented binder (not found). !!!\n");
+      string need = requiredCat > 0 ? $"{card} (printing {requiredCat} — the exact copy I lent)" : card;
+      Line($"\n!!! CANCELLING — {need} isn't in your presented binder (not found). !!!\n");
       exec.CancelCurrent(); WaitForNoTrade();
-      try { exec.SendDM(partner, $"Cancelled — I didn't find the {card} in the binder you presented. Pick a binder that has it (before accepting), then reply YES to retry."); } catch { }
+      try { exec.SendDM(partner, $"Cancelled — I didn't find {need} in the binder you presented. Pick a binder that has it (before accepting), then reply YES to retry."); } catch { }
       return false;
     }
     if (ms >= findMs + 20_000 && matchedEver && !haveIt)
@@ -926,17 +928,18 @@ static bool RunSwapFlow(TradeBot.TradeExecutor exec, string partner, string give
 
 // GRAB: receive one card, give nothing. Handshake, then runs the grab cycle.
 static bool RunGrabFlow(TradeBot.TradeExecutor exec, string partner, string card, bool allowCommit,
-    int yesTimeoutSec = 300, int qty = 1)
+    int yesTimeoutSec = 300, int qty = 1, int requiredCat = -1)
 {
   System.Collections.Generic.List<int> cats;
   try { cats = MTGOSDK.API.Collection.CollectionManager.GetCardIds(card).ToList(); }
   catch { Line($"Unknown card '{card}'."); return false; }
   string qtyCard = qty > 1 ? $"{qty}x {card}" : card;
+  string printingNote = requiredCat > 0 ? $" (the exact copy I lent you — printing {requiredCat})" : "";
   var esc = HandshakeThenInitiate(exec, partner,
-    $"Ready to give me {qtyCard}? Reply YES, accept the trade, and present a binder that HAS {qtyCard} (pick it before accepting). I'll grab it; take nothing from my side.",
+    $"Ready to give me back {qtyCard}{printingNote}? Reply YES, accept the trade, and present a binder that HAS it (pick it before accepting). I'll grab it; take nothing from my side.",
     presentBinder: null, yesTimeoutSec: yesTimeoutSec);
   if (esc is null) { try { exec.SendDM(partner, "Couldn't open the trade — reply YES when ready and I'll retry."); } catch { } return false; }
-  return RunGrabCycle(exec, esc, partner, card, cats, allowCommit, qty);
+  return RunGrabCycle(exec, esc, partner, card, cats, allowCommit, qty, requiredCat);
 }
 
 // UNIFIED DISPATCH — a trade is "what we GIVE + what we RECEIVE"; route to the right flow.
@@ -2264,6 +2267,8 @@ using (var exec = new TradeExecutor { AllowCommit = allowCommit })
         },
         s => Line(s));
 
+      var loans = new TradeBot.LoanStore();
+      Line($"[serve] loan ledger: {TradeBot.LoanStore.DefaultPath} ({loans.Open().Count} open loan(s)).");
       var svc = new TradeBot.TradeService(
         token: token, bind: bind, port: port, conn: conn, perJobTimeoutSec: perJobTimeout, commitArmed: allowCommit,
         tradeFn: (partner, give, receive, jobCommit, waitSec) =>
@@ -2274,6 +2279,15 @@ using (var exec = new TradeExecutor { AllowCommit = allowCommit })
           // RunTrade feeds it to the presence-aware handshake.
           bool effectiveCommit = allowCommit && jobCommit;
           return RunTrade(conn.Exec, partner, give, receive, allowCommit: effectiveCommit, yesTimeoutSec: waitSec);
+        },
+        recallFn: (partner, card, catId, qty, jobCommit, waitSec) =>
+        {
+          // Recall = receive the EXACT owed printing (requiredCat) back, giving nothing.
+          bool effectiveCommit = allowCommit && jobCommit;
+          bool ok = RunGrabFlow(conn.Exec, partner, card, allowCommit: effectiveCommit, yesTimeoutSec: waitSec, qty: qty, requiredCat: catId);
+          string set = qty > 1 ? $"{qty}x {card}" : card;
+          return (ok, ok ? (effectiveCommit ? $"committed — recalled {set} (printing {catId})" : $"dry-run — recall reached ready ({set})")
+                         : "not completed (declined / wrong printing / guardrail)");
         },
         vaultFn: () =>
         {
@@ -2298,6 +2312,7 @@ using (var exec = new TradeExecutor { AllowCommit = allowCommit })
                           .Select(k => (name: k.Key, qty: k.Value)).ToList();
           return (tix, byName.Count, top);
         },
+        loans: loans,
         log: s => Line(s));
 
       Line($"[serve] trade service (give / deposit / swap) as {whoami}; per-job wait {perJobTimeout}s; " +

@@ -89,9 +89,18 @@ public sealed class TradeExecutor : IDisposable
   // on completion, since a closed escrow is no longer readable.
   public static readonly string LedgerPath = System.IO.Path.Combine(
     Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "mtgosdk-tradebot", "ledger.log");
+  public readonly record struct TradedItemInfo(int CatId, string Name, int Qty);
+
   private List<string> _lastReceived = new();
   private List<string> _lastGiven = new();
   private string? _lastPartner;
+  private List<TradedItemInfo> _lastReceivedS = new();
+  private List<TradedItemInfo> _lastGivenS = new();
+  // Last COMPLETED trade (NOT reset afterward — the serve reads these to record/settle loans).
+  public IReadOnlyList<TradedItemInfo> LastCompletedGiven { get; private set; } = new List<TradedItemInfo>();
+  public IReadOnlyList<TradedItemInfo> LastCompletedReceived { get; private set; } = new List<TradedItemInfo>();
+  public string? LastCompletedPartner { get; private set; }
+  public long CompletedTradeSeq { get; private set; }
 
   /// <summary>FinalState of the most recently CLOSED trade (e.g. "TradeComplete",
   /// "OtherBusyTrading", "UserCanceledTrade"). Lets callers explain why an invite
@@ -113,6 +122,14 @@ public sealed class TradeExecutor : IDisposable
         try { list.Add($"{it.Quantity}x {it.Card?.Name} (cat {it.Id})"); } catch { }
       }
     }
+    catch { }
+    return list;
+  }
+
+  static List<TradedItemInfo> SnapshotStructured(ItemCollection coll)
+  {
+    var list = new List<TradedItemInfo>();
+    try { foreach (var it in coll.CollectionItems) { try { list.Add(new TradedItemInfo(it.Id, it.Card?.Name ?? "?", (int)it.Quantity)); } catch { } } }
     catch { }
     return list;
   }
@@ -1493,6 +1510,10 @@ public sealed class TradeExecutor : IDisposable
       var give = SnapshotItems(e.TradedItems);
       if (recv.Count > 0) _lastReceived = recv;
       if (give.Count > 0) _lastGiven = give;
+      var recvS = SnapshotStructured(e.PartnerTradedItems);
+      var giveS = SnapshotStructured(e.TradedItems);
+      if (recvS.Count > 0) _lastReceivedS = recvS;
+      if (giveS.Count > 0) _lastGivenS = giveS;
 
       // On completion, auto-write the ledger entry.
       if (s.New == TradeState.Closed)
@@ -1500,10 +1521,16 @@ public sealed class TradeExecutor : IDisposable
         string fs = Try(() => e.FinalState.ToString()) ?? "?";
         LastCloseReason = fs;
         if (fs == "TradeComplete")
+        {
           RecordAcquisition(_lastPartner ?? "?", _lastReceived, _lastGiven, fs);
+          // Publish the completed trade for the serve's loan tracking (NOT reset below).
+          LastCompletedGiven = _lastGivenS; LastCompletedReceived = _lastReceivedS;
+          LastCompletedPartner = _lastPartner; CompletedTradeSeq++;
+        }
         else
           Log($"[ledger] trade ended '{fs}' — no assets moved, no ledger entry.");
         _lastReceived = new(); _lastGiven = new(); _lastPartner = null;
+        _lastReceivedS = new(); _lastGivenS = new();
       }
     };
     TradeManager.TradeStateChanged += changed;
