@@ -1141,25 +1141,17 @@ using (var exec = new TradeExecutor { AllowCommit = allowCommit })
     }
 
     Line($"Logging in as {uname} ...");
-    try
-    {
-      await client.LogOn(
-        username: DotEnv.Get("USERNAME"),  // string
-        password: DotEnv.Get("PASSWORD")); // SecureString
-      Line("Login complete.");
-    }
-    catch (InvalidOperationException)
-    {
-      // LogOn throws this if the session became logged-in underneath us
-      // (raced with the settle check). That's fine — we're logged in.
-      Line("Already logged in (login raced to completion).");
-    }
+    // FIRE LogOn but do NOT await it: its await can hang even after MTGO has actually logged
+    // in (observed with a fast login), wedging the process at "Logging in ...". The
+    // CurrentUser poll below is the real "did we log in" gate.
+    try { _ = client.LogOn(username: DotEnv.Get("USERNAME"), password: DotEnv.Get("PASSWORD")); }
+    catch (Exception ex) { Line($"(LogOn dispatch threw: {ex.Message.Split('\n')[0]})"); }
   }
   // A freshly (re)started client can report no logged-in user for a while even
   // though it will settle. Poll CurrentUser rather than dereferencing it blindly
   // (a logged-out client throws "User ID must be greater than zero. Got -1.").
   string? whoami = null;
-  for (int i = 0; i < 20 && whoami is null; i++)
+  for (int i = 0; i < 40 && whoami is null; i++)   // ~60s: room for a fire-and-forget login to land
   {
     try { var u = client.CurrentUser; if (u != null && u.Id > 0) whoami = u.Name; }
     catch { /* not settled yet */ }
@@ -2168,15 +2160,43 @@ using (var exec = new TradeExecutor { AllowCommit = allowCommit })
       var conn = new TradeBot.MtgoConnection(client, exec, whoami ?? "?",
         () =>
         {
+          // If MTGO is fully GONE, relaunch it (cold-start) and log in from the env creds
+          // (needs --env; the MFA is still the user's). If MTGO is up but only the diver
+          // dropped, just re-attach. Either way we then wait for a logged-in user.
+          // MTGO gone -> relaunch it (CreateProcess). If it's up but only the diver dropped,
+          // just re-attach.
+          bool mtgoUp = System.Diagnostics.Process.GetProcessesByName("MTGO").Length > 0;
           Client? c = null;
-          try { c = new Client(new ClientOptions(), loggerFactory: factory); }
-          catch { return (null, null, null); }
-          string? acct = null;
-          for (int i = 0; i < 40 && acct is null; i++)
+          try
           {
-            try { var u = c.CurrentUser; if (u != null && u.Id > 0) acct = u.Name; } catch { }
-            if (acct is null) System.Threading.Thread.Sleep(1500);
+            var opts = mtgoUp
+              ? new ClientOptions()
+              : new ClientOptions { CreateProcess = true, AcceptEULAPrompt = true };
+            if (!mtgoUp) Line("[serve] MTGO gone — relaunching + logging in from env...");
+            c = new Client(opts, loggerFactory: factory);
           }
+          catch { return (null, null, null); }
+          // Detect login with WaitForUserLogin, which RESETS the remote cache each poll — a
+          // raw CurrentUser read reports a STALE not-logged-in right after diver injection
+          // (the login can be complete while CurrentUser still says -1), the same pitfall the
+          // bootstrap's attach path avoids.
+          bool loggedIn = false;
+          try { loggedIn = c.WaitForUserLogin(TimeSpan.FromSeconds(8)).GetAwaiter().GetResult(); } catch { }
+          if (!loggedIn)
+          {
+            // Relaunched MTGO is at the login screen — drive the login from env creds. FIRE
+            // LogOn (don't await; its await can hang even after MTGO has actually logged in).
+            try
+            {
+              string un = ""; try { un = DotEnv.Get("USERNAME"); } catch { }
+              if (un.Length > 0) { Line("[serve] logging MTGO back in from env..."); _ = c.LogOn(DotEnv.Get("USERNAME"), DotEnv.Get("PASSWORD")); }
+            }
+            catch { }
+            try { loggedIn = c.WaitForUserLogin(TimeSpan.FromSeconds(120)).GetAwaiter().GetResult(); } catch { }
+          }
+          if (!loggedIn) { try { c.Dispose(); } catch { } return (null, null, null); }
+          string? acct = null;
+          try { var u = c.CurrentUser; if (u != null && u.Id > 0) acct = u.Name; } catch { }
           if (acct is null) { try { c.Dispose(); } catch { } return (null, null, null); }
           var e = new TradeBot.TradeExecutor { AllowCommit = allowCommit };
           e.Attach();

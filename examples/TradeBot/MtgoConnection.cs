@@ -78,16 +78,16 @@ public sealed class MtgoConnection : IDisposable
       {
         try
         {
-          if (Process.GetProcessesByName("MTGO").Length > 0)
+          // Always call _attach — it relaunches MTGO itself when the process is gone (and
+          // just re-attaches when MTGO is up but only the diver dropped). Guarding this
+          // behind "is MTGO running" would prevent the relaunch and wait forever.
+          var (c, e, acct) = _attach();
+          if (c != null && e != null)
           {
-            var (c, e, acct) = _attach();
-            if (c != null && e != null)
-            {
-              _client = c; _exec = e; _account = acct ?? _account;
-              _reconnecting = false;
-              _log($"[serve] reconnected as {_account}.");
-              return true;
-            }
+            _client = c; _exec = e; _account = acct ?? _account;
+            _reconnecting = false;
+            _log($"[serve] reconnected as {_account}.");
+            return true;
           }
         }
         catch (Exception ex) { _log($"[serve] reconnect attempt failed: {ex.Message.Split('\n')[0]}"); }
