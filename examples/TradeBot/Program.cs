@@ -682,9 +682,9 @@ static bool RunGrabCycle(TradeBot.TradeExecutor exec, MTGOSDK.API.Trade.TradeEsc
   string qtyCard = qty > 1 ? $"{qty}x {card}" : card;
   Line($"\nTrade open with {esc.TradePartnerName}. Looking for {qtyCard} in your presented binder...");
   bool ready = false, matchedEver = false;
-  int lastReq = -100, lastNote = -100;
-  const int findSec = 12, windowSec = 90;
-  for (int i = 0; i < windowSec && !ready; i++)
+  int lastReq = -5000, lastNote = -5000;
+  const int findMs = 12_000, windowMs = 90_000, pollMs = 300;
+  for (int ms = 0; ms < windowMs && !ready; ms += pollMs)
   {
     var c = MTGOSDK.API.Trade.TradeManager.CurrentTrade;
     if (c is null) { Line("Trade closed."); return false; }
@@ -702,42 +702,52 @@ static bool RunGrabCycle(TradeBot.TradeExecutor exec, MTGOSDK.API.Trade.TradeEsc
     bool haveIt = false; try { foreach (var it in c.PartnerTradedItems.CollectionItems) if ((it.Card?.Name ?? "").IndexOf(card, StringComparison.OrdinalIgnoreCase) >= 0) { haveIt = true; break; } } catch { }
     if (exec.VerifyReceiveIsOnly(c, card, qty)) { ready = true; break; }
 
-    if (!exec.VerifyReceiveIsOnly(c, card, qty) && i - lastReq >= 4)
+    // Request the EXACT printing the partner PRESENTS (their binder is fixed at trade start) — NOT
+    // every printing of the name. Trying all printings spams wrong-printing requests, and the
+    // MatchDesiredCards count is unreliable (reports "matched 1" for a printing it never stages).
+    // Reading their presented binder gives the one true catId to request; only fall back to the
+    // all-printings sweep if that read fails.
+    int presentedCat = -1;
+    try { foreach (var it in c.PartnerCollection.CollectionItems) if ((it.Card?.Name ?? "").IndexOf(card, StringComparison.OrdinalIgnoreCase) >= 0) { presentedCat = it.Id; break; } } catch { }
+    if (presentedCat > 0) matchedEver = true;   // genuinely in their presented binder (reliable signal)
+
+    if (!exec.VerifyReceiveIsOnly(c, card, qty) && ms - lastReq >= 1500)
     {
-      lastReq = i;
-      foreach (var cat in cats) { exec.RequestViaWishlist(cat, qty, card); if (exec.LastMatchCount > 0) matchedEver = true; }
+      lastReq = ms;
+      if (presentedCat > 0) exec.RequestViaWishlist(presentedCat, qty, card);   // exact printing — preferred
+      else foreach (var cat in cats) { exec.RequestViaWishlist(cat, qty, card); if (exec.LastMatchCount > 0) matchedEver = true; }  // fallback: presented binder unreadable
     }
 
-    if (i - lastNote >= 3) { lastNote = i; Line($"  [t+{i,3}s] {card} is in your offer: {(matchedEver ? "yes" : "not yet")}  |  I've secured it: {(haveIt ? "yes" : "no")}  |  WE RECEIVE: {TradeBot.TradeExecutor.Summarize(c.PartnerTradedItems)}"); }
+    if (ms - lastNote >= 3000) { lastNote = ms; Line($"  [t+{ms/1000,3}s] {card} is in your offer: {(matchedEver ? "yes" : "not yet")}  |  I've secured it: {(haveIt ? "yes" : "no")}  |  WE RECEIVE: {TradeBot.TradeExecutor.Summarize(c.PartnerTradedItems)}"); }
 
-    if (i >= findSec && !matchedEver && !haveIt)
+    if (ms >= findMs && !matchedEver && !haveIt)
     {
-      Line($"\n!!! CANCELLING — the {card} isn't in your presented binder (match found nothing). !!!\n");
+      Line($"\n!!! CANCELLING — the {card} isn't in your presented binder (not found). !!!\n");
       exec.CancelCurrent(); WaitForNoTrade();
       try { exec.SendDM(partner, $"Cancelled — I didn't find the {card} in the binder you presented. Pick a binder that has it (before accepting), then reply YES to retry."); } catch { }
       return false;
     }
-    if (i >= findSec + 20 && matchedEver && !haveIt)
+    if (ms >= findMs + 20_000 && matchedEver && !haveIt)
     {
       Line($"\n!!! CANCELLING — the {card} is in your binder but I can't pull it onto my side (stale trade view-model). A client restart is needed. !!!\n");
       exec.CancelCurrent(); WaitForNoTrade();
       try { exec.SendDM(partner, $"Cancelled — I see the {card} but couldn't complete the pull (client hiccup)."); } catch { }
       return false;
     }
-    System.Threading.Thread.Sleep(1000);
+    System.Threading.Thread.Sleep(pollMs);
   }
   if (!ready) { Line("Didn't secure the cards in time — cancelling."); exec.CancelCurrent(); WaitForNoTrade(); return false; }
   Line($"GUARDRAIL passed: we receive exactly {qtyCard} and give nothing.");
 
   exec.SubmitDeposit();
   bool approveReady = false; string st = "?";
-  for (int i = 0; i < 30 && !approveReady; i++)
+  for (int ms = 0; ms < 30_000 && !approveReady; ms += 300)
   {
-    System.Threading.Thread.Sleep(1000);
+    System.Threading.Thread.Sleep(300);
     var c = MTGOSDK.API.Trade.TradeManager.CurrentTrade;
     if (c is null) { Line("Trade closed before approval."); return false; }
     st = c.State.ToString(); esc = c;
-    if (i % 3 == 0) Line($"  t+{i,2}s state={st}");
+    if (ms % 3_000 < 300) Line($"  t+{ms/1000,2}s state={st}");
     if (st.StartsWith("Approval")) approveReady = true;
   }
   if (!approveReady) { Line("Did not reach approval-ready — cancelling."); exec.CancelCurrent(); WaitForNoTrade(); return false; }
@@ -760,12 +770,12 @@ static bool RunGrabCycle(TradeBot.TradeExecutor exec, MTGOSDK.API.Trade.TradeEsc
 
   Line("\n*** COMMITTING the grab (ConfirmTrade) ***");
   exec.ConfirmTrade();
-  for (int i = 0; i < 40; i++)
+  for (int ms = 0; ms < 40_000; ms += 300)
   {
-    System.Threading.Thread.Sleep(1000);
+    System.Threading.Thread.Sleep(300);
     var c = MTGOSDK.API.Trade.TradeManager.CurrentTrade;
     if (c is null) { Line("Grab complete — client clear."); break; }
-    if (i % 3 == 0) Line($"  t+{i,2}s state={c.State}");
+    if (ms % 3_000 < 300) Line($"  t+{ms/1000,2}s state={c.State}");
     if (c.State == MTGOSDK.API.Trade.Enums.TradeState.Closed) break;
   }
   try { exec.SendDM(partner, $"Thanks — got {qtyCard}!"); } catch { }
