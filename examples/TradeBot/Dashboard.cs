@@ -24,6 +24,10 @@ header h1{font-size:16px;margin:0;letter-spacing:.3px;font-weight:600}
 header h1 .g{color:var(--acc)}
 .dot{width:9px;height:9px;border-radius:50%;background:var(--mut)}.dot.live{background:var(--ok);box-shadow:0 0 8px var(--ok)}.dot.bad{background:var(--bad);box-shadow:0 0 8px var(--bad)}
 .spacer{flex:1}
+.modebadge{font-size:11px;font-weight:600;letter-spacing:.5px;padding:2px 8px;border-radius:5px;border:1px solid var(--edge);text-transform:uppercase;color:var(--mut)}
+.modebadge.live{color:#1a1206;background:var(--ok);border-color:var(--ok)}
+.modebadge.dry{color:var(--warn);border-color:#d2992255}
+input:disabled{opacity:.5;cursor:not-allowed}
 .tokbar{display:flex;align-items:center;gap:6px}
 .tokbar input{background:var(--panel2);border:1px solid var(--edge);color:var(--ink);border-radius:6px;padding:5px 8px;width:150px;font:12px ui-monospace,Consolas,monospace}
 main{display:grid;grid-template-columns:380px 1fr;gap:16px;padding:16px;align-items:start;max-width:1200px}
@@ -75,6 +79,7 @@ select{background:var(--panel2);border:1px solid var(--edge);color:var(--ink);bo
 <header>
   <h1>&#9670; MTGO TradeBot <span class="g">Vault</span></h1>
   <span class="dot" id="livedot"></span><span class="muted" id="livetext">connecting&hellip;</span>
+  <span class="modebadge" id="mode" title="commit mode">&hellip;</span>
   <span class="spacer"></span>
   <div class="tokbar"><span class="muted">token</span><input type="password" id="tok" placeholder="bearer&hellip;"><button class="mini" onclick="saveTok()">set</button></div>
 </header>
@@ -108,6 +113,7 @@ select{background:var(--panel2);border:1px solid var(--edge);color:var(--ink);bo
         <label style="display:flex;align-items:center;gap:6px;margin:0"><input type="checkbox" id="ocommit"> commit</label>
       </div>
       <div class="commit-warn" id="cwarn">&#9888; commit moves REAL assets on MTGO.</div>
+      <div class="muted" id="commitnote" style="display:none;font-size:11px;color:var(--warn);margin-top:4px">service is in dry-run &mdash; commit disabled. Relaunch the serve with <b>--commit</b> to arm.</div>
       <button class="primary" style="width:100%;margin-top:10px" onclick="queue()">Queue trade</button>
     </section>
   </div>
@@ -126,7 +132,7 @@ select{background:var(--panel2);border:1px solid var(--edge);color:var(--ink);bo
 <script>
 function $(id){return document.getElementById(id);}
 function tok(){return localStorage.getItem('tbtoken')||'';}
-function saveTok(){localStorage.setItem('tbtoken',$('tok').value.trim());$('authwarn').style.display='none';tick();vault();}
+function saveTok(){localStorage.setItem('tbtoken',$('tok').value.trim());$('authwarn').style.display='none';tick();vault();health();}
 async function api(path,opts){opts=opts||{};opts.headers=Object.assign({'Authorization':'Bearer '+tok()},opts.headers||{});
   const r=await fetch(path,opts);if(r.status===401)$('authwarn').style.display='block';return r;}
 function el(t,a,k){const e=document.createElement(t);for(const x in(a||{}))e.setAttribute(x,a[x]);(k||[]).forEach(c=>e.append(c));return e;}
@@ -188,10 +194,18 @@ async function vault(){try{const r=await api('/vault');if(!r.ok)return;const v=a
     d.innerHTML='<span>'+esc(t.name)+'</span><span class="q">'+t.qty+'</span>';
     d.title='Add to give';d.onclick=()=>addGive(t.name);h.append(d);});
 }catch(e){}}
+async function health(){try{const r=await api('/health');if(!r.ok)return;const hh=await r.json();
+  const armed=!!hh.commit;const badge=$('mode');
+  badge.textContent=armed?'live':'dry-run';badge.className='modebadge '+(armed?'live':'dry');
+  badge.title=armed?'Service armed — commits move real assets':'Service in dry-run — commit disabled';
+  const cb=$('ocommit');cb.disabled=!armed;
+  if(!armed&&cb.checked){cb.checked=false;$('cwarn').style.display='none';}
+  $('commitnote').style.display=armed?'none':'block';
+}catch(e){}}
 function esc(s){return String(s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));}
 $('tok').value=tok();
 addRow('give');updateDir();
-tick();vault();setInterval(tick,1500);setInterval(vault,15000);
+tick();vault();health();setInterval(tick,1500);setInterval(vault,15000);setInterval(health,5000);
 </script></body></html>
 """;
 }

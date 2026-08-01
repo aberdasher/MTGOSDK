@@ -66,6 +66,7 @@ public sealed class TradeService
   readonly int _port;
   readonly MtgoConnection _conn;
   readonly int _perJobTimeoutSec;
+  readonly bool _commitArmed;   // master arm (from --commit); false => service can never commit (dashboard reflects this)
   // (partner, give[(name,qty)], receive[(name,qty)], commit, yesTimeoutSec) => (ok, detail)
   readonly Func<string, List<(string name, int qty)>, List<(string name, int qty)>, bool, int, (bool ok, string detail)> _tradeFn;
   readonly Action<string> _log;
@@ -91,13 +92,13 @@ public sealed class TradeService
     return h;
   }
 
-  public TradeService(string token, string bind, int port, MtgoConnection conn, int perJobTimeoutSec,
+  public TradeService(string token, string bind, int port, MtgoConnection conn, int perJobTimeoutSec, bool commitArmed,
     Func<string, List<(string name, int qty)>, List<(string name, int qty)>, bool, int, (bool ok, string detail)> tradeFn,
     Func<(int tix, int distinct, List<(string name, int qty)> top)>? vaultFn,
     Action<string> log)
   {
     _token = token; _bind = bind; _port = port; _conn = conn;
-    _perJobTimeoutSec = perJobTimeoutSec; _tradeFn = tradeFn; _vaultFn = vaultFn;
+    _perJobTimeoutSec = perJobTimeoutSec; _commitArmed = commitArmed; _tradeFn = tradeFn; _vaultFn = vaultFn;
     // Tee every service log line into a ring buffer so the dashboard's GET /log can show it.
     _log = s => { log(s); lock (_logRing) { _logRing.Add($"{DateTime.UtcNow:HH:mm:ss}  {s}"); if (_logRing.Count > 400) _logRing.RemoveRange(0, _logRing.Count - 400); } };
   }
@@ -161,7 +162,7 @@ public sealed class TradeService
 
     if (method == "GET" && path == "/health")
     {
-      Write(ctx, 200, new { ok = !_conn.Reconnecting, custodian = _conn.Account,
+      Write(ctx, 200, new { ok = !_conn.Reconnecting, custodian = _conn.Account, commit = _commitArmed,
         reconnecting = _conn.Reconnecting, queued = _queue.Count, jobs = _jobs.Count });
       return;
     }

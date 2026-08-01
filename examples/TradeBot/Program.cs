@@ -2255,7 +2255,7 @@ using (var exec = new TradeExecutor { AllowCommit = allowCommit })
         s => Line(s));
 
       var svc = new TradeBot.TradeService(
-        token: token, bind: bind, port: port, conn: conn, perJobTimeoutSec: perJobTimeout,
+        token: token, bind: bind, port: port, conn: conn, perJobTimeoutSec: perJobTimeout, commitArmed: allowCommit,
         tradeFn: (partner, give, receive, jobCommit, waitSec) =>
         {
           // Belt + suspenders: commit only if the process allows commits AND the job asks to.
