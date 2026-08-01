@@ -454,12 +454,12 @@ static MTGOSDK.API.Trade.TradeEscrow? TryReachNegotiation(TradeBot.TradeExecutor
   bool advanced = false;
   bool dispatched = false;
   int nulls = 0;
-  for (int i = 0; i < 30 && !dispatched; i++)   // up to ~15s
+  for (int ms = 0; ms < 15_000 && !dispatched; ms += 300)   // up to ~15s, 300ms poll
   {
-    System.Threading.Thread.Sleep(500);
+    System.Threading.Thread.Sleep(300);
     MTGOSDK.API.Trade.TradeEscrow? e0 = null;
     try { e0 = MTGOSDK.API.Trade.TradeManager.CurrentTrade; } catch { e0 = null; }
-    if (e0 is null) { if (++nulls >= 4) return null; continue; } // escrow gone -> rotate
+    if (e0 is null) { if (++nulls >= 7) return null; continue; } // escrow gone -> rotate (~2s tolerance)
     nulls = 0;
     var st0 = e0.State;
     if (st0 == MTGOSDK.API.Trade.Enums.TradeState.InviteSelectBinder)
@@ -488,12 +488,12 @@ static MTGOSDK.API.Trade.TradeEscrow? TryReachNegotiation(TradeBot.TradeExecutor
   // Wait for negotiation (or an early close = bot busy/declined). Humans need more
   // room to click Accept than a bot does, so callers can widen this window.
   nulls = 0;
-  for (int i = 0; i < negotiateWaitSec; i++)
+  for (int ms = 0; ms < negotiateWaitSec * 1000; ms += 400)
   {
-    System.Threading.Thread.Sleep(1000);
+    System.Threading.Thread.Sleep(400);
     MTGOSDK.API.Trade.TradeEscrow? esc = null;
     try { esc = MTGOSDK.API.Trade.TradeManager.CurrentTrade; } catch { esc = null; }
-    if (esc is null) { if (++nulls >= 3) return null; continue; } // closed -> rotate/retry
+    if (esc is null) { if (++nulls >= 8) return null; continue; } // closed -> rotate/retry (~3s tolerance)
     nulls = 0;
     if (esc.State.ToString().StartsWith("Negotiate")) return esc;
   }
@@ -811,10 +811,10 @@ static bool RunLend(TradeBot.TradeExecutor exec, string recipient,
   string lastRemindKey = "";
   // keepOpen: no grab-window timeout — hold the offer until they finish grabbing or the
   // trade closes (the c==null check below breaks out on a close/cancel).
-  for (int i = 0; (keepOpen || i < 300) && !ready; i++)
+  for (int ms = 0; (keepOpen || ms < 300_000) && !ready; ms += 300)   // 300ms poll -> react to their grab fast
   {
     if (exec.AbortRequested) { Line("Cancelled by operator — closing the trade (gave nothing)."); exec.CancelCurrent(); WaitForNoTrade(); return false; }
-    System.Threading.Thread.Sleep(1000);
+    System.Threading.Thread.Sleep(300);
     var c = MTGOSDK.API.Trade.TradeManager.CurrentTrade;
     if (c is null) { Line("Trade closed before they finished grabbing."); return false; }
     esc = c;
@@ -842,7 +842,7 @@ static bool RunLend(TradeBot.TradeExecutor exec, string recipient,
     else
     {
       if (!TradeBot.TradeExecutor.PartnerHasSubmitted(c)) lastRemindKey = "";
-      if (i % 10 == 0) Line($"  t+{i,3}s  WE GIVE: {TradeBot.TradeExecutor.Summarize(c.TradedItems)}  (still to grab: {(missing.Count == 0 ? "(none)" : string.Join(", ", missing))})");
+      if (ms % 10_000 < 300) Line($"  t+{ms/1000,3}s  WE GIVE: {TradeBot.TradeExecutor.Summarize(c.TradedItems)}  (still to grab: {(missing.Count == 0 ? "(none)" : string.Join(", ", missing))})");
     }
   }
   if (!ready)
@@ -856,13 +856,13 @@ static bool RunLend(TradeBot.TradeExecutor exec, string recipient,
 
   exec.SubmitDeposit();
   string sst = "?"; bool approveReady = false;
-  for (int i = 0; i < 30 && !approveReady; i++)
+  for (int ms = 0; ms < 30_000 && !approveReady; ms += 300)
   {
-    System.Threading.Thread.Sleep(1000);
+    System.Threading.Thread.Sleep(300);
     var c = MTGOSDK.API.Trade.TradeManager.CurrentTrade;
     if (c is null) { Line("Trade closed before approval."); return false; }
     sst = c.State.ToString(); esc = c;
-    if (i % 3 == 0) Line($"  t+{i,2}s state={sst}");
+    if (ms % 3_000 < 300) Line($"  t+{ms/1000,2}s state={sst}");
     if (sst.StartsWith("Approval")) approveReady = true;
   }
   if (!approveReady) { Line("Did not reach approval-ready — cancelling."); exec.CancelCurrent(); WaitForNoTrade(); return false; }
@@ -884,12 +884,12 @@ static bool RunLend(TradeBot.TradeExecutor exec, string recipient,
 
   Line("\n*** COMMITTING the give (ConfirmTrade) ***");
   exec.ConfirmTrade();
-  for (int i = 0; i < 40; i++)
+  for (int ms = 0; ms < 40_000; ms += 300)
   {
-    System.Threading.Thread.Sleep(1000);
+    System.Threading.Thread.Sleep(300);
     var c = MTGOSDK.API.Trade.TradeManager.CurrentTrade;
     if (c is null) { Line("Give complete — client clear."); break; }
-    if (i % 3 == 0) Line($"  t+{i,2}s state={c.State}");
+    if (ms % 3_000 < 300) Line($"  t+{ms/1000,2}s state={c.State}");
     if (c.State == MTGOSDK.API.Trade.Enums.TradeState.Closed) break;
   }
   try { exec.SendDM(recipient, $"Done — enjoy {cardList}!"); } catch { }

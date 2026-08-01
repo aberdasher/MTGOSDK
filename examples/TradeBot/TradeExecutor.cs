@@ -916,17 +916,21 @@ public sealed class TradeExecutor : IDisposable
     if (wasOnline) { try { SendDM(username, prompt); } catch (Exception ex) { Log($"[dm] initial prompt threw: {ex.Message.Split('\n')[0]}"); } }
     else Log($"[presence] {username} is offline — holding; I'll prompt them the moment they come online.");
 
-    for (int i = 0; i < timeoutSec; i++)
+    for (long ms = 0; ms < (long)timeoutSec * 1000; ms += 500)
     {
       if (AbortRequested) { Log($"[cancel] handshake for {username} aborted by operator."); return false; }
-      // Prompt on each offline→online edge so they get a prompt they can actually see.
-      bool online = IsUserOnline(username);
-      if (online && !wasOnline)
+      // Presence is an RPC that changes slowly — check ~every 1.5s (not every 500ms poll). Prompt
+      // on each offline→online edge so they get a prompt they can actually see.
+      if (ms % 1500 < 500)
       {
-        try { SendDM(username, prompt); Log($"[presence] {username} came online — prompt sent."); }
-        catch (Exception ex) { Log($"[dm] prompt-on-online threw: {ex.Message.Split('\n')[0]}"); }
+        bool online = IsUserOnline(username);
+        if (online && !wasOnline)
+        {
+          try { SendDM(username, prompt); Log($"[presence] {username} came online — prompt sent."); }
+          catch (Exception ex) { Log($"[dm] prompt-on-online threw: {ex.Message.Split('\n')[0]}"); }
+        }
+        wasOnline = online;
       }
-      wasOnline = online;
 
       // Watch for a new YES (independent of presence — any yes they type fires the trade).
       try
@@ -946,7 +950,7 @@ public sealed class TradeExecutor : IDisposable
       }
       catch { }
 
-      System.Threading.Thread.Sleep(1000);
+      System.Threading.Thread.Sleep(500);
     }
     return false;
   }
