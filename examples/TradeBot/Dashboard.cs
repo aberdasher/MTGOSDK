@@ -51,12 +51,17 @@ button.mini{padding:2px 8px;font-size:12px}
 .job .t{color:var(--mut);font-size:11px;font-variant-numeric:tabular-nums}
 #log{background:var(--panel2);border:1px solid var(--edge);border-radius:8px;padding:10px;height:220px;overflow:auto;font:12px/1.55 ui-monospace,Consolas,monospace;color:#c9d1d9;white-space:pre-wrap}
 .muted{color:var(--mut);font-size:12px}
-.vault{display:flex;align-items:baseline;gap:10px}
+.vault{display:flex;align-items:baseline;gap:10px;cursor:pointer;border-radius:7px;padding:2px 4px;margin-left:-4px}
+.vault:hover{background:#ffffff0a}
 .vault .big{font-size:34px;font-weight:700;color:var(--acc);font-variant-numeric:tabular-nums;line-height:1}
 .vault .unit{font-size:13px;color:var(--mut)}
-.holdings{margin-top:12px;display:flex;flex-direction:column;gap:3px;max-height:180px;overflow:auto}
-.holdings .h{display:flex;justify-content:space-between;font-size:12px;padding:3px 0;border-bottom:1px solid #ffffff08}
-.holdings .h .q{color:var(--mut);font-variant-numeric:tabular-nums}
+.holdings{margin-top:10px;display:flex;flex-direction:column;gap:2px;max-height:180px;overflow:auto}
+.holdings .h{display:flex;justify-content:space-between;gap:8px;font-size:12px;padding:4px 6px;border-radius:5px;cursor:pointer}
+.holdings .h:hover{background:#ffffff10}
+.holdings .h span:first-child{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.holdings .h .q{color:var(--mut);font-variant-numeric:tabular-nums;flex:none}
+@keyframes flash{0%{background:var(--acc)}100%{background:transparent}}
+.flash{animation:flash .6s ease-out}
 .dir{display:flex;align-items:center;justify-content:space-between;margin-top:12px}
 .warn{display:none;background:#3d1f1f;border:1px solid var(--bad);color:#ffb4ae;border-radius:7px;padding:8px 10px;font-size:12px;margin:0 16px}
 .commit-warn{color:var(--warn);font-size:11px;margin-top:6px;display:none}
@@ -73,8 +78,9 @@ button.mini{padding:2px 8px;font-size:12px}
   <div class="col">
     <section class="card">
       <h2>Vault &mdash; <span id="custodian">&hellip;</span></h2>
-      <div class="vault"><span class="big" id="tix">&mdash;</span><span class="unit">event tickets</span></div>
+      <div class="vault" onclick="addGive('Event Ticket')" title="Add an Event Ticket to the give side"><span class="big" id="tix">&mdash;</span><span class="unit">event tickets</span></div>
       <div class="muted" id="distinct" style="margin-top:4px">&mdash;</div>
+      <div class="muted" style="margin-top:3px;font-size:11px">tip: click the tix balance or a holding to add it to <b>give</b></div>
       <div class="holdings" id="holdings"></div>
     </section>
     <section class="card">
@@ -121,6 +127,11 @@ function rows(kind){return[...$(kind).children].map(r=>{const i=r.querySelectorA
 function updateDir(){const g=rows('give').length,r=rows('receive').length;const d=$('dir');let t='—',c='';
   if(g>0&&r===0){t='LEND (give)';c='request';}else if(g===0&&r>0){t='DEPOSIT (receive)';c='deposit';}else if(g>0&&r>0){t='SWAP';c='swap';}
   d.textContent=t;d.className='badge '+c;}
+function flash(row){if(!row)return;row.classList.remove('flash');void row.offsetWidth;row.classList.add('flash');}
+function addGive(name){const box=$('give');
+  for(const r of box.children){const inp=r.querySelectorAll('input');
+    if((inp[0].value||'').trim().toLowerCase()===name.toLowerCase()){inp[1].value=(parseInt(inp[1].value)||1)+1;updateDir();flash(r);return;}}
+  addRow('give',name,1);flash(box.lastElementChild);}
 $('ocommit').addEventListener('change',e=>{$('cwarn').style.display=e.target.checked?'block':'none';});
 async function queue(){const o={partner:$('partner').value.trim(),give:rows('give'),receive:rows('receive'),commit:$('ocommit').checked};
   if(!o.partner){alert('partner required');return;}
@@ -153,7 +164,8 @@ async function vault(){try{const r=await api('/vault');if(!r.ok)return;const v=a
   if(!v.available){$('tix').textContent='—';$('distinct').textContent=v.reason||'vault unavailable';$('holdings').innerHTML='';return;}
   $('tix').textContent=v.tix;$('distinct').textContent=(v.distinct||0)+' distinct items held';
   const h=$('holdings');h.innerHTML='';(v.top||[]).forEach(t=>{const d=el('div',{class:'h'});
-    d.innerHTML='<span>'+esc(t.name)+'</span><span class="q">'+t.qty+'</span>';h.append(d);});
+    d.innerHTML='<span>'+esc(t.name)+'</span><span class="q">'+t.qty+'</span>';
+    d.title='Add to give';d.onclick=()=>addGive(t.name);h.append(d);});
 }catch(e){}}
 function esc(s){return String(s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));}
 $('tok').value=tok();
