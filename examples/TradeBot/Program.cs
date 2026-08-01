@@ -677,9 +677,10 @@ static bool RunSwapCycle(TradeBot.TradeExecutor exec, MTGOSDK.API.Trade.TradeEsc
 // if the card isn't in their offer, or if it's there but can't be pulled (stale VM).
 // Returns true iff committed.
 static bool RunGrabCycle(TradeBot.TradeExecutor exec, MTGOSDK.API.Trade.TradeEscrow esc,
-    string partner, string card, System.Collections.Generic.List<int> cats, bool allowCommit)
+    string partner, string card, System.Collections.Generic.List<int> cats, bool allowCommit, int qty = 1)
 {
-  Line($"\nTrade open with {esc.TradePartnerName}. Looking for the {card} in your presented binder...");
+  string qtyCard = qty > 1 ? $"{qty}x {card}" : card;
+  Line($"\nTrade open with {esc.TradePartnerName}. Looking for {qtyCard} in your presented binder...");
   bool ready = false, matchedEver = false;
   int lastReq = -100, lastNote = -100;
   const int findSec = 12, windowSec = 90;
@@ -699,12 +700,12 @@ static bool RunGrabCycle(TradeBot.TradeExecutor exec, MTGOSDK.API.Trade.TradeEsc
     }
 
     bool haveIt = false; try { foreach (var it in c.PartnerTradedItems.CollectionItems) if ((it.Card?.Name ?? "").IndexOf(card, StringComparison.OrdinalIgnoreCase) >= 0) { haveIt = true; break; } } catch { }
-    if (exec.VerifyReceiveIsOnly(c, card, 1)) { ready = true; break; }
+    if (exec.VerifyReceiveIsOnly(c, card, qty)) { ready = true; break; }
 
-    if (!haveIt && i - lastReq >= 4)
+    if (!exec.VerifyReceiveIsOnly(c, card, qty) && i - lastReq >= 4)
     {
       lastReq = i;
-      foreach (var cat in cats) { exec.RequestViaWishlist(cat, 1, card); if (exec.LastMatchCount > 0) matchedEver = true; }
+      foreach (var cat in cats) { exec.RequestViaWishlist(cat, qty, card); if (exec.LastMatchCount > 0) matchedEver = true; }
     }
 
     if (i - lastNote >= 3) { lastNote = i; Line($"  [t+{i,3}s] {card} is in your offer: {(matchedEver ? "yes" : "not yet")}  |  I've secured it: {(haveIt ? "yes" : "no")}  |  WE RECEIVE: {TradeBot.TradeExecutor.Summarize(c.PartnerTradedItems)}"); }
@@ -725,8 +726,8 @@ static bool RunGrabCycle(TradeBot.TradeExecutor exec, MTGOSDK.API.Trade.TradeEsc
     }
     System.Threading.Thread.Sleep(1000);
   }
-  if (!ready) { Line("Didn't secure the card in time — cancelling."); exec.CancelCurrent(); WaitForNoTrade(); return false; }
-  Line($"GUARDRAIL passed: we receive exactly the {card} and give nothing.");
+  if (!ready) { Line("Didn't secure the cards in time — cancelling."); exec.CancelCurrent(); WaitForNoTrade(); return false; }
+  Line($"GUARDRAIL passed: we receive exactly {qtyCard} and give nothing.");
 
   exec.SubmitDeposit();
   bool approveReady = false; string st = "?";
@@ -741,7 +742,7 @@ static bool RunGrabCycle(TradeBot.TradeExecutor exec, MTGOSDK.API.Trade.TradeEsc
   }
   if (!approveReady) { Line("Did not reach approval-ready — cancelling."); exec.CancelCurrent(); WaitForNoTrade(); return false; }
 
-  if (!exec.VerifyReceiveIsOnly(esc, card, 1))
+  if (!exec.VerifyReceiveIsOnly(esc, card, qty))
   {
     Line("GUARDRAIL re-check FAILED at approval — cancelling.");
     try { exec.Cancel(esc); } catch { } WaitForNoTrade();
@@ -767,7 +768,7 @@ static bool RunGrabCycle(TradeBot.TradeExecutor exec, MTGOSDK.API.Trade.TradeEsc
     if (i % 3 == 0) Line($"  t+{i,2}s state={c.State}");
     if (c.State == MTGOSDK.API.Trade.Enums.TradeState.Closed) break;
   }
-  try { exec.SendDM(partner, $"Thanks — got the {card} back!"); } catch { }
+  try { exec.SendDM(partner, $"Thanks — got {qtyCard}!"); } catch { }
   Line("\nLedger (latest):");
   var glp = TradeBot.TradeExecutor.LedgerPath;
   if (System.IO.File.Exists(glp)) foreach (var l in System.IO.File.ReadAllLines(glp).Reverse().Take(1)) Line("  " + l);
@@ -914,16 +915,17 @@ static bool RunSwapFlow(TradeBot.TradeExecutor exec, string partner, string give
 
 // GRAB: receive one card, give nothing. Handshake, then runs the grab cycle.
 static bool RunGrabFlow(TradeBot.TradeExecutor exec, string partner, string card, bool allowCommit,
-    int yesTimeoutSec = 300)
+    int yesTimeoutSec = 300, int qty = 1)
 {
   System.Collections.Generic.List<int> cats;
   try { cats = MTGOSDK.API.Collection.CollectionManager.GetCardIds(card).ToList(); }
   catch { Line($"Unknown card '{card}'."); return false; }
+  string qtyCard = qty > 1 ? $"{qty}x {card}" : card;
   var esc = HandshakeThenInitiate(exec, partner,
-    $"Ready to give me the {card}? Reply YES, accept the trade, and present a binder that HAS the {card} (pick it before accepting). I'll grab it; take nothing from my side.",
+    $"Ready to give me {qtyCard}? Reply YES, accept the trade, and present a binder that HAS {qtyCard} (pick it before accepting). I'll grab it; take nothing from my side.",
     presentBinder: null, yesTimeoutSec: yesTimeoutSec);
   if (esc is null) { try { exec.SendDM(partner, "Couldn't open the trade — reply YES when ready and I'll retry."); } catch { } return false; }
-  return RunGrabCycle(exec, esc, partner, card, cats, allowCommit);
+  return RunGrabCycle(exec, esc, partner, card, cats, allowCommit, qty);
 }
 
 // Given a negotiating escrow, stage the requested card (non-committing) and HOLD
@@ -2220,15 +2222,16 @@ using (var exec = new TradeExecutor { AllowCommit = allowCommit })
               : $"dry-run — nothing given (service commit {(allowCommit ? "on" : "off")}, job commit={jobCommit})";
           return (committed, detail);
         },
-        grabFn: (user, card, jobCommit, timeoutSec) =>
+        grabFn: (user, card, qty, jobCommit, timeoutSec) =>
         {
-          // Deposit: custodian RECEIVES one card from the user, gives nothing (one-way grab).
+          // Deposit: custodian RECEIVES qty of one card from the user, gives nothing (one-way grab).
           bool effectiveCommit = allowCommit && jobCommit;
-          bool committed = RunGrabFlow(conn.Exec, user, card, allowCommit: effectiveCommit, yesTimeoutSec: timeoutSec);
+          bool committed = RunGrabFlow(conn.Exec, user, card, allowCommit: effectiveCommit, yesTimeoutSec: timeoutSec, qty: qty);
+          string set = qty > 1 ? $"{qty}x {card}" : card;
           string detail = committed
-            ? $"committed — received {card}"
+            ? $"committed — received {set}"
             : effectiveCommit
-              ? "not completed (declined / offline / card not presented / took-from-us / guardrail)"
+              ? "not completed (declined / offline / cards not presented / took-from-us / guardrail)"
               : $"dry-run — nothing received (service commit {(allowCommit ? "on" : "off")}, job commit={jobCommit})";
           return (committed, detail);
         },

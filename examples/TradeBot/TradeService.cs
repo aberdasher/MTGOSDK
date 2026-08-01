@@ -31,7 +31,8 @@ public sealed class TradeJob
   public string Id { get; init; } = "";
   public string Type { get; init; } = "request";     // give-side: lend to a user
   public string User { get; init; } = "";
-  public List<string> Cards { get; init; } = new();   // repeat a name for qty>1 (e.g. 3x)
+  public List<string> Cards { get; init; } = new();   // distinct card names
+  public int Qty { get; init; } = 1;                   // copies of each card (e.g. N event tickets)
   public bool Commit { get; init; }                    // false => dry-run (reaches approval, cancels)
   public JobState State { get; set; } = JobState.Queued;
   public string Detail { get; set; } = "";
@@ -55,8 +56,8 @@ public sealed class TradeService
   readonly int _perJobTimeoutSec;
   // (user, intended[(name,qty)], commit, yesTimeoutSec) => (ok, detail)
   readonly Func<string, List<(string name, int qty)>, bool, int, (bool ok, string detail)> _lendFn;
-  // (user, card, commit, yesTimeoutSec) => (ok, detail)  — receive one card, give nothing
-  readonly Func<string, string, bool, int, (bool ok, string detail)> _grabFn;
+  // (user, card, qty, commit, yesTimeoutSec) => (ok, detail)  — receive qty of one card, give nothing
+  readonly Func<string, string, int, bool, int, (bool ok, string detail)> _grabFn;
   readonly Action<string> _log;
 
   readonly ConcurrentDictionary<string, TradeJob> _jobs = new();
@@ -66,7 +67,7 @@ public sealed class TradeService
 
   public TradeService(string token, string bind, int port, MtgoConnection conn, int perJobTimeoutSec,
     Func<string, List<(string name, int qty)>, bool, int, (bool ok, string detail)> lendFn,
-    Func<string, string, bool, int, (bool ok, string detail)> grabFn,
+    Func<string, string, int, bool, int, (bool ok, string detail)> grabFn,
     Action<string> log)
   {
     _token = token; _bind = bind; _port = port; _conn = conn;
@@ -94,7 +95,7 @@ public sealed class TradeService
     }
 
     _log($"[serve] listening on {prefix}   custodian={_conn.Account}   (Bearer token required)");
-    _log("[serve] routes: GET /health | POST /request {user,cards[],commit} | POST /deposit {user,cards[1],commit} | GET /jobs/{id} | GET /jobs");
+    _log("[serve] routes: GET /health | POST /request {user,cards[],qty,commit} | POST /deposit {user,cards[1],qty,commit} | GET /jobs/{id} | GET /jobs");
 
     while (true)
     {
@@ -161,16 +162,18 @@ public sealed class TradeService
 
     string user = (dto.User ?? "").Trim();
     var cards = (dto.Cards ?? new()).Select(c => (c ?? "").Trim()).Where(c => c.Length > 0).ToList();
+    int qty = dto.Qty ?? 1;
     if (user.Length == 0) { Write(ctx, 400, new { error = "user required" }); return; }
-    if (cards.Count == 0) { Write(ctx, 400, new { error = "cards required (non-empty array; repeat a name for qty>1)" }); return; }
-    // v1 deposit is single-card (reuses the tested one-card grab flow). Multi-card TODO.
+    if (cards.Count == 0) { Write(ctx, 400, new { error = "cards required (non-empty array)" }); return; }
+    if (qty < 1) { Write(ctx, 400, new { error = "qty must be >= 1" }); return; }
+    // v1 deposit is a single distinct card (reuses the tested grab flow); qty copies of it are fine.
     if (type == "deposit" && cards.Count != 1)
-    { Write(ctx, 400, new { error = "deposit v1 takes exactly ONE card per request (multi-card deposit not yet supported)" }); return; }
+    { Write(ctx, 400, new { error = "deposit v1 takes exactly ONE distinct card (use qty for copies; multi-distinct deposit not yet supported)" }); return; }
 
-    var job = new TradeJob { Id = NewId(), Type = type, User = user, Cards = cards, Commit = dto.Commit ?? false };
+    var job = new TradeJob { Id = NewId(), Type = type, User = user, Cards = cards, Commit = dto.Commit ?? false, Qty = qty };
     _jobs[job.Id] = job;
     _queue.Add(job);
-    _log($"[serve] queued {job.Id}: {type} user={user} cards=[{string.Join(", ", cards)}] commit={job.Commit}");
+    _log($"[serve] queued {job.Id}: {type} user={user} cards=[{string.Join(", ", cards)}] qty={qty} commit={job.Commit}");
     Write(ctx, 202, Project(job));
   }
 
@@ -196,15 +199,15 @@ public sealed class TradeService
         (bool ok, string detail) r;
         if (job.Type == "deposit")
         {
-          // Receive one card (validated single at enqueue), give nothing.
-          r = _grabFn(job.User, job.Cards[0], job.Commit, _perJobTimeoutSec);
+          // Receive qty of one card (validated single distinct at enqueue), give nothing.
+          r = _grabFn(job.User, job.Cards[0], job.Qty, job.Commit, _perJobTimeoutSec);
         }
         else
         {
-          // request (give): aggregate duplicate names into (name, qty).
+          // request (give): aggregate duplicate names, then multiply each by the job qty.
           var intended = job.Cards
             .GroupBy(n => n, StringComparer.OrdinalIgnoreCase)
-            .Select(g => (name: g.Key, qty: g.Count()))
+            .Select(g => (name: g.Key, qty: g.Count() * job.Qty))
             .ToList();
           r = _lendFn(job.User, intended, job.Commit, _perJobTimeoutSec);
         }
@@ -232,7 +235,7 @@ public sealed class TradeService
 
   static object Project(TradeJob j) => new
   {
-    id = j.Id, type = j.Type, user = j.User, cards = j.Cards, commit = j.Commit,
+    id = j.Id, type = j.Type, user = j.User, cards = j.Cards, qty = j.Qty, commit = j.Commit,
     state = j.State.ToString().ToLowerInvariant(), detail = j.Detail,
     createdAt = j.CreatedAt, startedAt = j.StartedAt, finishedAt = j.FinishedAt
   };
@@ -257,6 +260,7 @@ public sealed class TradeService
   {
     public string? User { get; set; }
     public List<string>? Cards { get; set; }
+    public int? Qty { get; set; }        // copies of each card (default 1) — e.g. N event tickets
     public bool? Commit { get; set; }
   }
 }
