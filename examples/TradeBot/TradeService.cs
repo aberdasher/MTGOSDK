@@ -126,7 +126,7 @@ public sealed class TradeService
     _log($"[serve] listening on {prefix}   custodian={_conn.Account}   (Bearer token required)");
     _log($"[serve] dashboard: http://{_bind}:{_port}/  (open in a browser; paste the token)");
     _log("[serve] routes: GET / (dashboard) | GET /health | GET /vault | GET /autocomplete?q= | GET /log | GET /jobs | GET /jobs/{id} | " +
-         "POST /jobs/{id}/cancel | POST /request | POST /deposit | POST /trade {partner,give[],receive[],waitMinutes,commit}");
+         "POST /jobs/{id}/cancel | POST /binders/prune | POST /request | POST /deposit | POST /trade {partner,give[],receive[],waitMinutes,commit}");
 
     while (true)
     {
@@ -188,10 +188,18 @@ public sealed class TradeService
       return;
     }
     if (method == "GET" && path == "/vault") { HandleVault(ctx); return; }
+    if (method == "GET" && path == "/binders")
+    {
+      if (_runningJobId != null || _conn.Reconnecting) { Write(ctx, 200, new { binders = Array.Empty<object>(), note = "busy" }); return; }
+      var bl = _conn.Exec.ListBinders().Select(b => new { name = b.name, items = b.items }).ToList();
+      Write(ctx, 200, new { binders = bl });
+      return;
+    }
     if (method == "GET" && path == "/autocomplete") { HandleAutocomplete(ctx, req); return; }
     if (method == "POST" && path == "/request") { HandleEnqueue(ctx, req, "request"); return; }  // give
     if (method == "POST" && path == "/deposit") { HandleEnqueue(ctx, req, "deposit"); return; }  // receive
     if (method == "POST" && path == "/trade")   { HandleEnqueue(ctx, req, "trade");   return; }  // give+receive
+    if (method == "POST" && path == "/binders/prune") { HandlePrune(ctx); return; }
 
     Write(ctx, 404, new { error = "not found", path, method });
   }
@@ -392,6 +400,19 @@ public sealed class TradeService
     if (running) { _conn.Exec.RequestAbort(); _log($"[serve] cancel requested for RUNNING job {id} — aborting the wait."); }
     else _log($"[serve] cancel requested for queued job {id} — it will be skipped at pickup.");
     Write(ctx, 200, new { id, cancelling = true, running });
+  }
+
+  // Delete the bot's transient trade binders (Lending / SwapOffer) that piled up under churn.
+  // Only when idle — deleting a binder mid-trade would break the open trade.
+  void HandlePrune(HttpListenerContext ctx)
+  {
+    if (_runningJobId != null || _conn.Reconnecting)
+    { Write(ctx, 409, new { error = "busy (a trade is running or reconnecting) — try again when idle" }); return; }
+    _conn.EnsureHealthy();
+    int n;
+    try { n = _conn.Exec.PruneBinders("Lending", "SwapOffer"); }
+    catch (Exception ex) { Write(ctx, 500, new { error = ex.Message.Split('\n')[0] }); return; }
+    Write(ctx, 200, new { pruned = n });
   }
 
   // Proxy Scryfall's card-name autocomplete (cached ~5 min). Returns { names: [...] } so the

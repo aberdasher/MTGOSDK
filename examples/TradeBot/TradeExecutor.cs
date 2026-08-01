@@ -1276,6 +1276,39 @@ public sealed class TradeExecutor : IDisposable
     return true;
   }
 
+  /// <summary>Delete EVERY binder whose name matches any of <paramref name="names"/>. The bot's
+  /// transient trade binders (Lending / SwapOffer) can pile up as duplicates under churn; this
+  /// prunes them (they're regenerated on demand). Returns how many were removed.</summary>
+  public int PruneBinders(params string[] names)
+  {
+    int removed = 0;
+    foreach (var name in names)
+    {
+      int consecutiveFails = 0;
+      // Bounded; the DeleteGrouping call can transiently time out (WPF UI busy), so tolerate a few
+      // failures per name (retry after a pause) before giving up rather than bailing on the first.
+      for (int i = 0; i < 30 && consecutiveFails < 4; i++)
+      {
+        var b = MTGOSDK.API.Collection.CollectionManager.Binders
+          .FirstOrDefault(x => string.Equals(Try(() => x.Name) ?? "", name, StringComparison.OrdinalIgnoreCase));
+        if (b is null) break;
+        if (DeleteBinder(name)) { removed++; consecutiveFails = 0; }
+        else { consecutiveFails++; Log($"[binder] prune: '{name}' delete failed (MTGO busy) — retry {consecutiveFails}/4 in 2s..."); System.Threading.Thread.Sleep(2000); }
+      }
+    }
+    Log($"[binder] pruned {removed} binder(s) named [{string.Join(", ", names)}].");
+    return removed;
+  }
+
+  /// <summary>List every binder (name + item count) on the bot's account — for diagnostics/UI.</summary>
+  public System.Collections.Generic.List<(string name, int items)> ListBinders()
+  {
+    var list = new System.Collections.Generic.List<(string, int)>();
+    try { foreach (var b in MTGOSDK.API.Collection.CollectionManager.Binders) list.Add((Try(() => b.Name) ?? "?", Try(() => b.ItemCount) ?? 0)); }
+    catch { }
+    return list;
+  }
+
   /// <summary>
   /// Create a binder named <paramref name="binderName"/> whose contents are EXACTLY
   /// <paramref name="cardNames"/> — deleting any existing binder of that name first.

@@ -92,6 +92,10 @@ select{background:var(--panel2);border:1px solid var(--edge);color:var(--ink);bo
       <div class="muted" id="distinct" style="margin-top:4px">&mdash;</div>
       <div class="muted" style="margin-top:3px;font-size:11px">tip: click the tix balance or a holding to add it to <b>give</b></div>
       <div class="holdings" id="holdings"></div>
+      <div style="margin-top:10px;display:flex;align-items:center;gap:8px">
+        <button class="mini" onclick="prune()" title="Delete leftover Lending/SwapOffer trade binders (regenerated on demand)">prune stale binders</button>
+        <span class="muted" id="prunemsg" style="font-size:11px"></span>
+      </div>
     </section>
     <section class="card">
       <h2>Compose trade</h2>
@@ -157,6 +161,11 @@ async function autocomplete(q){if(!q||q.trim().length<2)return;
     const dl=$('cardnames');dl.innerHTML='';(d.names||[]).forEach(n=>{const o=document.createElement('option');o.value=n;dl.append(o);});}catch(e){}}
 function onCardInput(e){const v=e.target.value;clearTimeout(acTimer);acTimer=setTimeout(()=>autocomplete(v),180);}
 async function cancelJob(id){try{await api('/jobs/'+id+'/cancel',{method:'POST'});tick();}catch(e){}}
+async function prune(){const m=$('prunemsg');m.textContent='pruning…';
+  try{const r=await api('/binders/prune',{method:'POST'});const d=await r.json();
+    m.textContent=r.ok?('pruned '+(d.pruned||0)+' binder(s)'):('failed: '+(d.error||('HTTP '+r.status)));}
+  catch(e){m.textContent='error';}
+  setTimeout(()=>{m.textContent='';},6000);}
 $('ocommit').addEventListener('change',e=>{$('cwarn').style.display=e.target.checked?'block':'none';});
 async function queue(){const o={partner:$('partner').value.trim(),give:rows('give'),receive:rows('receive'),commit:$('ocommit').checked,waitMinutes:parseInt($('wait').value)||0};
   if(!o.partner){alert('partner required');return;}
