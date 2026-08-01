@@ -37,6 +37,9 @@ input[type=number]{width:64px}
 button{background:#20262e;color:var(--ink);border:1px solid var(--edge);border-radius:7px;padding:7px 12px;cursor:pointer;font-size:13px}
 button:hover{border-color:var(--acc)}button.primary{background:var(--acc);color:#1a1206;border-color:var(--acc);font-weight:600}
 button.mini{padding:2px 8px;font-size:12px}
+button.cancel{margin-left:8px;color:var(--bad);border-color:#f8514933;padding:1px 7px}
+button.cancel:hover{border-color:var(--bad)}
+select{background:var(--panel2);border:1px solid var(--edge);color:var(--ink);border-radius:7px;padding:7px 9px;width:100%;font:13px system-ui;cursor:pointer}
 .badge{font-size:11px;text-transform:uppercase;letter-spacing:.5px;padding:2px 7px;border-radius:5px;border:1px solid var(--edge);white-space:nowrap}
 .badge.request{color:#7ee787;border-color:#2ea04366}.badge.deposit{color:#79c0ff;border-color:#1f6feb66}.badge.swap{color:#d2a8ff;border-color:#8957e566}
 .status{display:inline-flex;align-items:center;gap:6px;font-size:12px;color:var(--mut)}
@@ -93,6 +96,13 @@ button.mini{padding:2px 8px;font-size:12px}
       <button class="mini" onclick="addRow('give')">+ give</button>
       <label>Receive <span class="muted">(cards / tix the bot takes)</span></label><div id="receive"></div>
       <button class="mini" onclick="addRow('receive')">+ receive</button>
+      <label>Wait for partner <span class="muted">(online + reply YES)</span></label>
+      <select id="wait">
+        <option value="0">until they're ready (recommended)</option>
+        <option value="15">up to 15 min</option>
+        <option value="60">up to 1 hour</option>
+        <option value="240">up to 4 hours</option>
+      </select>
       <div class="dir">
         <span>Direction: <span id="dir" class="badge">&mdash;</span></span>
         <label style="display:flex;align-items:center;gap:6px;margin:0"><input type="checkbox" id="ocommit"> commit</label>
@@ -140,8 +150,9 @@ async function autocomplete(q){if(!q||q.trim().length<2)return;
   try{const r=await api('/autocomplete?q='+encodeURIComponent(q.trim()));if(!r.ok)return;const d=await r.json();
     const dl=$('cardnames');dl.innerHTML='';(d.names||[]).forEach(n=>{const o=document.createElement('option');o.value=n;dl.append(o);});}catch(e){}}
 function onCardInput(e){const v=e.target.value;clearTimeout(acTimer);acTimer=setTimeout(()=>autocomplete(v),180);}
+async function cancelJob(id){try{await api('/jobs/'+id+'/cancel',{method:'POST'});tick();}catch(e){}}
 $('ocommit').addEventListener('change',e=>{$('cwarn').style.display=e.target.checked?'block':'none';});
-async function queue(){const o={partner:$('partner').value.trim(),give:rows('give'),receive:rows('receive'),commit:$('ocommit').checked};
+async function queue(){const o={partner:$('partner').value.trim(),give:rows('give'),receive:rows('receive'),commit:$('ocommit').checked,waitMinutes:parseInt($('wait').value)||0};
   if(!o.partner){alert('partner required');return;}
   if(o.give.length===0&&o.receive.length===0){alert('add at least one give or receive');return;}
   const r=await api('/trade',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(o)});
@@ -155,8 +166,10 @@ async function tick(){try{
   const jr=await api('/jobs');if(!jr.ok)return;const {jobs}=await jr.json();const box=$('jobs');
   if(!jobs||jobs.length===0){box.innerHTML='<div class="muted">no jobs yet &mdash; compose one on the left</div>';}
   else{box.innerHTML='';jobs.forEach(o=>{const card=el('div',{class:'job'});
+    const waitInfo=((o.state==='running'||o.state==='queued')&&o.waitLabel)?' · wait '+esc(o.waitLabel):'';
+    const cancelBtn=o.cancellable?'<button class="mini cancel" onclick="cancelJob(\''+o.id+'\')">cancel</button>':'';
     card.innerHTML='<div class="top"><span class="who"><span class="badge '+o.type+'">'+o.type+'</span> '+esc(o.user)+'</span>'
-      +'<span class="status"><span class="sdot '+o.state+'"></span>'+o.state+(o.commit?' · commit':' · dry')+'</span></div>'
+      +'<span class="status"><span class="sdot '+o.state+'"></span>'+o.state+(o.commit?' · commit':' · dry')+waitInfo+cancelBtn+'</span></div>'
       +'<div class="items">give <b>'+esc(items(o.give))+'</b> &nbsp; receive <b>'+esc(items(o.receive))+'</b></div>'
       +(o.detail?'<div class="detail">'+esc(o.detail)+'</div>':'')
       +'<div class="t">'+esc(o.id)+' · '+ago(o.createdAt)+'</div>';

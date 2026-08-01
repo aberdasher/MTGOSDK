@@ -813,6 +813,7 @@ static bool RunLend(TradeBot.TradeExecutor exec, string recipient,
   // trade closes (the c==null check below breaks out on a close/cancel).
   for (int i = 0; (keepOpen || i < 300) && !ready; i++)
   {
+    if (exec.AbortRequested) { Line("Cancelled by operator — closing the trade (gave nothing)."); exec.CancelCurrent(); WaitForNoTrade(); return false; }
     System.Threading.Thread.Sleep(1000);
     var c = MTGOSDK.API.Trade.TradeManager.CurrentTrade;
     if (c is null) { Line("Trade closed before they finished grabbing."); return false; }
@@ -901,14 +902,14 @@ static bool RunLend(TradeBot.TradeExecutor exec, string recipient,
 // SWAP: give one card, request one-or-more back. Ensures the SwapOffer binder,
 // handshake, then runs the swap cycle.
 static bool RunSwapFlow(TradeBot.TradeExecutor exec, string partner, string giveCard,
-    System.Collections.Generic.List<string> getNames, bool allowCommit)
+    System.Collections.Generic.List<string> getNames, bool allowCommit, int yesTimeoutSec = 300)
 {
   var offer = exec.EnsureBinderExact("SwapOffer", new[] { giveCard });
   if (offer is null) { Line("Could not build the SwapOffer binder — aborting."); return false; }
   string getList = string.Join(", ", getNames);
   var esc = HandshakeThenInitiate(exec, partner,
     $"Swap offer: my 1 {giveCard} for your [{getList}]. Reply YES when ready — then accept the trade, present [{getList}], and grab the {giveCard} from my SwapOffer binder.",
-    presentBinder: "SwapOffer");
+    presentBinder: "SwapOffer", yesTimeoutSec: yesTimeoutSec);
   if (esc is null) { Line($"Swap not started with {partner} (no YES / not accepted)."); exec.CancelCurrent(); WaitForNoTrade(); return false; }
   return RunSwapCycle(exec, esc, partner, giveCard, 1, getNames, allowCommit);
 }
@@ -952,29 +953,36 @@ static (bool ok, string detail) RunTrade(TradeBot.TradeExecutor exec, string par
   bool giveOnly = give.Count > 0 && receive.Count == 0;
   bool recvOnly = give.Count == 0 && receive.Count > 0;
 
+  // yesTimeoutSec is the READINESS wait (how long to wait for the partner to be online + reply
+  // YES); int.MaxValue = "until they're ready". The grab/completion phase stays bounded inside
+  // each flow. An operator cancel (exec.AbortRequested) breaks the wait -> "cancelled" below.
+  bool ok; string okDetail, failDetail;
   if (giveOnly)
   {
-    bool ok = RunLend(exec, partner, give, allowCommit: allowCommit, keepOpen: false, yesTimeoutSec: yesTimeoutSec);
-    return (ok, ok ? (allowCommit ? $"committed — gave {Fmt(give)}" : $"dry-run — reached ready, gave nothing ({Fmt(give)})")
-                   : "not completed (declined / offline / grab incomplete / guardrail)");
+    ok = RunLend(exec, partner, give, allowCommit: allowCommit, keepOpen: false, yesTimeoutSec: yesTimeoutSec);
+    okDetail = allowCommit ? $"committed — gave {Fmt(give)}" : $"dry-run — reached ready, gave nothing ({Fmt(give)})";
+    failDetail = "not completed (declined / grab incomplete / guardrail)";
   }
-  if (recvOnly && receive.Count == 1)
+  else if (recvOnly && receive.Count == 1)
   {
     var r = receive[0];
-    bool ok = RunGrabFlow(exec, partner, r.name, allowCommit: allowCommit, yesTimeoutSec: yesTimeoutSec, qty: r.qty);
-    return (ok, ok ? (allowCommit ? $"committed — received {Fmt(receive)}" : $"dry-run — reached ready, received nothing ({Fmt(receive)})")
-                   : "not completed (declined / offline / cards not presented / took-from-us / guardrail)");
+    ok = RunGrabFlow(exec, partner, r.name, allowCommit: allowCommit, yesTimeoutSec: yesTimeoutSec, qty: r.qty);
+    okDetail = allowCommit ? $"committed — received {Fmt(receive)}" : $"dry-run — reached ready, received nothing ({Fmt(receive)})";
+    failDetail = "not completed (cards not presented / took-from-us / guardrail)";
   }
-  if (give.Count == 1 && give[0].qty == 1 && receive.Count > 0)
+  else if (give.Count == 1 && give[0].qty == 1 && receive.Count > 0)
   {
-    // SWAP: give one card, request the listed cards back (qty on the receive side is not
-    // yet honored by the swap cycle — it requests each name once, matching the old worker).
-    var getNames = receive.Select(i => i.name).ToList();
-    bool ok = RunSwapFlow(exec, partner, give[0].name, getNames, allowCommit);
-    return (ok, ok ? (allowCommit ? $"committed — swapped {give[0].name} for {Fmt(receive)}" : $"dry-run — swap reached ready ({give[0].name} for {Fmt(receive)})")
-                   : "not completed (declined / offline / guardrail)");
+    // SWAP: give one card, request the listed cards back (receive-side qty not yet honored —
+    // requests each name once, matching the old worker).
+    ok = RunSwapFlow(exec, partner, give[0].name, receive.Select(i => i.name).ToList(), allowCommit, yesTimeoutSec: yesTimeoutSec);
+    okDetail = allowCommit ? $"committed — swapped {give[0].name} for {Fmt(receive)}" : $"dry-run — swap reached ready ({give[0].name} for {Fmt(receive)})";
+    failDetail = "not completed (declined / guardrail)";
   }
-  return (false, "unsupported give/receive combo (v1: give-only lend, single receive-only grab, or single-give+receive swap; multi-give / qty>1 receive-with-give not yet)");
+  else return (false, "unsupported give/receive combo (v1: give-only lend, single receive-only grab, or single-give+receive swap; multi-give / qty>1 receive-with-give not yet)");
+
+  if (ok) return (true, okDetail);
+  if (exec.AbortRequested) return (false, "cancelled by operator");
+  return (false, failDetail);
 }
 
 // Given a negotiating escrow, stage the requested card (non-committing) and HOLD
@@ -2248,12 +2256,14 @@ using (var exec = new TradeExecutor { AllowCommit = allowCommit })
 
       var svc = new TradeBot.TradeService(
         token: token, bind: bind, port: port, conn: conn, perJobTimeoutSec: perJobTimeout,
-        tradeFn: (partner, give, receive, jobCommit, timeoutSec) =>
+        tradeFn: (partner, give, receive, jobCommit, waitSec) =>
         {
           // Belt + suspenders: commit only if the process allows commits AND the job asks to.
-          // ONE dispatch for give / receive / swap — RunTrade owns the routing + the detail text.
+          // ONE dispatch for give / receive / swap — RunTrade owns routing + detail text.
+          // waitSec is the READINESS wait (int.MaxValue = wait until the partner is ready);
+          // RunTrade feeds it to the presence-aware handshake.
           bool effectiveCommit = allowCommit && jobCommit;
-          return RunTrade(conn.Exec, partner, give, receive, allowCommit: effectiveCommit, yesTimeoutSec: timeoutSec);
+          return RunTrade(conn.Exec, partner, give, receive, allowCommit: effectiveCommit, yesTimeoutSec: waitSec);
         },
         vaultFn: () =>
         {

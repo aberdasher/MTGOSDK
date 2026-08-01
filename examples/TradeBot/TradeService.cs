@@ -39,6 +39,8 @@ public sealed class TradeJob
   public List<TradeItem> Give { get; init; } = new();     // custodian -> user
   public List<TradeItem> Receive { get; init; } = new();  // user -> custodian
   public bool Commit { get; init; }                    // false => dry-run (reaches approval, cancels)
+  public int WaitSec { get; init; } = int.MaxValue;    // readiness wait for partner (online+YES); MaxValue = until ready
+  public volatile bool Cancelled;                      // operator cancel (before/at pickup, or via abort while running)
   public JobState State { get; set; } = JobState.Queued;
   public string Detail { get; set; } = "";
   public string CreatedAt { get; init; } = DateTime.UtcNow.ToString("o");
@@ -74,6 +76,7 @@ public sealed class TradeService
   readonly BlockingCollection<TradeJob> _queue = new(new ConcurrentQueue<TradeJob>());
   readonly List<string> _logRing = new();   // last N service log lines, for the dashboard /log
   object? _vaultCache;                       // last good /vault snapshot (reused while a trade runs)
+  volatile string? _runningJobId;            // id of the job the worker is executing now (for cancel)
 
   static readonly JsonSerializerOptions JsonIn = new() { PropertyNameCaseInsensitive = true };
 
@@ -122,7 +125,7 @@ public sealed class TradeService
     _log($"[serve] listening on {prefix}   custodian={_conn.Account}   (Bearer token required)");
     _log($"[serve] dashboard: http://{_bind}:{_port}/  (open in a browser; paste the token)");
     _log("[serve] routes: GET / (dashboard) | GET /health | GET /vault | GET /autocomplete?q= | GET /log | GET /jobs | GET /jobs/{id} | " +
-         "POST /request {user,cards[],qty,commit} | POST /deposit {user,cards[],qty,commit} | POST /trade {partner,give[],receive[],commit}");
+         "POST /jobs/{id}/cancel | POST /request | POST /deposit | POST /trade {partner,give[],receive[],waitMinutes,commit}");
 
     while (true)
     {
@@ -168,6 +171,8 @@ public sealed class TradeService
       Write(ctx, 200, new { jobs = list });
       return;
     }
+    if (method == "POST" && path.StartsWith("/jobs/") && path.EndsWith("/cancel"))
+    { HandleCancel(ctx, path.Substring("/jobs/".Length, path.Length - "/jobs/".Length - "/cancel".Length)); return; }
     if (method == "GET" && path.StartsWith("/jobs/"))
     {
       string id = path.Substring("/jobs/".Length);
@@ -238,10 +243,15 @@ public sealed class TradeService
       else                       { give = new(); receive = items; type = "deposit"; }
     }
 
-    var job = new TradeJob { Id = NewId(), Type = type, User = user, Give = give, Receive = receive, Commit = commit };
+    // Readiness wait: how long to wait for the partner to be online + reply YES.
+    // waitMinutes absent -> serve default (--timeout); <= 0 -> until ready (unbounded).
+    int waitSec = dto.WaitMinutes.HasValue
+      ? (dto.WaitMinutes.Value <= 0 ? int.MaxValue : dto.WaitMinutes.Value * 60)
+      : _perJobTimeoutSec;
+    var job = new TradeJob { Id = NewId(), Type = type, User = user, Give = give, Receive = receive, Commit = commit, WaitSec = waitSec };
     _jobs[job.Id] = job;
     _queue.Add(job);
-    _log($"[serve] queued {job.Id}: {type} user={user} give=[{Fmt(give)}] receive=[{Fmt(receive)}] commit={commit}");
+    _log($"[serve] queued {job.Id}: {type} user={user} give=[{Fmt(give)}] receive=[{Fmt(receive)}] commit={commit} wait={(waitSec >= int.MaxValue / 2 ? "until-ready" : waitSec + "s")}");
     Write(ctx, 202, Project(job));
   }
 
@@ -266,17 +276,27 @@ public sealed class TradeService
   {
     foreach (var job in _queue.GetConsumingEnumerable())
     {
+      if (job.Cancelled)   // cancelled while still queued — skip without touching MTGO
+      {
+        job.State = JobState.Failed; job.Detail = "cancelled before it started";
+        job.FinishedAt = DateTime.UtcNow.ToString("o");
+        _log($"[serve] {job.Id} -> cancelled (before start)");
+        continue;
+      }
       job.State = JobState.Running;
       job.StartedAt = DateTime.UtcNow.ToString("o");
-      _log($"[serve] running {job.Id} ({job.Type} user={job.User}) ...");
+      _runningJobId = job.Id;
+      _conn.Exec.ClearAbort();   // fresh cancel state for this job
+      _log($"[serve] running {job.Id} ({job.Type} user={job.User}) — readiness wait: {(job.WaitSec >= int.MaxValue / 2 ? "until partner is ready" : job.WaitSec + "s")}");
       _conn.EnsureHealthy();   // block here until MTGO is reachable again (survives a client restart)
       try
       {
-        var r = _tradeFn(job.User, job.GiveTuples(), job.ReceiveTuples(), job.Commit, _perJobTimeoutSec);
+        var r = _tradeFn(job.User, job.GiveTuples(), job.ReceiveTuples(), job.Commit, job.WaitSec);
         job.State = r.ok ? JobState.Done : JobState.Failed;
         job.Detail = r.detail;
       }
       catch (Exception ex) { job.State = JobState.Failed; job.Detail = ex.Message; }
+      _runningJobId = null;
       job.FinishedAt = DateTime.UtcNow.ToString("o");
       _log($"[serve] {job.Id} -> {job.State.ToString().ToLowerInvariant()} ({job.Detail})");
     }
@@ -301,6 +321,9 @@ public sealed class TradeService
     give = j.Give.Select(i => new { name = i.Name, qty = i.Qty }).ToList(),
     receive = j.Receive.Select(i => new { name = i.Name, qty = i.Qty }).ToList(),
     commit = j.Commit,
+    waitSec = j.WaitSec,
+    waitLabel = j.WaitSec >= int.MaxValue / 2 ? "until ready" : (j.WaitSec >= 60 ? (j.WaitSec / 60) + " min" : j.WaitSec + "s"),
+    cancellable = j.State is JobState.Queued or JobState.Running,
     state = j.State.ToString().ToLowerInvariant(), detail = j.Detail,
     createdAt = j.CreatedAt, startedAt = j.StartedAt, finishedAt = j.FinishedAt
   };
@@ -356,6 +379,20 @@ public sealed class TradeService
     Write(ctx, 200, _vaultCache ?? new { available = false, custodian = _conn.Account, reason = "snapshot pending (busy)" });
   }
 
+  // Operator cancel. Running job -> abort the presence-wait via the executor flag; queued job ->
+  // mark so the worker skips it. Terminal jobs are a no-op.
+  void HandleCancel(HttpListenerContext ctx, string id)
+  {
+    if (!_jobs.TryGetValue(id, out var job)) { Write(ctx, 404, new { error = "no such job", id }); return; }
+    if (job.State is JobState.Done or JobState.Failed)
+    { Write(ctx, 200, new { id, state = job.State.ToString().ToLowerInvariant(), note = "already finished" }); return; }
+    job.Cancelled = true;
+    bool running = id == _runningJobId;
+    if (running) { _conn.Exec.RequestAbort(); _log($"[serve] cancel requested for RUNNING job {id} — aborting the wait."); }
+    else _log($"[serve] cancel requested for queued job {id} — it will be skipped at pickup.");
+    Write(ctx, 200, new { id, cancelling = true, running });
+  }
+
   // Proxy Scryfall's card-name autocomplete (cached ~5 min). Returns { names: [...] } so the
   // dashboard's card fields suggest valid names. Never fails hard — a Scryfall hiccup or no
   // network just yields no suggestions (the operator can still type a name).
@@ -388,6 +425,7 @@ public sealed class TradeService
     public int? Qty { get; set; }                    // copies of each card (default 1)
     public List<ItemDto>? Give { get; set; }         // /trade
     public List<ItemDto>? Receive { get; set; }      // /trade
+    public int? WaitMinutes { get; set; }            // readiness wait; <=0 or 0 => until ready (unbounded)
     public bool? Commit { get; set; }
   }
 

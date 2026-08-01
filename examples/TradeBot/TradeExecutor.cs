@@ -851,6 +851,13 @@ public sealed class TradeExecutor : IDisposable
   /// on a new message is theirs. We still reject a yes whose sender name IS present
   /// and is someone OTHER than them (e.g. our own echo), to be safe.
   /// </summary>
+  // Operator abort: the serve sets this to break a long presence-wait (see
+  // SendPromptWhenOnlineAndWaitForYes). One job runs at a time on one executor, so a single
+  // flag is unambiguous. Cleared at the start of each job.
+  public volatile bool AbortRequested;
+  public void RequestAbort() => AbortRequested = true;
+  public void ClearAbort() => AbortRequested = false;
+
   public bool WaitForDMYes(string username, int timeoutSec = 300)
   {
     int uid = ResolveUserId(username);
@@ -902,19 +909,22 @@ public sealed class TradeExecutor : IDisposable
     var channel = ChannelManager.GetPrivateChannel(uid);
     int seen = Try(() => channel.Messages.Count) ?? 0;
 
-    // One attempt now (covers "already online" + any queue-if-offline behavior)...
-    try { SendDM(username, prompt); } catch (Exception ex) { Log($"[dm] initial prompt threw: {ex.Message.Split('\n')[0]}"); }
+    // Presence-FIRST: only prompt when they're actually online. If already online, prompt now;
+    // otherwise HOLD and prompt the moment they come online (a DM to an offline user can be
+    // silently dropped, so prompting into the void is pointless).
     bool wasOnline = IsUserOnline(username);
+    if (wasOnline) { try { SendDM(username, prompt); } catch (Exception ex) { Log($"[dm] initial prompt threw: {ex.Message.Split('\n')[0]}"); } }
+    else Log($"[presence] {username} is offline — holding; I'll prompt them the moment they come online.");
 
     for (int i = 0; i < timeoutSec; i++)
     {
-      // ...then re-send on each offline→online edge so a dropped offline DM is replaced by
-      // one they can actually see.
+      if (AbortRequested) { Log($"[cancel] handshake for {username} aborted by operator."); return false; }
+      // Prompt on each offline→online edge so they get a prompt they can actually see.
       bool online = IsUserOnline(username);
       if (online && !wasOnline)
       {
-        try { SendDM(username, prompt); Log($"[presence] {username} came online — prompt re-sent."); }
-        catch (Exception ex) { Log($"[dm] re-send threw: {ex.Message.Split('\n')[0]}"); }
+        try { SendDM(username, prompt); Log($"[presence] {username} came online — prompt sent."); }
+        catch (Exception ex) { Log($"[dm] prompt-on-online threw: {ex.Message.Split('\n')[0]}"); }
       }
       wasOnline = online;
 
