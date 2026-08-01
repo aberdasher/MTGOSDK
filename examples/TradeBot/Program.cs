@@ -2257,22 +2257,24 @@ using (var exec = new TradeExecutor { AllowCommit = allowCommit })
         },
         vaultFn: () =>
         {
-          // Owned Event Tickets + a small holdings summary, from ONE collection scan.
+          // Owned Event Tickets (headline) + top TRADEABLE holdings, from ONE collection scan.
+          // Filter out account-bound / non-tradeable cruft so the list is real cards.
           var col = MTGOSDK.API.Collection.CollectionManager.Collection;
           System.Collections.Generic.List<int> tixIds;
           try { tixIds = MTGOSDK.API.Collection.CollectionManager.GetCardIds("Event Ticket").ToList(); }
           catch { tixIds = new(); }
+          string[] hide = { "Play Point", "Reward Pack", "Avatar" };
           int tix = 0;
           var byName = new System.Collections.Generic.Dictionary<string, int>();
           foreach (var it in col.Items)
           {
             int q = it.Quantity; if (q <= 0) continue;
-            if (tixIds.Contains(it.Id)) tix += q;
+            if (tixIds.Contains(it.Id)) { tix += q; continue; }   // tix is the headline, not a row
             string nm; try { nm = it.Card?.Name ?? "?"; } catch { nm = "?"; }
+            if (hide.Any(h => nm.IndexOf(h, StringComparison.OrdinalIgnoreCase) >= 0)) continue;
             byName[nm] = (byName.TryGetValue(nm, out var v) ? v : 0) + q;
           }
-          var top = byName.Where(k => !string.Equals(k.Key, "Event Ticket", StringComparison.OrdinalIgnoreCase))
-                          .OrderByDescending(k => k.Value).ThenBy(k => k.Key).Take(12)
+          var top = byName.OrderByDescending(k => k.Value).ThenBy(k => k.Key).Take(12)
                           .Select(k => (name: k.Key, qty: k.Value)).ToList();
           return (tix, byName.Count, top);
         },

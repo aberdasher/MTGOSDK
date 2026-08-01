@@ -51,10 +51,12 @@ button.mini{padding:2px 8px;font-size:12px}
 .job .t{color:var(--mut);font-size:11px;font-variant-numeric:tabular-nums}
 #log{background:var(--panel2);border:1px solid var(--edge);border-radius:8px;padding:10px;height:220px;overflow:auto;font:12px/1.55 ui-monospace,Consolas,monospace;color:#c9d1d9;white-space:pre-wrap}
 .muted{color:var(--mut);font-size:12px}
-.vault{display:flex;align-items:baseline;gap:10px;cursor:pointer;border-radius:7px;padding:2px 4px;margin-left:-4px}
+.vault{display:flex;align-items:baseline;gap:10px;cursor:pointer;border-radius:7px;padding:4px 6px;margin-left:-6px}
 .vault:hover{background:#ffffff0a}
 .vault .big{font-size:34px;font-weight:700;color:var(--acc);font-variant-numeric:tabular-nums;line-height:1}
 .vault .unit{font-size:13px;color:var(--mut)}
+.vault .addcue{margin-left:auto;align-self:center;font-size:11px;color:var(--acc);opacity:.6;font-weight:600;white-space:nowrap}
+.vault:hover .addcue{opacity:1;text-decoration:underline}
 .holdings{margin-top:10px;display:flex;flex-direction:column;gap:2px;max-height:180px;overflow:auto}
 .holdings .h{display:flex;justify-content:space-between;gap:8px;font-size:12px;padding:4px 6px;border-radius:5px;cursor:pointer}
 .holdings .h:hover{background:#ffffff10}
@@ -78,7 +80,7 @@ button.mini{padding:2px 8px;font-size:12px}
   <div class="col">
     <section class="card">
       <h2>Vault &mdash; <span id="custodian">&hellip;</span></h2>
-      <div class="vault" onclick="addGive('Event Ticket')" title="Add an Event Ticket to the give side"><span class="big" id="tix">&mdash;</span><span class="unit">event tickets</span></div>
+      <div class="vault" onclick="addGive('Event Ticket')" title="Add an Event Ticket to the give side"><span class="big" id="tix">&mdash;</span><span class="unit">event tickets</span><span class="addcue">+ give</span></div>
       <div class="muted" id="distinct" style="margin-top:4px">&mdash;</div>
       <div class="muted" style="margin-top:3px;font-size:11px">tip: click the tix balance or a holding to add it to <b>give</b></div>
       <div class="holdings" id="holdings"></div>
