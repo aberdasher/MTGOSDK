@@ -2292,6 +2292,23 @@ using (var exec = new TradeExecutor { AllowCommit = allowCommit })
 
       Line($"[serve] trade service (give / deposit / swap) as {whoami}; per-job wait {perJobTimeout}s; " +
            $"commits {(allowCommit ? "ENABLED (--commit)" : "DISABLED — dry-run only")}.");
+
+      // Warm the collection + binder list before serving. Both read empty/stale right after a
+      // fresh attach: a cold catalog means card names won't resolve, and a cold binder list means
+      // a lend can collide with a 'Lending' binder the SDK can't see yet. Poll until loaded.
+      Line("[serve] warming collection + binder list...");
+      for (int wi = 0; wi < 20; wi++)
+      {
+        bool hasItems = false; int binders = 0;
+        try { hasItems = MTGOSDK.API.Collection.CollectionManager.Collection.Items.Any(); } catch { }
+        try { binders = MTGOSDK.API.Collection.CollectionManager.Binders.Count(); } catch { }
+        // The binder list populates SLOWER than the collection. Proceed once the collection is up
+        // AND either a binder is visible or we've given the binder list ~10s (so a genuinely
+        // binder-less account doesn't wait forever).
+        if (hasItems && (binders > 0 || wi >= 5)) { Line($"[serve] warm: collection loaded, {binders} binder(s) visible."); break; }
+        System.Threading.Thread.Sleep(2000);
+      }
+
       svc.Run();   // blocks the process on the accept loop until stopped
       break;
     }

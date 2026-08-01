@@ -1191,34 +1191,53 @@ public sealed class TradeExecutor : IDisposable
     }
     if (defs.Count == 0) { Log("[binder] no cards resolved — aborting."); return null; }
 
-    try
-    {
-      // Build List<ICardDefinition> remotely. The diver's type resolver only
-      // constructs a cross-assembly generic if the type-arg is ASSEMBLY-QUALIFIED
-      // (List`1[[Inner, Asm]]); a plain List`1[Inner] fails.
-      string asmName = Try(() => RemoteClient.GetInstanceType(ICardDefinition).Assembly.GetName().Name)
-                       ?? "WotC.MtGO.Client.Model";
-      string listType = $"System.Collections.Generic.List`1[[{ICardDefinition}, {asmName}]]";
-      dynamic list = RemoteClient.CreateInstance(listType);
-      foreach (var d in defs) list.Add(d);
-      dynamic mgr = Unbind((object)ObjectProvider.Get(IGroupingManager, true, false, false));
-      OnUI(() => mgr.CreateNewBinder(binderName, null, list));
-      Log($"[binder] CreateNewBinder('{binderName}') with {defs.Count} card(s).");
-    }
-    catch (Exception ex)
-    {
-      var inner = ex.InnerException;
-      Log($"[binder] CreateNewBinder failed: {ex.GetType().Name}: {ex.Message}" +
-          (inner != null ? $" || inner: {inner.GetType().Name}: {inner.Message}" : ""));
-      return null;
-    }
+    // The remote List<ICardDefinition> type must be ASSEMBLY-QUALIFIED (the diver's resolver
+    // needs List`1[[Inner, Asm]], not a plain List`1[Inner]).
+    string asmName = Try(() => RemoteClient.GetInstanceType(ICardDefinition).Assembly.GetName().Name)
+                     ?? "WotC.MtGO.Client.Model";
+    string listType = $"System.Collections.Generic.List`1[[{ICardDefinition}, {asmName}]]";
+    dynamic mgr = Unbind((object)ObjectProvider.Get(IGroupingManager, true, false, false));
 
-    System.Threading.Thread.Sleep(1500);
-    var created = MTGOSDK.API.Collection.CollectionManager.Binders
-      .FirstOrDefault(b => string.Equals(Try(() => b.Name) ?? "", binderName, StringComparison.OrdinalIgnoreCase));
-    if (created is null) { Log($"[binder] created but not found on re-scan (give it a moment)."); return null; }
-    Log($"[binder] created '{created.Name}' (id={Try(() => created.Id)}, items={Try(() => created.ItemCount)}).");
-    return created;
+    // CreateNewBinder is flaky under churn — it can throw a TRANSIENT MagicException or time out
+    // on the UI thread (observed: fails once, succeeds on retry). Retry a few times, re-scanning
+    // after each (the binder may have landed despite the throw). Rebuild the remote list each try
+    // since a failed attempt can leave it consumed.
+    for (int attempt = 1; attempt <= 3; attempt++)
+    {
+      try
+      {
+        dynamic list = RemoteClient.CreateInstance(listType);
+        foreach (var d in defs) list.Add(d);
+        OnUI(() => mgr.CreateNewBinder(binderName, null, list));
+        Log($"[binder] CreateNewBinder('{binderName}') with {defs.Count} card(s) (attempt {attempt}).");
+      }
+      catch (Exception ex)
+      {
+        var inner = ex.InnerException;
+        Log($"[binder] CreateNewBinder attempt {attempt} failed: {ex.GetType().Name}: {ex.Message.Split('\n')[0]}" +
+            (inner != null ? $" || inner: {inner.GetType().Name}: {inner.Message.Split('\n')[0]}" : ""));
+      }
+
+      System.Threading.Thread.Sleep(1500);
+      var found = MTGOSDK.API.Collection.CollectionManager.Binders
+        .FirstOrDefault(b => string.Equals(Try(() => b.Name) ?? "", binderName, StringComparison.OrdinalIgnoreCase));
+      if (found != null && BinderHasExactly(found, cardNames))
+      {
+        Log($"[binder] '{found.Name}' ready (id={Try(() => found.Id)}, items={Try(() => found.ItemCount)}).");
+        return found;
+      }
+      if (found != null)
+      {
+        // Same-named binder exists but with the WRONG contents — a stale binder the (cold) binder
+        // list hid from the earlier check, now colliding. Clear it before retrying so we NEVER
+        // return the wrong card (this was the original bug's failure mode).
+        Log($"[binder] '{binderName}' present but contents != [{string.Join(", ", cardNames)}] — clearing + retrying.");
+        DeleteBinder(binderName);
+      }
+      if (attempt < 3) { Log($"[binder] retrying create of '{binderName}' in 2s..."); System.Threading.Thread.Sleep(2000); }
+    }
+    Log($"[binder] gave up creating '{binderName}' after 3 attempts.");
+    return null;
   }
 
   /// <summary>
@@ -1268,8 +1287,53 @@ public sealed class TradeExecutor : IDisposable
   {
     var existing = MTGOSDK.API.Collection.CollectionManager.Binders
       .FirstOrDefault(b => string.Equals(Try(() => b.Name) ?? "", binderName, StringComparison.OrdinalIgnoreCase));
-    if (existing != null) DeleteBinder(binderName);
+    if (existing != null)
+    {
+      // Already holds EXACTLY the requested card(s)? Reuse as-is and skip the delete —
+      // DeleteGrouping can time out when MTGO's UI thread is briefly busy, and the previous
+      // bug was reusing a STALE binder after a failed delete (offered the wrong card).
+      if (BinderHasExactly(existing, cardNames))
+      {
+        Log($"[binder] existing '{binderName}' already holds exactly [{string.Join(", ", cardNames)}] — reusing.");
+        return existing;
+      }
+      // Stale contents — clear it, RETRYING since the delete can transiently time out. If we
+      // still can't clear it, ABORT (null) rather than hand out a binder with the wrong card.
+      bool gone = false;
+      for (int attempt = 1; attempt <= 3 && !gone; attempt++)
+      {
+        gone = DeleteBinder(binderName);
+        if (!gone && attempt < 3) { Log($"[binder] delete attempt {attempt} didn't clear '{binderName}' — retrying in 2s..."); System.Threading.Thread.Sleep(2000); }
+      }
+      if (!gone)
+      {
+        Log($"[binder] could NOT clear stale '{binderName}' after 3 tries (MTGO UI busy) — aborting so we never offer the wrong card. Retry the trade.");
+        return null;
+      }
+    }
     return CreateBinder(binderName, cardNames);
+  }
+
+  // True iff the binder's contents are EXACTLY the requested cards (name -> count). Best-effort:
+  // any read failure returns false, so we fall through to the safe delete+recreate path.
+  bool BinderHasExactly(MTGOSDK.API.Collection.Binder binder, System.Collections.Generic.IReadOnlyList<string> cardNames)
+  {
+    try
+    {
+      var want = new System.Collections.Generic.Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+      foreach (var n in cardNames) want[n] = (want.TryGetValue(n, out var c) ? c : 0) + 1;
+      var have = new System.Collections.Generic.Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+      foreach (var it in binder.Items)
+      {
+        string nm = Try(() => it.Card?.Name) ?? "";
+        int q = Try(() => it.Quantity) ?? 0;
+        if (nm.Length > 0 && q > 0) have[nm] = (have.TryGetValue(nm, out var c) ? c : 0) + q;
+      }
+      if (want.Count != have.Count) return false;
+      foreach (var kv in want) if (!have.TryGetValue(kv.Key, out var q) || q != kv.Value) return false;
+      return true;
+    }
+    catch { return false; }
   }
 
   /// <summary>Summarize the view-model's requested ("you receive") list.</summary>
