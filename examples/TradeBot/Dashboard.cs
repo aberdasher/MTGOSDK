@@ -112,6 +112,7 @@ button.mini{padding:2px 8px;font-size:12px}
     </section>
   </div>
 </main>
+<datalist id="cardnames"></datalist>
 <script>
 function $(id){return document.getElementById(id);}
 function tok(){return localStorage.getItem('tbtoken')||'';}
@@ -120,10 +121,10 @@ async function api(path,opts){opts=opts||{};opts.headers=Object.assign({'Authori
   const r=await fetch(path,opts);if(r.status===401)$('authwarn').style.display='block';return r;}
 function el(t,a,k){const e=document.createElement(t);for(const x in(a||{}))e.setAttribute(x,a[x]);(k||[]).forEach(c=>e.append(c));return e;}
 function addRow(kind,name,qty){const box=$(kind);const row=el('div',{class:'row'});
-  const n=el('input',{type:'text',placeholder:'Card name or Event Ticket'});n.value=name||'';
+  const n=el('input',{type:'text',placeholder:'Card name or Event Ticket',list:'cardnames'});n.value=name||'';
   const q=el('input',{type:'number',min:'1'});q.value=qty||'1';
   const rm=el('button',{class:'mini'});rm.textContent='×';rm.onclick=()=>{row.remove();updateDir();};
-  n.oninput=updateDir;row.append(n,q,rm);box.append(row);updateDir();}
+  n.oninput=(e)=>{updateDir();onCardInput(e);};row.append(n,q,rm);box.append(row);updateDir();}
 function rows(kind){return[...$(kind).children].map(r=>{const i=r.querySelectorAll('input');
   return{name:i[0].value.trim(),qty:parseInt(i[1].value)||1};}).filter(x=>x.name);}
 function updateDir(){const g=rows('give').length,r=rows('receive').length;const d=$('dir');let t='—',c='';
@@ -134,6 +135,11 @@ function addGive(name){const box=$('give');
   for(const r of box.children){const inp=r.querySelectorAll('input');
     if((inp[0].value||'').trim().toLowerCase()===name.toLowerCase()){inp[1].value=(parseInt(inp[1].value)||1)+1;updateDir();flash(r);return;}}
   addRow('give',name,1);flash(box.lastElementChild);}
+let acTimer=null;
+async function autocomplete(q){if(!q||q.trim().length<2)return;
+  try{const r=await api('/autocomplete?q='+encodeURIComponent(q.trim()));if(!r.ok)return;const d=await r.json();
+    const dl=$('cardnames');dl.innerHTML='';(d.names||[]).forEach(n=>{const o=document.createElement('option');o.value=n;dl.append(o);});}catch(e){}}
+function onCardInput(e){const v=e.target.value;clearTimeout(acTimer);acTimer=setTimeout(()=>autocomplete(v),180);}
 $('ocommit').addEventListener('change',e=>{$('cwarn').style.display=e.target.checked?'block':'none';});
 async function queue(){const o={partner:$('partner').value.trim(),give:rows('give'),receive:rows('receive'),commit:$('ocommit').checked};
   if(!o.partner){alert('partner required');return;}

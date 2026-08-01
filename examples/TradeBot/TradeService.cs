@@ -19,6 +19,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Net;
+using System.Net.Http;
 using System.Text;
 using System.Text.Json;
 using System.Threading;
@@ -76,6 +77,17 @@ public sealed class TradeService
 
   static readonly JsonSerializerOptions JsonIn = new() { PropertyNameCaseInsensitive = true };
 
+  // Card-name autocomplete via Scryfall, PROXIED so the dashboard only ever talks to us.
+  static readonly HttpClient _http = CreateHttp();
+  static readonly ConcurrentDictionary<string, (string[] names, long at)> _acCache = new();
+  static HttpClient CreateHttp()
+  {
+    var h = new HttpClient { Timeout = TimeSpan.FromSeconds(6) };
+    h.DefaultRequestHeaders.UserAgent.ParseAdd("MTGOSDK-TradeBot/1.0");   // Scryfall asks for a descriptive UA
+    h.DefaultRequestHeaders.Accept.ParseAdd("application/json");
+    return h;
+  }
+
   public TradeService(string token, string bind, int port, MtgoConnection conn, int perJobTimeoutSec,
     Func<string, List<(string name, int qty)>, List<(string name, int qty)>, bool, int, (bool ok, string detail)> tradeFn,
     Func<(int tix, int distinct, List<(string name, int qty)> top)>? vaultFn,
@@ -109,7 +121,7 @@ public sealed class TradeService
 
     _log($"[serve] listening on {prefix}   custodian={_conn.Account}   (Bearer token required)");
     _log($"[serve] dashboard: http://{_bind}:{_port}/  (open in a browser; paste the token)");
-    _log("[serve] routes: GET / (dashboard) | GET /health | GET /vault | GET /log | GET /jobs | GET /jobs/{id} | " +
+    _log("[serve] routes: GET / (dashboard) | GET /health | GET /vault | GET /autocomplete?q= | GET /log | GET /jobs | GET /jobs/{id} | " +
          "POST /request {user,cards[],qty,commit} | POST /deposit {user,cards[],qty,commit} | POST /trade {partner,give[],receive[],commit}");
 
     while (true)
@@ -170,6 +182,7 @@ public sealed class TradeService
       return;
     }
     if (method == "GET" && path == "/vault") { HandleVault(ctx); return; }
+    if (method == "GET" && path == "/autocomplete") { HandleAutocomplete(ctx, req); return; }
     if (method == "POST" && path == "/request") { HandleEnqueue(ctx, req, "request"); return; }  // give
     if (method == "POST" && path == "/deposit") { HandleEnqueue(ctx, req, "deposit"); return; }  // receive
     if (method == "POST" && path == "/trade")   { HandleEnqueue(ctx, req, "trade");   return; }  // give+receive
@@ -341,6 +354,30 @@ public sealed class TradeService
       catch (Exception ex) { _vaultCache ??= new { available = false, custodian = _conn.Account, reason = ex.Message.Split('\n')[0] }; }
     }
     Write(ctx, 200, _vaultCache ?? new { available = false, custodian = _conn.Account, reason = "snapshot pending (busy)" });
+  }
+
+  // Proxy Scryfall's card-name autocomplete (cached ~5 min). Returns { names: [...] } so the
+  // dashboard's card fields suggest valid names. Never fails hard — a Scryfall hiccup or no
+  // network just yields no suggestions (the operator can still type a name).
+  void HandleAutocomplete(HttpListenerContext ctx, HttpListenerRequest req)
+  {
+    string q = (req.QueryString["q"] ?? "").Trim();
+    if (q.Length < 2) { Write(ctx, 200, new { names = Array.Empty<string>() }); return; }
+    string key = q.ToLowerInvariant();
+    if (_acCache.TryGetValue(key, out var c) && Environment.TickCount64 - c.at < 300000)
+    { Write(ctx, 200, new { names = c.names, cached = true }); return; }
+    try
+    {
+      string url = "https://api.scryfall.com/cards/autocomplete?q=" + Uri.EscapeDataString(q);
+      string body = _http.GetStringAsync(url).GetAwaiter().GetResult();
+      using var doc = JsonDocument.Parse(body);
+      string[] names = doc.RootElement.TryGetProperty("data", out var arr) && arr.ValueKind == JsonValueKind.Array
+        ? arr.EnumerateArray().Select(e => e.GetString() ?? "").Where(s => s.Length > 0).ToArray()
+        : Array.Empty<string>();
+      _acCache[key] = (names, Environment.TickCount64);
+      Write(ctx, 200, new { names });
+    }
+    catch (Exception ex) { Write(ctx, 200, new { names = Array.Empty<string>(), error = ex.Message.Split('\n')[0] }); }
   }
 
   sealed class RequestDto
