@@ -30,7 +30,18 @@ header h1 .g{color:var(--acc)}
 input:disabled{opacity:.5;cursor:not-allowed}
 .tokbar{display:flex;align-items:center;gap:6px}
 .tokbar input{background:var(--panel2);border:1px solid var(--edge);color:var(--ink);border-radius:6px;padding:5px 8px;width:150px;font:12px ui-monospace,Consolas,monospace}
-main{display:grid;grid-template-columns:380px 1fr;gap:16px;padding:16px;align-items:start;max-width:1200px}
+main{display:grid;grid-template-columns:300px minmax(0,1fr) 340px;gap:16px;padding:16px;align-items:start;max-width:1600px}
+.sheetwrap{overflow-x:auto}
+table.sheet{width:100%;border-collapse:collapse;font-size:12px}
+table.sheet th{text-align:left;color:var(--mut);font-weight:600;text-transform:uppercase;letter-spacing:.4px;font-size:10px;padding:6px 8px;border-bottom:1px solid var(--edge);white-space:nowrap}
+table.sheet td{padding:7px 8px;border-bottom:1px solid #ffffff08;vertical-align:middle}
+table.sheet tr:hover td{background:#ffffff06}
+table.sheet td.num{font-variant-numeric:tabular-nums;color:var(--mut)}
+.pill{font-size:11px;padding:2px 7px;border-radius:5px;border:1px solid var(--edge);white-space:nowrap}
+.pill.held{color:var(--ok);border-color:#2ea04355}
+.pill.onloan{color:var(--run);border-color:#1f6feb55}
+.filters{display:flex;gap:8px;margin-bottom:10px}
+.filters input{flex:1;background:var(--panel2);border:1px solid var(--edge);color:var(--ink);border-radius:7px;padding:6px 9px;font:12px system-ui}
 .col{display:flex;flex-direction:column;gap:16px;min-width:0}
 .card{background:var(--panel);border:1px solid var(--edge);border-radius:10px;padding:14px}
 .card h2{font-size:12px;text-transform:uppercase;letter-spacing:.7px;color:var(--mut);margin:0 0 10px;font-weight:600}
@@ -80,7 +91,7 @@ button.recall:hover{border-color:var(--acc)}
 .dir{display:flex;align-items:center;justify-content:space-between;margin-top:12px}
 .warn{display:none;background:#3d1f1f;border:1px solid var(--bad);color:#ffb4ae;border-radius:7px;padding:8px 10px;font-size:12px;margin:0 16px}
 .commit-warn{color:var(--warn);font-size:11px;margin-top:6px;display:none}
-@media(max-width:820px){main{grid-template-columns:1fr}}
+@media(max-width:1100px){main{grid-template-columns:1fr}}
 </style></head><body>
 <header>
   <h1>&#9670; MTGO TradeBot <span class="g">Vault</span></h1>
@@ -102,10 +113,6 @@ button.recall:hover{border-color:var(--acc)}
         <button class="mini" onclick="prune()" title="Delete leftover Lending/SwapOffer trade binders (regenerated on demand)">prune stale binders</button>
         <span class="muted" id="prunemsg" style="font-size:11px"></span>
       </div>
-    </section>
-    <section class="card">
-      <h2>On loan <span class="muted" id="loancount"></span></h2>
-      <div id="loans"><div class="muted">nothing out on loan</div></div>
     </section>
     <section class="card">
       <h2>Compose trade</h2>
@@ -133,6 +140,20 @@ button.recall:hover{border-color:var(--acc)}
   </div>
   <div class="col">
     <section class="card">
+      <h2>Accounting <span class="muted" id="hcount"></span></h2>
+      <div class="muted" style="margin:-4px 0 10px;font-size:11px">what the bot custodies — who it's from, who it can go to, and where it is</div>
+      <div class="filters">
+        <input id="fplayer" placeholder="filter by player…" oninput="renderSheet()">
+        <input id="fcard" placeholder="filter by card…" oninput="renderSheet()">
+      </div>
+      <div class="sheetwrap"><table class="sheet">
+        <thead><tr><th>Card</th><th>Printing</th><th>From</th><th>Qty</th><th>Can lend to</th><th>Status</th><th></th></tr></thead>
+        <tbody id="sheet"><tr><td colspan="7" class="muted">no holdings yet</td></tr></tbody>
+      </table></div>
+    </section>
+  </div>
+  <div class="col">
+    <section class="card">
       <h2>Jobs <span class="muted" id="qdepth"></span></h2>
       <div id="jobs"><div class="muted">no jobs yet &mdash; compose one on the left</div></div>
     </section>
@@ -146,7 +167,7 @@ button.recall:hover{border-color:var(--acc)}
 <script>
 function $(id){return document.getElementById(id);}
 function tok(){return localStorage.getItem('tbtoken')||'';}
-function saveTok(){localStorage.setItem('tbtoken',$('tok').value.trim());$('authwarn').style.display='none';tick();vault();health();loansTick();}
+function saveTok(){localStorage.setItem('tbtoken',$('tok').value.trim());$('authwarn').style.display='none';tick();vault();health();holdingsTick();}
 async function api(path,opts){opts=opts||{};opts.headers=Object.assign({'Authorization':'Bearer '+tok()},opts.headers||{});
   const r=await fetch(path,opts);if(r.status===401)$('authwarn').style.display='block';return r;}
 function el(t,a,k){const e=document.createElement(t);for(const x in(a||{}))e.setAttribute(x,a[x]);(k||[]).forEach(c=>e.append(c));return e;}
@@ -176,20 +197,31 @@ async function prune(){const m=$('prunemsg');m.textContent='pruning…';
     m.textContent=r.ok?('pruned '+(d.pruned||0)+' binder(s)'):('failed: '+(d.error||('HTTP '+r.status)));}
   catch(e){m.textContent='error';}
   setTimeout(()=>{m.textContent='';},6000);}
-async function loansTick(){try{const r=await api('/loans');if(!r.ok)return;const {loans}=await r.json();
-  const open=(loans||[]).filter(l=>l.status==='open');
-  $('loancount').textContent=open.length?('· '+open.reduce((a,l)=>a+l.qty,0)+' card(s) out'):'';
-  const box=$('loans');
-  if(!open.length){box.innerHTML='<div class="muted">nothing out on loan</div>';return;}
-  box.innerHTML='';open.forEach(l=>{const d=el('div',{class:'loan'});
-    d.innerHTML='<div class="top"><span class="who">'+esc(l.borrower)+'</span>'
-      +'<button class="mini recall" onclick="recall(\''+l.id+'\')">recall</button></div>'
-      +'<div class="items"><b>'+l.qty+'× '+esc(l.card)+'</b> <span class="muted">· printing '+l.catId+' · lent '+ago(l.lentAt)+'</span></div>';
-    box.append(d);});
-}catch(e){}}
-async function recall(id){try{const r=await api('/loans/'+id+'/recall',{method:'POST'});let d={};try{d=await r.json();}catch(e){}
+let allHoldings=[];
+async function holdingsTick(){try{const r=await api('/holdings');if(!r.ok)return;const j=await r.json();allHoldings=j.holdings||[];renderSheet();}catch(e){}}
+function renderSheet(){
+  const fp=($('fplayer').value||'').trim().toLowerCase(), fc=($('fcard').value||'').trim().toLowerCase();
+  const rows=allHoldings.filter(h=>{
+    const players=[h.owner,h.borrower].concat(h.canLendTo||[]).filter(Boolean).join(' ').toLowerCase();
+    return (!fp||players.includes(fp)) && (!fc||(h.card||'').toLowerCase().includes(fc));
+  });
+  const onloan=allHoldings.filter(h=>h.status==='onloan').length;
+  $('hcount').textContent=allHoldings.length?('· '+allHoldings.length+' held, '+onloan+' on loan'):'';
+  const tb=$('sheet');
+  if(!rows.length){tb.innerHTML='<tr><td colspan="7" class="muted">'+(allHoldings.length?'no holdings match the filter':'no holdings yet — deposits and lends show up here')+'</td></tr>';return;}
+  tb.innerHTML='';rows.forEach(h=>{
+    const from=(h.owner==='house')?'<span class="muted">house</span>':esc(h.owner);
+    const canlend=(h.canLendTo&&h.canLendTo.length)?esc(h.canLendTo.join(', ')):'<span class="muted">anyone</span>';
+    const status=(h.status==='onloan')?'<span class="pill onloan">on loan → '+esc(h.borrower||'?')+'</span>':'<span class="pill held">held</span>';
+    const act=(h.status==='onloan')?'<button class="mini recall" onclick="recall(\''+h.id+'\')">recall</button>':'';
+    const tr=el('tr');
+    tr.innerHTML='<td><b>'+esc(h.card)+'</b></td><td class="num">'+h.catId+'</td><td>'+from+'</td><td class="num">'+h.qty+'</td><td>'+canlend+'</td><td>'+status+'</td><td>'+act+'</td>';
+    tb.append(tr);
+  });
+}
+async function recall(id){try{const r=await api('/holdings/'+id+'/recall',{method:'POST'});let d={};try{d=await r.json();}catch(e){}
   if(!r.ok){alert('recall failed: '+(d.error||('HTTP '+r.status)));return;}
-  tick();loansTick();}catch(e){}}
+  tick();holdingsTick();}catch(e){}}
 $('ocommit').addEventListener('change',e=>{$('cwarn').style.display=e.target.checked?'block':'none';});
 async function queue(){const o={partner:$('partner').value.trim(),give:rows('give'),receive:rows('receive'),commit:$('ocommit').checked,waitMinutes:parseInt($('wait').value)||0};
   if(!o.partner){alert('partner required');return;}
@@ -238,7 +270,7 @@ async function health(){try{const r=await api('/health');if(!r.ok)return;const h
 function esc(s){return String(s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));}
 $('tok').value=tok();
 addRow('give');updateDir();
-tick();vault();health();loansTick();setInterval(tick,1500);setInterval(vault,15000);setInterval(health,5000);setInterval(loansTick,5000);
+tick();vault();health();holdingsTick();setInterval(tick,1500);setInterval(vault,15000);setInterval(health,5000);setInterval(holdingsTick,5000);
 </script></body></html>
 """;
 }

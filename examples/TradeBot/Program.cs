@@ -2267,8 +2267,8 @@ using (var exec = new TradeExecutor { AllowCommit = allowCommit })
         },
         s => Line(s));
 
-      var loans = new TradeBot.LoanStore();
-      Line($"[serve] loan ledger: {TradeBot.LoanStore.DefaultPath} ({loans.Open().Count} open loan(s)).");
+      var holdings = new TradeBot.HoldingStore();
+      Line($"[serve] holdings ledger: {TradeBot.HoldingStore.DefaultPath} ({holdings.Active().Count} active).");
       var svc = new TradeBot.TradeService(
         token: token, bind: bind, port: port, conn: conn, perJobTimeoutSec: perJobTimeout, commitArmed: allowCommit,
         tradeFn: (partner, give, receive, jobCommit, waitSec) =>
@@ -2312,7 +2312,7 @@ using (var exec = new TradeExecutor { AllowCommit = allowCommit })
                           .Select(k => (name: k.Key, qty: k.Value)).ToList();
           return (tix, byName.Count, top);
         },
-        loans: loans,
+        holdings: holdings,
         log: s => Line(s));
 
       Line($"[serve] trade service (give / deposit / swap) as {whoami}; per-job wait {perJobTimeout}s; " +
