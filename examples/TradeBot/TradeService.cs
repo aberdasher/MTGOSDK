@@ -50,8 +50,8 @@ public sealed class TradeJob
   public string? FinishedAt { get; set; }
 
   // Convenience for the worker/dispatch: TradeItem list -> (name, qty) tuples.
-  public List<(string name, int qty)> GiveTuples() => Give.Select(i => (i.Name, Math.Max(1, i.Qty))).ToList();
-  public List<(string name, int qty)> ReceiveTuples() => Receive.Select(i => (i.Name, Math.Max(1, i.Qty))).ToList();
+  public List<(string name, int qty, int catId)> GiveTuples() => Give.Select(i => (i.Name, Math.Max(1, i.Qty), i.CatId)).ToList();
+  public List<(string name, int qty, int catId)> ReceiveTuples() => Receive.Select(i => (i.Name, Math.Max(1, i.Qty), i.CatId)).ToList();
 }
 
 /// <summary>
@@ -70,7 +70,7 @@ public sealed class TradeService
   readonly int _perJobTimeoutSec;
   readonly bool _commitArmed;   // master arm (from --commit); false => service can never commit (dashboard reflects this)
   // (partner, give[(name,qty)], receive[(name,qty)], commit, yesTimeoutSec) => (ok, detail)
-  readonly Func<string, List<(string name, int qty)>, List<(string name, int qty)>, bool, int, (bool ok, string detail)> _tradeFn;
+  readonly Func<string, List<(string name, int qty, int catId)>, List<(string name, int qty, int catId)>, bool, int, (bool ok, string detail)> _tradeFn;
   // (partner, card, catId, qty, commit, waitSec) => (ok, detail) — recall: receive the EXACT owed printing
   readonly Func<string, string, int, int, bool, int, (bool ok, string detail)> _recallFn;
   readonly Action<string> _log;
@@ -98,7 +98,7 @@ public sealed class TradeService
   }
 
   public TradeService(string token, string bind, int port, MtgoConnection conn, int perJobTimeoutSec, bool commitArmed,
-    Func<string, List<(string name, int qty)>, List<(string name, int qty)>, bool, int, (bool ok, string detail)> tradeFn,
+    Func<string, List<(string name, int qty, int catId)>, List<(string name, int qty, int catId)>, bool, int, (bool ok, string detail)> tradeFn,
     Func<string, string, int, int, bool, int, (bool ok, string detail)> recallFn,
     Func<(int tix, int distinct, List<(string name, int qty)> top)>? vaultFn,
     HoldingStore holdings,
@@ -297,7 +297,7 @@ public sealed class TradeService
   static List<TradeItem> ItemsFrom(List<ItemDto>? items) =>
     (items ?? new())
       .Where(i => !string.IsNullOrWhiteSpace(i?.Name))
-      .Select(i => new TradeItem { Name = i!.Name!.Trim(), Qty = Math.Max(1, i.Qty ?? 1) })
+      .Select(i => new TradeItem { Name = i!.Name!.Trim(), Qty = Math.Max(1, i.Qty ?? 1), CatId = Math.Max(0, i.CatId ?? 0) })
       .ToList();
 
   static string Fmt(List<TradeItem> xs) => string.Join(", ", xs.Select(i => i.ToString()));
@@ -536,6 +536,7 @@ public sealed class TradeService
   {
     public string? Name { get; set; }
     public int? Qty { get; set; }
+    public int? CatId { get; set; }   // exact printing (from a .dek import)
   }
 
   sealed class AllowDto { public List<string>? Borrowers { get; set; } }

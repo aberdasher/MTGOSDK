@@ -49,6 +49,9 @@ label{display:block;font-size:12px;color:var(--mut);margin:8px 0 4px}
 input[type=text],input[type=number]{background:var(--panel2);border:1px solid var(--edge);color:var(--ink);border-radius:7px;padding:7px 9px;width:100%;font:13px system-ui}
 input[type=number]{width:64px}
 .row{display:flex;gap:6px;align-items:center;margin:5px 0}.row input[type=text]{flex:1}
+.cattag{align-self:center;font-size:10px;color:var(--acc);opacity:.75;font-variant-numeric:tabular-nums;white-space:nowrap}
+input[type=file]{color:var(--mut);font-size:11px}
+input[type=file]::file-selector-button{background:#20262e;color:var(--ink);border:1px solid var(--edge);border-radius:6px;padding:4px 8px;margin-right:8px;cursor:pointer;font-size:11px}
 button{background:#20262e;color:var(--ink);border:1px solid var(--edge);border-radius:7px;padding:7px 12px;cursor:pointer;font-size:13px}
 button:hover{border-color:var(--acc)}button.primary{background:var(--acc);color:#1a1206;border-color:var(--acc);font-weight:600}
 button.mini{padding:2px 8px;font-size:12px}
@@ -122,6 +125,8 @@ button.recall:hover{border-color:var(--acc)}
       <button class="mini" onclick="addRow('give')">+ give</button>
       <label>Receive <span class="muted">(cards / tix the bot takes)</span></label><div id="receive"></div>
       <button class="mini" onclick="addRow('receive')">+ receive</button>
+      <label>Import a .dek <span class="muted">(exact printings)</span></label>
+      <div class="row"><input type="file" id="dek" accept=".dek,.xml" style="flex:1;min-width:0"><select id="dekside" style="width:auto"><option value="give">&rarr; give</option><option value="receive">&rarr; receive</option></select><button class="mini" onclick="importDek()">load</button></div>
       <label>Wait for partner <span class="muted">(online + reply YES)</span></label>
       <select id="wait">
         <option value="0">until they're ready (recommended)</option>
@@ -171,13 +176,27 @@ function saveTok(){localStorage.setItem('tbtoken',$('tok').value.trim());$('auth
 async function api(path,opts){opts=opts||{};opts.headers=Object.assign({'Authorization':'Bearer '+tok()},opts.headers||{});
   const r=await fetch(path,opts);if(r.status===401)$('authwarn').style.display='block';return r;}
 function el(t,a,k){const e=document.createElement(t);for(const x in(a||{}))e.setAttribute(x,a[x]);(k||[]).forEach(c=>e.append(c));return e;}
-function addRow(kind,name,qty){const box=$(kind);const row=el('div',{class:'row'});
+function addRow(kind,name,qty,catId){const box=$(kind);const row=el('div',{class:'row'});
+  if(catId)row.dataset.catid=catId;
   const n=el('input',{type:'text',placeholder:'Card name or Event Ticket',list:'cardnames'});n.value=name||'';
   const q=el('input',{type:'number',min:'1'});q.value=qty||'1';
   const rm=el('button',{class:'mini'});rm.textContent='×';rm.onclick=()=>{row.remove();updateDir();};
-  n.oninput=(e)=>{updateDir();onCardInput(e);};row.append(n,q,rm);box.append(row);updateDir();}
+  const tag=el('span',{class:'cattag'});tag.textContent=catId?('#'+catId):'';if(catId)tag.title='exact printing '+catId;
+  n.oninput=(e)=>{delete row.dataset.catid;tag.textContent='';updateDir();onCardInput(e);};  // manual edit drops the exact printing
+  row.append(n,q,tag,rm);box.append(row);updateDir();}
 function rows(kind){return[...$(kind).children].map(r=>{const i=r.querySelectorAll('input');
-  return{name:i[0].value.trim(),qty:parseInt(i[1].value)||1};}).filter(x=>x.name);}
+  return{name:i[0].value.trim(),qty:parseInt(i[1].value)||1,catId:parseInt(r.dataset.catid)||0};}).filter(x=>x.name);}
+function parseDek(text){try{const doc=new DOMParser().parseFromString(text,'application/xml');
+  if(doc.getElementsByTagName('parsererror').length)return null;
+  const raw=[...doc.getElementsByTagName('Cards')].map(c=>({catId:parseInt(c.getAttribute('CatID'))||0,name:(c.getAttribute('Name')||'').trim(),qty:parseInt(c.getAttribute('Quantity'))||1})).filter(c=>c.name);
+  const by={};raw.forEach(c=>{const k=c.catId+'|'+c.name.toLowerCase();if(by[k])by[k].qty+=c.qty;else by[k]={catId:c.catId,name:c.name,qty:c.qty};});
+  return Object.values(by);}catch(e){return null;}}
+async function importDek(){const f=$('dek').files[0];if(!f){alert('choose a .dek file first');return;}
+  let text;try{text=await f.text();}catch(e){alert('could not read the file');return;}
+  const cards=parseDek(text);
+  if(!cards||!cards.length){alert('no cards found — is this an MTGO .dek?');return;}
+  const side=$('dekside').value;$(side).innerHTML='';
+  cards.forEach(c=>addRow(side,c.name,c.qty,c.catId));updateDir();}
 function updateDir(){const g=rows('give').length,r=rows('receive').length;const d=$('dir');let t='—',c='';
   if(g>0&&r===0){t='LEND (give)';c='request';}else if(g===0&&r>0){t='DEPOSIT (receive)';c='deposit';}else if(g>0&&r>0){t='SWAP';c='swap';}
   d.textContent=t;d.className='badge '+c;}

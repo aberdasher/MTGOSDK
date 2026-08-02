@@ -13,5 +13,6 @@ public sealed class TradeItem
 {
   public string Name { get; set; } = "";
   public int Qty { get; set; } = 1;
-  public override string ToString() => $"{Qty}x {Name}";
+  public int CatId { get; set; }    // exact printing (0 = unspecified — resolve by name)
+  public override string ToString() => CatId > 0 ? $"{Qty}x {Name} (cat {CatId})" : $"{Qty}x {Name}";
 }

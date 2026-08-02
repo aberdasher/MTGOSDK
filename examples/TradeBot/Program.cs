@@ -951,8 +951,8 @@ static bool RunGrabFlow(TradeBot.TradeExecutor exec, string partner, string card
 //   single give(qty1) + receive  -> RunSwapFlow (give one card, request the listed cards)
 // `allowCommit` here is the EFFECTIVE commit (caller already ANDed process + job commit).
 static (bool ok, string detail) RunTrade(TradeBot.TradeExecutor exec, string partner,
-    System.Collections.Generic.List<(string name, int qty)> give,
-    System.Collections.Generic.List<(string name, int qty)> receive,
+    System.Collections.Generic.List<(string name, int qty, int catId)> give,
+    System.Collections.Generic.List<(string name, int qty, int catId)> receive,
     bool allowCommit, int yesTimeoutSec = 300)
 {
   give = (give ?? new()).Where(i => !string.IsNullOrWhiteSpace(i.name) && i.qty > 0).ToList();
@@ -960,7 +960,7 @@ static (bool ok, string detail) RunTrade(TradeBot.TradeExecutor exec, string par
   if (string.IsNullOrWhiteSpace(partner)) return (false, "no partner");
   if (give.Count == 0 && receive.Count == 0) return (false, "nothing to give or receive");
 
-  static string Fmt(System.Collections.Generic.List<(string name, int qty)> xs) =>
+  static string Fmt(System.Collections.Generic.List<(string name, int qty, int catId)> xs) =>
     string.Join(", ", xs.Select(i => i.qty > 1 ? $"{i.qty}x {i.name}" : i.name));
 
   bool giveOnly = give.Count > 0 && receive.Count == 0;
@@ -972,15 +972,15 @@ static (bool ok, string detail) RunTrade(TradeBot.TradeExecutor exec, string par
   bool ok; string okDetail, failDetail;
   if (giveOnly)
   {
-    ok = RunLend(exec, partner, give, allowCommit: allowCommit, keepOpen: false, yesTimeoutSec: yesTimeoutSec);
+    ok = RunLend(exec, partner, give.Select(g => (g.name, g.qty)).ToList(), allowCommit: allowCommit, keepOpen: false, yesTimeoutSec: yesTimeoutSec);
     okDetail = allowCommit ? $"committed — gave {Fmt(give)}" : $"dry-run — reached ready, gave nothing ({Fmt(give)})";
     failDetail = "not completed (declined / grab incomplete / guardrail)";
   }
   else if (recvOnly && receive.Count == 1)
   {
     var r = receive[0];
-    ok = RunGrabFlow(exec, partner, r.name, allowCommit: allowCommit, yesTimeoutSec: yesTimeoutSec, qty: r.qty);
-    okDetail = allowCommit ? $"committed — received {Fmt(receive)}" : $"dry-run — reached ready, received nothing ({Fmt(receive)})";
+    ok = RunGrabFlow(exec, partner, r.name, allowCommit: allowCommit, yesTimeoutSec: yesTimeoutSec, qty: r.qty, requiredCat: r.catId);
+    okDetail = allowCommit ? $"committed — received {Fmt(receive)}{(r.catId > 0 ? $" (printing {r.catId})" : "")}" : $"dry-run — reached ready, received nothing ({Fmt(receive)})";
     failDetail = "not completed (cards not presented / took-from-us / guardrail)";
   }
   else if (give.Count == 1 && give[0].qty == 1 && receive.Count > 0)
