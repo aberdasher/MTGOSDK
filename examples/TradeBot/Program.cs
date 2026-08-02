@@ -794,10 +794,14 @@ static bool RunGrabCycle(TradeBot.TradeExecutor exec, MTGOSDK.API.Trade.TradeEsc
 // handshake, present it, wait for them to grab all of it (reminding on an early
 // submit / cancelling on extras), submit our deposit, re-verify, then approve.
 static bool RunLend(TradeBot.TradeExecutor exec, string recipient,
-    System.Collections.Generic.List<(string name, int qty)> intended, bool allowCommit,
+    System.Collections.Generic.List<(string name, int qty, int catId)> intended, bool allowCommit,
     bool keepOpen = false, int yesTimeoutSec = 300)
 {
   var giveNames = intended.SelectMany(it => System.Linq.Enumerable.Repeat(it.name, System.Math.Max(1, it.qty))).ToList();
+  // (name, exact-catId) flattened by qty — pins the Lending binder to the EXACT printings when
+  // specified (catId > 0), so the partner can only grab that version.
+  var giveItems = intended.SelectMany(it => System.Linq.Enumerable.Repeat((it.name, it.catId), System.Math.Max(1, it.qty))).ToList();
+  var intended2 = intended.Select(i => (i.name, i.qty)).ToList();   // name+qty for the give guardrail
   // Human-readable list, e.g. "3x Kozilek's Command". Used for BOTH console and DMs —
   // do NOT wrap it in [ ] in a DM: MTGO chat treats [text] as a card-link and renders a
   // comma/qty blob as empty (recipient saw "Ready for ?").
@@ -805,7 +809,7 @@ static bool RunLend(TradeBot.TradeExecutor exec, string recipient,
   int totalQty = intended.Sum(it => it.qty);
   string cardCount = totalQty == 1 ? "the card" : $"all {totalQty} cards";
 
-  var lendBinder = exec.EnsureBinderExact("Lending", giveNames);
+  var lendBinder = exec.EnsureBinderExact("Lending", giveItems);
   if (lendBinder is null) { Line("Could not build the Lending binder — aborting."); return false; }
   Line($"Lending binder ready: '{lendBinder.Name}' (id={lendBinder.Id}, items={lendBinder.ItemCount}).");
 
@@ -830,7 +834,7 @@ static bool RunLend(TradeBot.TradeExecutor exec, string recipient,
     var c = MTGOSDK.API.Trade.TradeManager.CurrentTrade;
     if (c is null) { Line("Trade closed before they finished grabbing."); return false; }
     esc = c;
-    var (missing, extra, exact) = exec.GiveStatus(c, intended);
+    var (missing, extra, exact) = exec.GiveStatus(c, intended2);
 
     if (extra.Count > 0)
     {
@@ -879,7 +883,7 @@ static bool RunLend(TradeBot.TradeExecutor exec, string recipient,
   }
   if (!approveReady) { Line("Did not reach approval-ready — cancelling."); exec.CancelCurrent(); WaitForNoTrade(); return false; }
 
-  if (!exec.GiveStatus(esc, intended).exact)
+  if (!exec.GiveStatus(esc, intended2).exact)
   {
     Line("GUARDRAIL re-check FAILED at approval — cancelling (gives nothing).");
     try { exec.Cancel(esc); } catch { } WaitForNoTrade();
@@ -972,7 +976,7 @@ static (bool ok, string detail) RunTrade(TradeBot.TradeExecutor exec, string par
   bool ok; string okDetail, failDetail;
   if (giveOnly)
   {
-    ok = RunLend(exec, partner, give.Select(g => (g.name, g.qty)).ToList(), allowCommit: allowCommit, keepOpen: false, yesTimeoutSec: yesTimeoutSec);
+    ok = RunLend(exec, partner, give, allowCommit: allowCommit, keepOpen: false, yesTimeoutSec: yesTimeoutSec);
     okDetail = allowCommit ? $"committed — gave {Fmt(give)}" : $"dry-run — reached ready, gave nothing ({Fmt(give)})";
     failDetail = "not completed (declined / grab incomplete / guardrail)";
   }
@@ -2160,7 +2164,7 @@ using (var exec = new TradeExecutor { AllowCommit = allowCommit })
       // "extra" instead of "missing 1", and it cancels a valid partial grab.
       var intended = giveCards
           .GroupBy(n => n, StringComparer.OrdinalIgnoreCase)
-          .Select(g => (name: g.Key, qty: g.Count()))
+          .Select(g => (name: g.Key, qty: g.Count(), catId: 0))
           .ToList();
       string cardList = string.Join(", ", intended.Select(it => it.qty > 1 ? $"{it.qty}x {it.name}" : it.name));
       if (recipient.Length == 0) { Line("Usage: lend <recipient> [card] [--cards=\"A,B,C\"] [--commit] --yes"); break; }

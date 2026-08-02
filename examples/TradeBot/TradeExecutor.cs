@@ -1171,12 +1171,24 @@ public sealed class TradeExecutor : IDisposable
     return (-1, 0);
   }
 
-  /// <summary>
-  /// Create (or reuse) a trade binder named <paramref name="binderName"/>
-  /// containing one of each of <paramref name="cardNames"/> (quantity 1 each).
-  /// Operates entirely on THIS (the bot's) account. Returns the Binder, or null.
-  /// </summary>
+  /// <summary>Owned quantity of an EXACT printing (catId). 0 if not owned.</summary>
+  public int OwnedQtyOfCat(int catId)
+  {
+    try { foreach (var it in MTGOSDK.API.Collection.CollectionManager.Collection.Items) if ((Try(() => it.Id) ?? -1) == catId) return Try(() => it.Quantity) ?? 0; }
+    catch { }
+    return 0;
+  }
+
+  /// <summary>Name-only overload — resolves an OWNED printing per name (catId 0 each).</summary>
   public MTGOSDK.API.Collection.Binder? CreateBinder(string binderName, System.Collections.Generic.IReadOnlyList<string> cardNames)
+    => CreateBinder(binderName, cardNames.Select(n => (n, 0)).ToList());
+
+  /// <summary>
+  /// Create (or reuse) a trade binder named <paramref name="binderName"/> containing the given
+  /// cards. Each item may pin an EXACT printing (catId &gt; 0) — so a lend hands over the specific
+  /// version; catId 0 resolves an owned printing by name. Returns the Binder, or null.
+  /// </summary>
+  public MTGOSDK.API.Collection.Binder? CreateBinder(string binderName, System.Collections.Generic.IReadOnlyList<(string name, int catId)> items)
   {
     var existing = MTGOSDK.API.Collection.CollectionManager.Binders
       .FirstOrDefault(b => string.Equals(Try(() => b.Name) ?? "", binderName, StringComparison.OrdinalIgnoreCase));
@@ -1186,25 +1198,28 @@ public sealed class TradeExecutor : IDisposable
       return existing;
     }
 
-    // Resolve each card name to its underlying ICardDefinition (skip unresolved).
-    // PREFER a printing we actually OWN — otherwise the binder shows EMPTY to a
-    // trade partner (they only see owned copies of the exact printing).
+    // Resolve each item to its underlying ICardDefinition. Prefer the EXACT requested printing
+    // (catId) when we OWN it; else fall back to any owned printing of the name (an unowned
+    // printing shows EMPTY to a partner). This is what makes a lend hand over the right version.
     var defs = new List<dynamic>();
-    foreach (var cn in cardNames)
+    foreach (var (cn, wantCat) in items)
     {
       dynamic d = null;
       try
       {
-        var (ownedCat, ownedQty) = ResolveOwnedPrinting(cn);
-        if (ownedCat > 0)
+        int useCat = wantCat;
+        if (useCat > 0 && OwnedQtyOfCat(useCat) <= 0)
+        { Log($"[binder] don't OWN requested printing catId={useCat} of '{cn}' — falling back to an owned printing."); useCat = 0; }
+        if (useCat <= 0) { var (oc, _) = ResolveOwnedPrinting(cn); useCat = oc; }
+        if (useCat > 0)
         {
-          d = Unbind(MTGOSDK.API.Collection.CollectionManager.GetCard(ownedCat));
-          Log($"[binder] resolved '{cn}' -> OWNED printing catId={ownedCat} (qty {ownedQty}).");
+          d = Unbind(MTGOSDK.API.Collection.CollectionManager.GetCard(useCat));
+          Log($"[binder] '{cn}' -> printing catId={useCat}{(wantCat > 0 && wantCat == useCat ? " (exact, requested)" : "")}.");
         }
         else
         {
           d = Unbind(MTGOSDK.API.Collection.CollectionManager.GetCard(cn));
-          Log($"[binder] '{cn}': NOT owned in any printing — using default printing; binder will show EMPTY to partners.");
+          Log($"[binder] '{cn}': NOT owned in any printing — default printing; binder will show EMPTY to partners.");
         }
       }
       catch (Exception ex) { Log($"[binder] could not resolve '{cn}' — skipping ({ex.Message.Split('\n')[0]})"); }
@@ -1242,7 +1257,7 @@ public sealed class TradeExecutor : IDisposable
       System.Threading.Thread.Sleep(1500);
       var found = MTGOSDK.API.Collection.CollectionManager.Binders
         .FirstOrDefault(b => string.Equals(Try(() => b.Name) ?? "", binderName, StringComparison.OrdinalIgnoreCase));
-      if (found != null && BinderHasExactly(found, cardNames))
+      if (found != null && BinderHasExactly(found, items))
       {
         Log($"[binder] '{found.Name}' ready (id={Try(() => found.Id)}, items={Try(() => found.ItemCount)}).");
         return found;
@@ -1252,7 +1267,7 @@ public sealed class TradeExecutor : IDisposable
         // Same-named binder exists but with the WRONG contents — a stale binder the (cold) binder
         // list hid from the earlier check, now colliding. Clear it before retrying so we NEVER
         // return the wrong card (this was the original bug's failure mode).
-        Log($"[binder] '{binderName}' present but contents != [{string.Join(", ", cardNames)}] — clearing + retrying.");
+        Log($"[binder] '{binderName}' present but contents don't match the request — clearing + retrying.");
         DeleteBinder(binderName);
       }
       if (attempt < 3) { Log($"[binder] retrying create of '{binderName}' in 2s..."); System.Threading.Thread.Sleep(2000); }
@@ -1338,17 +1353,20 @@ public sealed class TradeExecutor : IDisposable
   /// the binder, or null. Owned-printing resolution applies (see CreateBinder).
   /// </summary>
   public MTGOSDK.API.Collection.Binder? EnsureBinderExact(string binderName, System.Collections.Generic.IReadOnlyList<string> cardNames)
+    => EnsureBinderExact(binderName, cardNames.Select(n => (n, 0)).ToList());
+
+  public MTGOSDK.API.Collection.Binder? EnsureBinderExact(string binderName, System.Collections.Generic.IReadOnlyList<(string name, int catId)> items)
   {
     var existing = MTGOSDK.API.Collection.CollectionManager.Binders
       .FirstOrDefault(b => string.Equals(Try(() => b.Name) ?? "", binderName, StringComparison.OrdinalIgnoreCase));
     if (existing != null)
     {
-      // Already holds EXACTLY the requested card(s)? Reuse as-is and skip the delete —
+      // Already holds EXACTLY the requested card(s)/printing(s)? Reuse as-is and skip the delete —
       // DeleteGrouping can time out when MTGO's UI thread is briefly busy, and the previous
       // bug was reusing a STALE binder after a failed delete (offered the wrong card).
-      if (BinderHasExactly(existing, cardNames))
+      if (BinderHasExactly(existing, items))
       {
-        Log($"[binder] existing '{binderName}' already holds exactly [{string.Join(", ", cardNames)}] — reusing.");
+        Log($"[binder] existing '{binderName}' already holds exactly [{string.Join(", ", items.Select(i => i.catId > 0 ? $"{i.name}#{i.catId}" : i.name))}] — reusing.");
         return existing;
       }
       // Stale contents — clear it, RETRYING since the delete can transiently time out. If we
@@ -1365,17 +1383,32 @@ public sealed class TradeExecutor : IDisposable
         return null;
       }
     }
-    return CreateBinder(binderName, cardNames);
+    return CreateBinder(binderName, items);
   }
 
-  // True iff the binder's contents are EXACTLY the requested cards (name -> count). Best-effort:
-  // any read failure returns false, so we fall through to the safe delete+recreate path.
-  bool BinderHasExactly(MTGOSDK.API.Collection.Binder binder, System.Collections.Generic.IReadOnlyList<string> cardNames)
+  // True iff the binder's contents are EXACTLY the requested items. If every item pins a printing
+  // (catId > 0) we match by catId (exact version); otherwise by name -> count. Best-effort: any
+  // read failure returns false, so we fall through to the safe delete+recreate path.
+  bool BinderHasExactly(MTGOSDK.API.Collection.Binder binder, System.Collections.Generic.IReadOnlyList<(string name, int catId)> items)
   {
     try
     {
+      if (items.Count > 0 && items.All(i => i.catId > 0))
+      {
+        var wantC = new System.Collections.Generic.Dictionary<int, int>();
+        foreach (var i in items) wantC[i.catId] = (wantC.TryGetValue(i.catId, out var c) ? c : 0) + 1;
+        var haveC = new System.Collections.Generic.Dictionary<int, int>();
+        foreach (var it in binder.Items)
+        {
+          int id = Try(() => it.Id) ?? 0; int q = Try(() => it.Quantity) ?? 0;
+          if (id > 0 && q > 0) haveC[id] = (haveC.TryGetValue(id, out var c) ? c : 0) + q;
+        }
+        if (wantC.Count != haveC.Count) return false;
+        foreach (var kv in wantC) if (!haveC.TryGetValue(kv.Key, out var q) || q != kv.Value) return false;
+        return true;
+      }
       var want = new System.Collections.Generic.Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
-      foreach (var n in cardNames) want[n] = (want.TryGetValue(n, out var c) ? c : 0) + 1;
+      foreach (var i in items) want[i.name] = (want.TryGetValue(i.name, out var c) ? c : 0) + 1;
       var have = new System.Collections.Generic.Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
       foreach (var it in binder.Items)
       {
