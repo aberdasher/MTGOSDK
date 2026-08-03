@@ -13,6 +13,46 @@ Sealed01 holds tix + cards on behalf of players. **Only moving value in/out of M
 (deposit / withdraw) needs a trade.** Everything internal (settling debts, lending cards
 between players) is a ledger op with no trade.
 
+### Two ledgers: obligations vs physical (the mental model)
+There are **two ledgers answering two different questions**, and the bridge between them is where
+the work is:
+
+- **Obligation ledger** — *who is owed what.* Append-only intent: "bot owes A a Griselbrand",
+  "loser owes winner 3 tix", "B owes bot a Griselbrand". Never moves a card by itself.
+- **Physical ledger** — *what the bot actually holds.* The vault's real MTGO contents (ground truth
+  = Sealed01's collection). **Built:** holdings + vault + trade log.
+
+**Update vs resolution** are distinct operations:
+- **Update (accrue):** book a new obligation (a draft ends; a deposit lands). Obligation ledger
+  only — no trade.
+- **Resolution (settle):** fulfil an obligation. **Most resolutions are internal claim-moves, not
+  trades** — a trade fires *only* when value crosses the bot boundary (deposit in / withdraw out).
+  - *Lazy (fungible / tix):* re-assign the claim (A −N, B +N); the tix never leave the vault → 0 trades.
+  - *Eager (cards to play):* the card must reach the borrower's client, so a lend is a real
+    bot→borrower trade.
+
+**Lending lifecycle** (A deposits Griselbrand, then it's lent to B):
+
+| Event | Physical | Obligation booked | A's claim backing |
+|---|---|---|---|
+| Deposit A→bot | +card in vault | **bot ⟶ A** | funded (card in vault) |
+| Lend bot→B | −card (to B) | **B ⟶ bot** (only new entry) | receivable (backed by B) |
+| Return B→bot | +card in vault | clear **B ⟶ bot** | funded again |
+| Withdraw A→out | −card (to A) | clear **bot ⟶ A** | — |
+
+The `bot ⟶ A` debt is **booked at the deposit** and just persists, changing only its *funding
+status* as the card moves on/off loan. One `Holding{owner:A, borrower:B}` row carries both debts
+(`owner` = the bot⟶A debt; `borrower` set = the B⟶bot debt *and* the "A is now a receivable" signal).
+
+**Reconciliation invariant:** at every instant each **"bot owes"** is backed by *either* inventory
+*or* a matching **"owes bot"** — so `physical == Σ funded claims`, and the bot's own net position is
+always **flat** (pure intermediary; the real obligation is B ⟶ A routed through the bot).
+
+**Built vs missing:** physical ledger ✅. Tix wallets (fungible claim ledger) ❌; debt accrual from
+draft results ❌; the **resolution engine** (read obligations → decide internal-move vs trade) ❌.
+First brick: the tix wallet + the `physical == Σ claims` audit — resolution needs claims to move
+between before any of the internal-settle logic makes sense.
+
 ### Tix wallet
 Each player has a wallet balance = tix stored in the system.
 
