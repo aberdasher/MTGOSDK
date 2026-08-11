@@ -518,6 +518,72 @@ static MTGOSDK.API.Trade.TradeEscrow? HandshakeThenInitiate(
   return TryReachNegotiation(exec, partner, presentBinder, negotiateWaitSec: 90);
 }
 
+// ── The shared finalize tail for EVERY trade flow ──────────────────────────────
+// submit deposit → wait approval-ready → re-verify the guardrail → dry-run cancel
+// or ConfirmTrade → wait Closed → done-DM + ledger tail. One implementation so the
+// safety-critical phase is provably identical across lend/swap/grab. Returns true
+// iff committed; always sets TradeBot.TradeExecutor.LastFlowDetail.
+static bool FinalizeTrade(TradeBot.TradeExecutor exec, string partner,
+    Func<MTGOSDK.API.Trade.TradeEscrow, bool> guardrail, bool allowCommit,
+    string commitLabel, string? doneDm)
+{
+  exec.SubmitDeposit();
+  MTGOSDK.API.Trade.TradeEscrow? esc = null;
+  bool approveReady = false;
+  for (int ms = 0; ms < 30_000 && !approveReady; ms += 300)
+  {
+    System.Threading.Thread.Sleep(300);
+    var c = MTGOSDK.API.Trade.TradeManager.CurrentTrade;
+    if (c is null) { TradeBot.TradeExecutor.LastFlowDetail = "trade closed before approval"; Line("Trade closed before approval."); return false; }
+    esc = c; string sst = c.State.ToString();
+    if (ms % 3_000 < 300) Line($"  t+{ms / 1000,2}s state={sst}");
+    if (sst.StartsWith("Approval")) approveReady = true;
+  }
+  if (!approveReady)
+  {
+    TradeBot.TradeExecutor.LastFlowDetail = "never reached approval-ready";
+    Line("Did not reach approval-ready — cancelling.");
+    exec.CancelCurrent(); WaitForNoTrade();
+    return false;
+  }
+
+  // RE-VERIFY right before committing (belt and suspenders).
+  if (!guardrail(esc!))
+  {
+    TradeBot.TradeExecutor.LastFlowDetail = "guardrail re-check failed at approval";
+    Line("GUARDRAIL re-check FAILED at approval — cancelling (moves nothing).");
+    try { exec.Cancel(esc!); } catch { } WaitForNoTrade();
+    try { exec.SendDM(partner, "Cancelled at the final check for safety."); } catch { }
+    return false;
+  }
+
+  if (!allowCommit)
+  {
+    TradeBot.TradeExecutor.LastFlowDetail = "dry-run — ready at approval, no --commit";
+    Line("\n[dry-run] Approval-ready + guardrail OK; no --commit -> cancelling (nothing moved).");
+    try { exec.Cancel(esc!); } catch { } WaitForNoTrade();
+    Line("Re-run with `--commit --yes` to actually complete it.");
+    return false;
+  }
+
+  Line($"\n*** COMMITTING the {commitLabel} (ConfirmTrade) ***");
+  exec.ConfirmTrade();
+  for (int ms = 0; ms < 40_000; ms += 300)
+  {
+    System.Threading.Thread.Sleep(300);
+    var c = MTGOSDK.API.Trade.TradeManager.CurrentTrade;
+    if (c is null) { Line($"{commitLabel} complete — client clear."); break; }
+    if (ms % 3_000 < 300) Line($"  t+{ms / 1000,2}s state={c.State}");
+    if (c.State == MTGOSDK.API.Trade.Enums.TradeState.Closed) break;
+  }
+  if (doneDm != null) { try { exec.SendDM(partner, doneDm); } catch { } }
+  Line("\nLedger (latest):");
+  var lp = TradeBot.TradeExecutor.LedgerPath;
+  if (System.IO.File.Exists(lp)) foreach (var l in System.IO.File.ReadAllLines(lp).Reverse().Take(1)) Line("  " + l);
+  TradeBot.TradeExecutor.LastFlowDetail = $"committed — {commitLabel} complete";
+  return true;
+}
+
 // One SWAP cycle from a live negotiating escrow to completion: find the GET card in
 // the partner's presented binder (cancel if unavailable), request it, wait until
 // BOTH sides are EXACTLY right (cancel if incomplete), submit our deposit,
@@ -609,52 +675,10 @@ static bool RunSwapCycle(TradeBot.TradeExecutor exec, MTGOSDK.API.Trade.TradeEsc
   }
   Line("All required cards secured and you grabbed my offer — finalizing.");
 
-  // submit our deposit; wait for approval-ready.
-  exec.SubmitDeposit();
-  bool approveReady = false; string sst = "?";
-  for (int i = 0; i < 30 && !approveReady; i++)
-  {
-    System.Threading.Thread.Sleep(1000);
-    var c = MTGOSDK.API.Trade.TradeManager.CurrentTrade;
-    if (c is null) { Line("Trade closed before approval."); return false; }
-    esc = c; sst = c.State.ToString();
-    if (i % 3 == 0) Line($"  t+{i,2}s state={sst}");
-    if (sst.StartsWith("Approval")) approveReady = true;
-  }
-  if (!approveReady) { Line("Did not reach approval-ready — cancelling."); exec.CancelCurrent(); WaitForNoTrade(); return false; }
-
-  // RE-VERIFY both sides right before committing (belt and suspenders).
-  if (!(GiveIsExactly(esc) && getNames.All(w => ReceiveHas(esc, w))))
-  {
-    Line("Guardrail re-check FAILED at approval — cancelling (moves nothing).");
-    try { exec.Cancel(esc); } catch { } WaitForNoTrade();
-    try { exec.SendDM(partner, "Cancelled at the final check for safety."); } catch { }
-    return false;
-  }
-
-  if (!allowCommit)
-  {
-    Line("\n[dry-run] Both sides ready + guardrail OK; no --commit -> cancelling (nothing moved).");
-    try { exec.Cancel(esc); } catch { } WaitForNoTrade();
-    Line("Re-run with `--commit --yes` to actually complete the swap.");
-    return false;
-  }
-
-  Line("\n*** COMMITTING the swap (ConfirmTrade) ***");
-  exec.ConfirmTrade();
-  for (int i = 0; i < 40; i++)
-  {
-    System.Threading.Thread.Sleep(1000);
-    var c = MTGOSDK.API.Trade.TradeManager.CurrentTrade;
-    if (c is null) { Line("Swap complete — client clear."); break; }
-    if (i % 3 == 0) Line($"  t+{i,2}s state={c.State}");
-    if (c.State == MTGOSDK.API.Trade.Enums.TradeState.Closed) break;
-  }
-  try { exec.SendDM(partner, $"Done — you got {giveQty} {giveCard}, I got {wantList}. Thanks!"); } catch { }
-  Line("\nLedger (latest):");
-  var slp = TradeBot.TradeExecutor.LedgerPath;
-  if (System.IO.File.Exists(slp)) foreach (var l in System.IO.File.ReadAllLines(slp).Reverse().Take(1)) Line("  " + l);
-  return true;
+  return FinalizeTrade(exec, partner,
+      c => GiveIsExactly(c) && getNames.All(w => ReceiveHas(c, w)),
+      allowCommit, "swap",
+      $"Done — you got {giveQty} {giveCard}, I got {wantList}. Thanks!");
 }
 
 // One GRAB cycle from a live negotiating escrow to completion: request the card
@@ -728,50 +752,10 @@ static bool RunGrabCycle(TradeBot.TradeExecutor exec, MTGOSDK.API.Trade.TradeEsc
   if (!ready) { Line("Didn't secure the cards in time — cancelling."); exec.CancelCurrent(); WaitForNoTrade(); return false; }
   Line($"GUARDRAIL passed: we receive exactly {qtyCard} and give nothing.");
 
-  exec.SubmitDeposit();
-  bool approveReady = false; string st = "?";
-  for (int ms = 0; ms < 30_000 && !approveReady; ms += 300)
-  {
-    System.Threading.Thread.Sleep(300);
-    var c = MTGOSDK.API.Trade.TradeManager.CurrentTrade;
-    if (c is null) { Line("Trade closed before approval."); return false; }
-    st = c.State.ToString(); esc = c;
-    if (ms % 3_000 < 300) Line($"  t+{ms/1000,2}s state={st}");
-    if (st.StartsWith("Approval")) approveReady = true;
-  }
-  if (!approveReady) { Line("Did not reach approval-ready — cancelling."); exec.CancelCurrent(); WaitForNoTrade(); return false; }
-
-  if (!exec.VerifyReceiveIsOnly(esc, card, qty))
-  {
-    Line("GUARDRAIL re-check FAILED at approval — cancelling.");
-    try { exec.Cancel(esc); } catch { } WaitForNoTrade();
-    try { exec.SendDM(partner, "Cancelled at the final check for safety."); } catch { }
-    return false;
-  }
-
-  if (!allowCommit)
-  {
-    Line("\n[dry-run] Approval-ready + guardrail OK; no --commit -> cancelling (received nothing).");
-    try { exec.Cancel(esc); } catch { } WaitForNoTrade();
-    Line("Re-run with `--commit --yes` to actually take the card.");
-    return false;
-  }
-
-  Line("\n*** COMMITTING the grab (ConfirmTrade) ***");
-  exec.ConfirmTrade();
-  for (int ms = 0; ms < 40_000; ms += 300)
-  {
-    System.Threading.Thread.Sleep(300);
-    var c = MTGOSDK.API.Trade.TradeManager.CurrentTrade;
-    if (c is null) { Line("Grab complete — client clear."); break; }
-    if (ms % 3_000 < 300) Line($"  t+{ms/1000,2}s state={c.State}");
-    if (c.State == MTGOSDK.API.Trade.Enums.TradeState.Closed) break;
-  }
-  try { exec.SendDM(partner, $"Thanks — got {qtyCard}!"); } catch { }
-  Line("\nLedger (latest):");
-  var glp = TradeBot.TradeExecutor.LedgerPath;
-  if (System.IO.File.Exists(glp)) foreach (var l in System.IO.File.ReadAllLines(glp).Reverse().Take(1)) Line("  " + l);
-  return true;
+  return FinalizeTrade(exec, partner,
+      c => exec.VerifyReceiveIsOnly(c, card, qty),
+      allowCommit, "grab",
+      $"Thanks — got {qtyCard}!");
 }
 
 // ── Full one-shot flows (handshake → cycle → commit), shared by the interactive
@@ -857,49 +841,10 @@ static bool RunLend(TradeBot.TradeExecutor exec, string recipient,
   }
   Line("GUARDRAIL passed: we give exactly the intended set and receive nothing.");
 
-  exec.SubmitDeposit();
-  string sst = "?"; bool approveReady = false;
-  for (int ms = 0; ms < 30_000 && !approveReady; ms += 300)
-  {
-    System.Threading.Thread.Sleep(300);
-    var c = MTGOSDK.API.Trade.TradeManager.CurrentTrade;
-    if (c is null) { Line("Trade closed before approval."); return false; }
-    sst = c.State.ToString(); esc = c;
-    if (ms % 3_000 < 300) Line($"  t+{ms/1000,2}s state={sst}");
-    if (sst.StartsWith("Approval")) approveReady = true;
-  }
-  if (!approveReady) { Line("Did not reach approval-ready — cancelling."); exec.CancelCurrent(); WaitForNoTrade(); return false; }
-
-  if (!exec.GiveStatus(esc, intended2).exact)
-  {
-    Line("GUARDRAIL re-check FAILED at approval — cancelling (gives nothing).");
-    try { exec.Cancel(esc); } catch { } WaitForNoTrade();
-    try { exec.SendDM(recipient, "Cancelled at the final check for safety."); } catch { }
-    return false;
-  }
-
-  if (!allowCommit)
-  {
-    Line("\n[dry-run] Approval-ready + guardrail OK; no commit → cancelling (gave nothing).");
-    try { exec.Cancel(esc); } catch { } WaitForNoTrade();
-    return false;
-  }
-
-  Line("\n*** COMMITTING the give (ConfirmTrade) ***");
-  exec.ConfirmTrade();
-  for (int ms = 0; ms < 40_000; ms += 300)
-  {
-    System.Threading.Thread.Sleep(300);
-    var c = MTGOSDK.API.Trade.TradeManager.CurrentTrade;
-    if (c is null) { Line("Give complete — client clear."); break; }
-    if (ms % 3_000 < 300) Line($"  t+{ms/1000,2}s state={c.State}");
-    if (c.State == MTGOSDK.API.Trade.Enums.TradeState.Closed) break;
-  }
-  try { exec.SendDM(recipient, $"Done — enjoy {cardList}!"); } catch { }
-  Line("\nLedger (latest):");
-  var lpl = TradeBot.TradeExecutor.LedgerPath;
-  if (System.IO.File.Exists(lpl)) foreach (var l in System.IO.File.ReadAllLines(lpl).Reverse().Take(1)) Line("  " + l);
-  return true;
+  return FinalizeTrade(exec, recipient,
+      c => exec.GiveStatus(c, intended2).exact,
+      allowCommit, "give",
+      $"Done — enjoy {cardList}!");
 }
 
 // SWAP: give one card, request one-or-more back. Ensures the SwapOffer binder,
@@ -960,6 +905,7 @@ static (bool ok, string detail) RunTrade(TradeBot.TradeExecutor exec, string par
   // yesTimeoutSec is the READINESS wait (how long to wait for the partner to be online + reply
   // YES); int.MaxValue = "until they're ready". The grab/completion phase stays bounded inside
   // each flow. An operator cancel (exec.AbortRequested) breaks the wait -> "cancelled" below.
+  TradeBot.TradeExecutor.LastFlowDetail = null;   // flows that reach the finalize phase report the REAL outcome here
   bool ok; string okDetail, failDetail;
   if (giveOnly)
   {
@@ -986,7 +932,8 @@ static (bool ok, string detail) RunTrade(TradeBot.TradeExecutor exec, string par
 
   if (ok) return (true, okDetail);
   if (exec.AbortRequested) return (false, "cancelled by operator");
-  return (false, failDetail);
+  // Prefer the flow's actual reason (set by FinalizeTrade) over the canned per-shape guess.
+  return (false, TradeBot.TradeExecutor.LastFlowDetail ?? failDetail);
 }
 
 // Given a negotiating escrow, stage the requested card (non-committing) and HOLD
@@ -1219,6 +1166,32 @@ using (var exec = new TradeExecutor { AllowCommit = allowCommit })
     Environment.Exit(4); return;
   }
   Line($"Connected as {whoami} (MTGO {Client.Version})\n");
+
+  // CLI custody recorder — the serve subscribes its own (job-aware) recorder, but every
+  // OTHER committing mode records here via the executor's TradeCompleted event, so no
+  // mode can forget custody. Semantics mirror the serve: lend of a CARD = recallable
+  // house loan; tix gives and swap/grab gives = permanent transfers (release any held
+  // deposits of the partner's). Receives outside the serve are house acquisitions —
+  // the vault itself tracks those (ledger.log records the raw event).
+  if (mode != "serve")
+  {
+    var cliHoldings = new TradeBot.HoldingStore();
+    exec.TradeCompleted += (partner, given, received) =>
+    {
+      foreach (var g in given)
+      {
+        bool isTix = string.Equals(g.Name, "Event Ticket", StringComparison.OrdinalIgnoreCase);
+        if (mode == "lend" && !isTix)
+        { var h = cliHoldings.RecordHouseLoan(g.Name, g.CatId, g.Qty, partner); Line($"[holding] {partner} borrowed {g.Qty}x {g.Name} (cat {g.CatId}) — house loan {h.Id}"); }
+        else
+        {
+          int released = cliHoldings.ConsumeDeposits(partner, g.Name, g.Qty);
+          Line($"[holding] gave {g.Qty}x {g.Name} to {partner}" +
+               (released > 0 ? $" — released {released} from their held deposits" : " (permanent transfer, nothing owed back)"));
+        }
+      }
+    };
+  }
 
   switch (mode)
   {

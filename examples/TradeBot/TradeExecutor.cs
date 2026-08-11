@@ -117,6 +117,11 @@ public sealed class TradeExecutor : IDisposable
   /// bounced. Null until a trade has closed this session.</summary>
   public string? LastCloseReason { get; private set; }
 
+  /// <summary>The REAL outcome of the last flow run (success or the actual failure
+  /// reason) — set by the flows' shared finalize tail; RunTrade/the serve report it
+  /// instead of a canned per-shape guess. Static: one flow runs at a time.</summary>
+  public static string? LastFlowDetail;
+
   /// <summary>How many cards the last RequestViaWishlist matched against the
   /// partner's presented trade binder (&gt;0 means the card IS in their offer, even
   /// if it hasn't landed on our receive side yet).</summary>
