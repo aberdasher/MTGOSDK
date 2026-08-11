@@ -6,9 +6,10 @@
   ------------
   MTGO holds cards in escrow and transfers NOTHING until BOTH parties send a
   final approval. That single "final approve" is the only asset-moving step.
-  This class funnels that one call through FinalApprove(), which throws unless
-  AllowCommit == true. Everything else (invite, add items, submit deposit list,
-  cancel, trade posts) is non-committing / reversible.
+  This class funnels that one call through ConfirmTrade() (the view-model
+  ExecuteConfirmTradeCommand path), which throws unless AllowCommit == true.
+  Everything else (invite, submit deposit list, cancel, trade posts) is
+  non-committing / reversible.
 
   All remote types are addressed by string query-path, so this file needs NO
   direct reference to the WotC.* assemblies.
@@ -101,6 +102,15 @@ public sealed class TradeExecutor : IDisposable
   public IReadOnlyList<TradedItemInfo> LastCompletedReceived { get; private set; } = new List<TradedItemInfo>();
   public string? LastCompletedPartner { get; private set; }
   public long CompletedTradeSeq { get; private set; }
+
+  /// <summary>
+  /// Fired once per COMMITTED trade (FinalState == TradeComplete) with
+  /// (partner, given, received). This is THE custody hook: every flow — serve job or
+  /// CLI mode — completes through here, so recording subscribed once can never be
+  /// forgotten by a new flow. Subscriber exceptions are swallowed (never break the
+  /// state handler).
+  /// </summary>
+  public event Action<string, IReadOnlyList<TradedItemInfo>, IReadOnlyList<TradedItemInfo>>? TradeCompleted;
 
   /// <summary>FinalState of the most recently CLOSED trade (e.g. "TradeComplete",
   /// "OtherBusyTrading", "UserCanceledTrade"). Lets callers explain why an invite
@@ -287,15 +297,6 @@ public sealed class TradeExecutor : IDisposable
     return TradeManager.CurrentTrade;   // may be null for a tick
   }
 
-  // ─────────────────────────────────────────────────────────────────────────
-  // NON-COMMITTING escrow steps.
-  // ─────────────────────────────────────────────────────────────────────────
-  public void AcceptInvite(TradeEscrow escrow)
-  {
-    dynamic remote = Unbind(escrow);
-    OnUI(() => ProcessAction(remote, A_InviteAccept, BuildAction(A_InviteAccept)));
-  }
-
   /// <summary>
   /// Read-only: dump what the partner (freebot) offers in negotiation + the
   /// escrow's item/want/deposit method surface, to work out how to grab a card.
@@ -346,9 +347,6 @@ public sealed class TradeExecutor : IDisposable
     Log("[trade] advanced binder selection (SendTradeInvitationReqAction) — invite dispatched");
   }
 
-  const string BinderSelectorVM  = "Shiny.Trade.ViewModels.BinderSelectorDialogViewModel";
-  const string SelectableBinderT = "Shiny.Trade.ViewModels.SelectableBinder";
-
   /// <summary>
   /// Make <paramref name="binderName"/> the client's LAST-USED binder. The trade
   /// invite (SendTradeInvitationReqAction, dispatched by AdvanceBinderSelection) is
@@ -371,53 +369,6 @@ public sealed class TradeExecutor : IDisposable
       return true;
     }
     catch (Exception ex) { Log($"[binder] set LastUsedBinder failed: {ex.GetType().Name}: {ex.Message.Split('\n')[0]}"); return false; }
-  }
-
-  /// <summary>
-  /// At InviteSelectBinder, present a SPECIFIC binder so the partner sees ONLY that
-  /// binder's cards. Drives MTGO's own binder-selector dialog VM the way a human
-  /// does: Initialize(escrow) → set Selected to a SelectableBinder wrapping the
-  /// named binder → ExecuteOkCommand (records the chosen binder for THIS escrow AND
-  /// dispatches the invite). Non-committing. Returns true iff the OK command ran;
-  /// on any failure returns false so the caller can fall back to
-  /// AdvanceBinderSelection (which still dispatches the invite, but with the
-  /// default/last-used binder).
-  /// </summary>
-  public bool PresentBinder(TradeEscrow escrow, string binderName)
-  {
-    var binder = MTGOSDK.API.Collection.CollectionManager.Binders
-      .FirstOrDefault(b => string.Equals(Try(() => b.Name) ?? "", binderName, StringComparison.OrdinalIgnoreCase));
-    if (binder is null) { Log($"[binder] '{binderName}' not found — cannot present it."); return false; }
-
-    bool ok = false;
-    try
-    {
-      OnUI(() =>
-      {
-        dynamic esc = Unbind(escrow);
-        // Build our own dialog VM wired to THIS escrow (same as MTGO's own, which
-        // opens invisibly from the injected thread — we drive ours directly).
-        dynamic dlg = RemoteClient.CreateInstance(BinderSelectorVM);
-        try { dlg.Initialize(esc); }
-        catch (Exception ex) { Log($"[binder] dialog.Initialize threw (continuing): {ex.Message.Split('\n')[0]}"); }
-
-        dynamic ib  = Unbind((object)binder);                          // IBinder
-        dynamic sel = RemoteClient.CreateInstance(SelectableBinderT, ib, dlg); // (IBinder, dialogVM)
-        dlg.Selected = sel;
-
-        bool can = Try<bool>(() => (bool)dlg.CanExecuteOkCommand());
-        if (can) { dlg.ExecuteOkCommand(); ok = true; }
-        else Log("[binder] CanExecuteOkCommand=false after selecting — cannot present via dialog.");
-      });
-    }
-    catch (Exception ex)
-    {
-      Log($"[binder] PresentBinder failed: {ex.GetType().Name}: {ex.Message.Split('\n')[0]}");
-      return false;
-    }
-    Log(ok ? $"[binder] presented '{binderName}' via dialog OkCommand — invite dispatched."
-           : $"[binder] could not present '{binderName}' via dialog.");
-    return ok;
   }
 
   public void Cancel(TradeEscrow escrow)
@@ -876,33 +827,9 @@ public sealed class TradeExecutor : IDisposable
   public void ClearAbort() => AbortRequested = false;
 
   public bool WaitForDMYes(string username, int timeoutSec = 300)
-  {
-    int uid = ResolveUserId(username);
-    if (uid <= 0) return false;
-    var channel = ChannelManager.GetPrivateChannel(uid);
-    int seen = Try(() => channel.Messages.Count) ?? 0;
-    for (int i = 0; i < timeoutSec; i++)
-    {
-      System.Threading.Thread.Sleep(1000);
-      System.Collections.Generic.IList<Message> msgs;
-      try { msgs = channel.Messages; } catch { continue; }
-      for (int m = seen; m < msgs.Count; m++)
-      {
-        string who = SenderName(msgs[m]);
-        string raw = (Try(() => msgs[m].Text) ?? "").Trim();
-        Log($"[dm-log] {(who.Length > 0 ? who : "(?)")}: {raw}");   // diagnostic
-        string txt = raw.ToLowerInvariant();
-        bool isYes = txt == "y" || txt == "yes" || txt.StartsWith("yes") || txt.StartsWith("y ");
-        // Accept when it's a yes AND the sender is either them or name-unavailable
-        // (private DMs often report no sender). A yes with a KNOWN sender that
-        // isn't them (our own echo) is rejected.
-        if (isYes && (who.Length == 0 || string.Equals(who, username, StringComparison.OrdinalIgnoreCase)))
-          return true;
-      }
-      seen = msgs.Count;
-    }
-    return false;
-  }
+    // One YES-watch loop for the whole bot: delegate to the hardened handshake (stale-channel
+    // re-resolve, operator abort, heartbeat diagnostics). null prompt = watch-only, no DMs.
+    => SendPromptWhenOnlineAndWaitForYes(username, null, timeoutSec);
 
   /// <summary>
   /// True if <paramref name="username"/> is logged in AND visible (online) right now.
@@ -919,26 +846,39 @@ public sealed class TradeExecutor : IDisposable
   /// the DM channel whether or not the prompt reached them). Waits up to
   /// <paramref name="timeoutSec"/> seconds (int.MaxValue = until they do). Read-only bar DMs.
   /// </summary>
-  public bool SendPromptWhenOnlineAndWaitForYes(string username, string prompt, int timeoutSec)
+  public bool SendPromptWhenOnlineAndWaitForYes(string username, string? prompt, int timeoutSec)
   {
     int uid = ResolveUserId(username);
-    if (uid <= 0) return false;
+    if (uid <= 0) { Log($"[handshake] cannot resolve a user id for '{username}' — failing."); return false; }
     var channel = ChannelManager.GetPrivateChannel(uid);
-    int seen = Try(() => channel.Messages.Count) ?? 0;
+    int? seen0 = Try(() => (int?)channel.Messages.Count);
+    if (seen0 is null) Log($"[handshake] {username} (uid={uid}): initial Messages read FAILED — channel object may be stale.");
+    int seen = seen0 ?? 0;
+    Log($"[handshake] {username} (uid={uid}): baseline {seen} msg(s); waiting {(timeoutSec >= int.MaxValue / 2 ? "until ready" : timeoutSec + "s")} for YES.");
 
     // Presence-FIRST: only prompt when they're actually online. If already online, prompt now;
     // otherwise HOLD and prompt the moment they come online (a DM to an offline user can be
-    // silently dropped, so prompting into the void is pointless).
-    bool wasOnline = IsUserOnline(username);
-    if (wasOnline) { try { SendDM(username, prompt); } catch (Exception ex) { Log($"[dm] initial prompt threw: {ex.Message.Split('\n')[0]}"); } }
-    else Log($"[presence] {username} is offline — holding; I'll prompt them the moment they come online.");
+    // silently dropped, so prompting into the void is pointless). A null prompt means
+    // watch-only (the WaitForDMYes path): no DMs, so presence isn't consulted at all.
+    bool wasOnline = prompt != null && IsUserOnline(username);
+    if (prompt != null)
+    {
+      Log($"[handshake] presence({username}) = {(wasOnline ? "online" : "offline-or-unknown")}.");
+      if (wasOnline) { try { SendDM(username, prompt); Log($"[dm] prompt sent to {username}."); } catch (Exception ex) { Log($"[dm] initial prompt threw: {ex.Message.Split('\n')[0]}"); } }
+      else Log($"[presence] {username} is offline — holding; I'll prompt them the moment they come online.");
+    }
 
+    // Every reads below is a remote RPC into MTGO; a human replies YES on a human timescale,
+    // so poll gently: messages ~2.5s, presence ~10s. The 500ms tick is kept ONLY so operator
+    // aborts stay responsive — it does no remote work on its own.
+    long lastBeatMs = 0;        // heartbeat pacing
+    long readFails = 0;         // consecutive-read diagnostics
+    string lastReadErr = null;
     for (long ms = 0; ms < (long)timeoutSec * 1000; ms += 500)
     {
       if (AbortRequested) { Log($"[cancel] handshake for {username} aborted by operator."); return false; }
-      // Presence is an RPC that changes slowly — check ~every 1.5s (not every 500ms poll). Prompt
-      // on each offline→online edge so they get a prompt they can actually see.
-      if (ms % 1500 < 500)
+      // Prompt on each offline→online edge so they get a prompt they can actually see.
+      if (prompt != null && ms % 10000 < 500)
       {
         bool online = IsUserOnline(username);
         if (online && !wasOnline)
@@ -949,7 +889,20 @@ public sealed class TradeExecutor : IDisposable
         wasOnline = online;
       }
 
+      // Remote channel wrappers go stale (same failure mode as the stale trade view-model):
+      // a stale one either throws on every read or returns a frozen snapshot whose Count
+      // never grows. Re-resolve a fresh channel object every ~10s (staggered off the
+      // presence slot) so the YES-watch below is always reading live state.
+      if (ms > 0 && ms % 10000 >= 5000 && ms % 10000 < 5500)
+      {
+        var fresh = Try(() => ChannelManager.GetPrivateChannel(uid));
+        if (fresh != null) channel = fresh;
+        else Log($"[handshake] channel re-resolve for {username} failed (uid={uid}).");
+      }
+
       // Watch for a new YES (independent of presence — any yes they type fires the trade).
+      // Skip the remote read on most ticks; ~2.5s latency on a YES is imperceptible.
+      if (ms % 2500 >= 500) { System.Threading.Thread.Sleep(500); continue; }
       try
       {
         var msgs = channel.Messages;
@@ -964,11 +917,27 @@ public sealed class TradeExecutor : IDisposable
             return true;
         }
         seen = msgs.Count;
+        lastReadErr = null;
       }
-      catch { }
+      catch (Exception ex)
+      {
+        readFails++;
+        string err = ex.Message.Split('\n')[0];
+        if (err != lastReadErr) Log($"[handshake] Messages read threw for {username}: {err}");  // log each NEW error, not every poll
+        lastReadErr = err;
+      }
+
+      // Heartbeat every ~30s: this wait must never be invisible again.
+      if (ms - lastBeatMs >= 30000)
+      {
+        lastBeatMs = ms;
+        int? cnt = Try(() => (int?)channel.Messages.Count);
+        Log($"[handshake] waiting for YES from {username} — {ms / 1000}s elapsed, msgs={(cnt.HasValue ? cnt.Value.ToString() : "unreadable")} (baseline {seen}), readFails={readFails}{(lastReadErr != null ? ", lastErr=" + lastReadErr : "")}");
+      }
 
       System.Threading.Thread.Sleep(500);
     }
+    Log($"[handshake] TIMED OUT waiting for YES from {username} ({timeoutSec}s, readFails={readFails}{(lastReadErr != null ? ", lastErr=" + lastReadErr : "")}).");
     return false;
   }
 
@@ -998,37 +967,11 @@ public sealed class TradeExecutor : IDisposable
   }
 
   /// <summary>
-  /// SAFETY GUARDRAIL for a give: true ONLY if WE GIVE is EXACTLY one card whose
-  /// name matches <paramref name="cardName"/> (quantity == expectedQty) and
-  /// nothing else, and WE RECEIVE nothing. Never submit/approve a give that fails
-  /// this — it is what prevents ever handing over more than the one intended card.
-  /// </summary>
-  public bool VerifyGiveIsOnly(TradeEscrow esc, string cardName, int expectedQty = 1)
-  {
-    var give = new List<(string name, int qty)>();
-    try
-    {
-      foreach (var it in esc.TradedItems.CollectionItems)
-        give.Add((Try(() => it.Card?.Name) ?? "?", Try(() => (int)it.Quantity) ?? 0));
-    }
-    catch (Exception ex) { Log($"[guardrail] could not read WE GIVE: {ex.Message}"); return false; }
-
-    int recvCount = 0;
-    try { recvCount = esc.PartnerTradedItems.CollectionItems.Count; } catch { }
-
-    bool nameOk = give.Count == 1 && give[0].qty == expectedQty
-               && (give[0].name?.ToLowerInvariant().Contains(cardName.ToLowerInvariant()) ?? false);
-    bool ok = nameOk && recvCount == 0;
-    Log($"[guardrail] WE GIVE = {(give.Count == 0 ? "(none)" : string.Join(", ", give.Select(g => $"{g.qty}x {g.name}")))}; WE RECEIVE items = {recvCount} => {(ok ? "OK (exactly the target, receiving nothing)" : "REJECT")}");
-    return ok;
-  }
-
-  /// <summary>
   /// SAFETY GUARDRAIL for a one-way GRAB (receive-only): true ONLY if WE RECEIVE is
   /// EXACTLY one card matching <paramref name="cardName"/> (qty == expectedQty) and
-  /// WE GIVE nothing. The mirror of <see cref="VerifyGiveIsOnly"/> — never
-  /// submit/approve a grab unless we're getting exactly the target and handing over
-  /// nothing.
+  /// WE GIVE nothing. Never submit/approve a grab unless we're getting exactly the
+  /// target and handing over nothing. (The give-side guardrail for a set is
+  /// <see cref="GiveStatus"/>.)
   /// </summary>
   public bool VerifyReceiveIsOnly(TradeEscrow esc, string cardName, int expectedQty = 1)
   {
@@ -1100,35 +1043,6 @@ public sealed class TradeExecutor : IDisposable
     return s.IndexOf("DepositReceivedOther", StringComparison.OrdinalIgnoreCase) >= 0
         || s.IndexOf("DepositSubmittedOther", StringComparison.OrdinalIgnoreCase) >= 0
         || s.IndexOf("DepositReceivedBoth", StringComparison.OrdinalIgnoreCase) >= 0;
-  }
-
-  /// <summary>
-  /// SAFETY GUARDRAIL for a two-sided SWAP: true ONLY if WE GIVE is EXACTLY
-  /// {<paramref name="giveQty"/> x <paramref name="giveCard"/>} and WE RECEIVE is
-  /// EXACTLY {<paramref name="getQty"/> x <paramref name="getCard"/>} — nothing
-  /// more on either side. Never submit/approve a swap that fails this: it is what
-  /// guarantees we hand over only the offered card AND actually get the requested
-  /// one (so an incomplete or lopsided deal is cancelled, never committed).
-  /// </summary>
-  public bool VerifySwap(TradeEscrow esc, string giveCard, int giveQty, string getCard, int getQty, bool log = true)
-  {
-    var give = new List<(string name, int qty)>();
-    var recv = new List<(string name, int qty)>();
-    try { foreach (var it in esc.TradedItems.CollectionItems) give.Add((Try(() => it.Card?.Name) ?? "?", Try(() => (int)it.Quantity) ?? 0)); }
-    catch (Exception ex) { Log($"[guardrail] could not read WE GIVE: {ex.Message}"); return false; }
-    try { foreach (var it in esc.PartnerTradedItems.CollectionItems) recv.Add((Try(() => it.Card?.Name) ?? "?", Try(() => (int)it.Quantity) ?? 0)); }
-    catch (Exception ex) { Log($"[guardrail] could not read WE RECEIVE: {ex.Message}"); return false; }
-
-    bool giveOk = give.Count == 1 && give[0].qty == giveQty && (give[0].name?.ToLowerInvariant().Contains(giveCard.ToLowerInvariant()) ?? false);
-    bool recvOk = recv.Count == 1 && recv[0].qty == getQty  && (recv[0].name?.ToLowerInvariant().Contains(getCard.ToLowerInvariant()) ?? false);
-    bool ok = giveOk && recvOk;
-    if (log)
-    {
-      string gs = give.Count == 0 ? "(none)" : string.Join(", ", give.Select(g => $"{g.qty}x {g.name}"));
-      string rs = recv.Count == 0 ? "(none)" : string.Join(", ", recv.Select(r => $"{r.qty}x {r.name}"));
-      Log($"[guardrail] WE GIVE = {gs} (need {giveQty}x {giveCard}); WE RECEIVE = {rs} (need {getQty}x {getCard}) => {(ok ? "OK (both sides exact)" : "REJECT")}");
-    }
-    return ok;
   }
 
   /// <summary>
@@ -1455,38 +1369,6 @@ public sealed class TradeExecutor : IDisposable
     return s.Count > 0 ? string.Join(", ", s) : "(none)";
   }
 
-  /// <summary>
-  /// Offer items into the escrow (non-committing). NOTE: assembling the remote
-  /// CollectionItem[] is the one step still to be finalized against a live
-  /// second-account trade — see caveats. Left as the documented next step.
-  /// </summary>
-  public void AddOfferedItems(TradeEscrow escrow, IReadOnlyList<int> catIds)
-  {
-    dynamic remote = Unbind(escrow);
-    // Pick the live CollectionItem DROs from the active binder that match catIds.
-    var picked = new List<object>();
-    foreach (var item in Map<dynamic>(remote.ActiveBinder.Items))
-      if (Try<bool>(() => catIds.Contains((int)item.CardDefinition.Id)))
-        picked.Add(Unbind(item));
-    Log($"[trade] would offer {picked.Count} item stack(s) via {A_ItemUpdate}.GetInstance(CollectionItem[])");
-    // dynamic items  = <remote CollectionItem[] built from `picked`>;   // TODO: finalize array marshalling
-    // dynamic action = BuildAction(A_ItemUpdate, items);
-    // remote.Process(action);
-  }
-
-  // ─────────────────────────────────────────────────────────────────────────
-  // THE ONLY COMMITTING CALL — gated. In dry-run this throws; never runs.
-  // ─────────────────────────────────────────────────────────────────────────
-  public void FinalApprove(TradeEscrow escrow)
-  {
-    if (!AllowCommit)
-      throw new InvalidOperationException(
-        "FinalApprove BLOCKED: AllowCommit is false (dry-run). No assets moved.");
-    dynamic remote = Unbind(escrow);
-    OnUI(() => ProcessAction(remote, A_FinalApprove, BuildAction(A_FinalApprove)));
-    Log($"[trade] FINAL APPROVE sent for escrow {escrow.Id} (commit).");
-  }
-
   // Dispatch a ClientAction into the escrow. ITradeEscrow.Process is GENERIC —
   // Process<T>(T message) — and a plain dynamic `dro.Process(action)` cannot
   // convey the type argument T over the remoting bridge (the fast path only
@@ -1533,7 +1415,7 @@ public sealed class TradeExecutor : IDisposable
 
     Action<TradeEscrow, (TradeState Old, TradeState New)> changed = (e, s) =>
     {
-      // Observe only. The bot never sends the commit (FinalApprove is gated).
+      // Observe only. The bot never sends the commit here (ConfirmTrade is gated).
       Log($"[event] StateChanged {s.Old} -> {s.New} partner={Try(() => e.TradePartnerName) ?? "?"}");
 
       // Capture escrow accounting as the trade progresses (a closed escrow can't
@@ -1559,6 +1441,8 @@ public sealed class TradeExecutor : IDisposable
           // Publish the completed trade for the serve's loan tracking (NOT reset below).
           LastCompletedGiven = _lastGivenS; LastCompletedReceived = _lastReceivedS;
           LastCompletedPartner = _lastPartner; CompletedTradeSeq++;
+          try { TradeCompleted?.Invoke(_lastPartner ?? "?", LastCompletedGiven, LastCompletedReceived); }
+          catch (Exception ex) { Log($"[event] TradeCompleted subscriber threw: {ex.Message.Split('\n')[0]}"); }
         }
         else
           Log($"[ledger] trade ended '{fs}' — no assets moved, no ledger entry.");

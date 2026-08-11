@@ -42,6 +42,7 @@ public sealed class TradeJob
   public int WaitSec { get; init; } = int.MaxValue;    // readiness wait for partner (online+YES); MaxValue = until ready
   public int CatId { get; init; }                      // recall: the exact printing to reclaim
   public string? LoanId { get; init; }                 // recall: the loan being settled
+  public string? Intent { get; init; }                 // give custody semantics: "loan" | "withdraw"; null = infer (tix=withdraw, cards=loan)
   public volatile bool Cancelled;                      // operator cancel (before/at pickup, or via abort while running)
   public JobState State { get; set; } = JobState.Queued;
   public string Detail { get; set; } = "";
@@ -82,6 +83,10 @@ public sealed class TradeService
   readonly BlockingCollection<TradeJob> _queue = new(new ConcurrentQueue<TradeJob>());
   readonly List<string> _logRing = new();   // last N service log lines, for the dashboard /log
   object? _vaultCache;                       // last good /vault snapshot (reused while a trade runs)
+  readonly object _vaultScanLock = new();    // single-flight: concurrent /vault callers share one scan
+  DateTime _vaultAt = DateTime.MinValue;     // when the snapshot was taken
+  long _vaultSeq = -1;                       // CompletedTradeSeq the snapshot reflects
+  const int VaultTtlSec = 60;                // only a completed trade changes the vault; TTL guards drift
   volatile string? _runningJobId;            // id of the job the worker is executing now (for cancel)
 
   static readonly JsonSerializerOptions JsonIn = new() { PropertyNameCaseInsensitive = true };
@@ -287,7 +292,8 @@ public sealed class TradeService
     int waitSec = dto.WaitMinutes.HasValue
       ? (dto.WaitMinutes.Value <= 0 ? int.MaxValue : dto.WaitMinutes.Value * 60)
       : _perJobTimeoutSec;
-    var job = new TradeJob { Id = NewId(), Type = type, User = user, Give = give, Receive = receive, Commit = commit, WaitSec = waitSec };
+    var job = new TradeJob { Id = NewId(), Type = type, User = user, Give = give, Receive = receive, Commit = commit, WaitSec = waitSec,
+                             Intent = dto.Intent?.Trim().ToLowerInvariant() };
     _jobs[job.Id] = job;
     _queue.Add(job);
     _log($"[serve] queued {job.Id}: {type} user={user} give=[{Fmt(give)}] receive=[{Fmt(receive)}] commit={commit} wait={(waitSec >= int.MaxValue / 2 ? "until-ready" : waitSec + "s")}");
@@ -311,6 +317,44 @@ public sealed class TradeService
     return diff == 0;
   }
 
+  // The job whose trade is currently executing — context for OnTradeCompleted (one job at a
+  // time on one worker, so a single field is unambiguous).
+  volatile TradeJob? _custodyJob;
+
+  // THE custody recorder: fires once per COMMITTED trade, from the executor's own completion
+  // event, so no flow can forget to record. Semantics:
+  //   deposit job  -> a held holding owned by the depositor (custody FOR them).
+  //   give, intent "loan"     -> a recallable house loan (borrower owes it back).
+  //   give, intent "withdraw" -> value going OUT for good (a DraftBot withdrawal or payment):
+  //                              nothing owed back; release any held deposits of theirs.
+  //   defaults when the caller doesn't say: swap gives and ALL tix gives are permanent
+  //   transfers ("withdraw" — tix claims are DraftBot's ledger, never loans); card gives on
+  //   /request default to "loan" (the recallable-lending business). Swap receives are house
+  //   acquisitions — the vault itself tracks those; no custody row.
+  void OnTradeCompleted(string partner, IReadOnlyList<TradeExecutor.TradedItemInfo> given, IReadOnlyList<TradeExecutor.TradedItemInfo> received)
+  {
+    var job = _custodyJob;
+    if (job is null || !string.Equals(partner, job.User, StringComparison.OrdinalIgnoreCase)) return;
+    if (job.Type == "recall") return;   // the worker settles the specific loan itself
+    foreach (var g in given)
+    {
+      bool isTix = string.Equals(g.Name, "Event Ticket", StringComparison.OrdinalIgnoreCase);
+      string intent = job.Intent ?? ((job.Type == "trade" || isTix) ? "withdraw" : "loan");
+      if (intent == "withdraw")
+      {
+        int released = _holdings.ConsumeDeposits(job.User, g.Name, g.Qty);
+        _log($"[holding] {job.User} withdrew {g.Qty}x {g.Name}" +
+             (released > 0 ? $" — released {released} from their held deposits"
+                           : " — no held deposits to release (claim accounting lives in DraftBot)"));
+      }
+      else
+      { var h = _holdings.RecordHouseLoan(g.Name, g.CatId, g.Qty, job.User); _log($"[holding] {job.User} borrowed {g.Qty}x {g.Name} (cat {g.CatId}) — house loan {h.Id}"); }
+    }
+    if (job.Type == "deposit")
+      foreach (var rc in received)
+      { var h = _holdings.RecordDeposit(job.User, rc.Name, rc.CatId, rc.Qty); _log($"[holding] {job.User} deposited {rc.Qty}x {rc.Name} (cat {rc.CatId}) — holding {h.Id} (owner {job.User})"); }
+  }
+
   void WorkerLoop()
   {
     foreach (var job in _queue.GetConsumingEnumerable())
@@ -328,7 +372,12 @@ public sealed class TradeService
       _conn.Exec.ClearAbort();   // fresh cancel state for this job
       _log($"[serve] running {job.Id} ({job.Type} user={job.User}) — readiness wait: {(job.WaitSec >= int.MaxValue / 2 ? "until partner is ready" : job.WaitSec + "s")}");
       _conn.EnsureHealthy();   // block here until MTGO is reachable again (survives a client restart)
-      long seqBefore = _conn.Exec.CompletedTradeSeq;
+      // Custody recording rides the executor's TradeCompleted event (fires at trade close,
+      // BEFORE the flow returns) — re-arm on the CURRENT executor each job, because a
+      // reconnect can swap in a fresh executor and a one-time subscription would be lost.
+      _conn.Exec.TradeCompleted -= OnTradeCompleted;
+      _conn.Exec.TradeCompleted += OnTradeCompleted;
+      _custodyJob = job;
       try
       {
         (bool ok, string detail) r;
@@ -347,27 +396,12 @@ public sealed class TradeService
         else
         {
           r = _tradeFn(job.User, job.GiveTuples(), job.ReceiveTuples(), job.Commit, job.WaitSec);
-          // Record custody: a committed GIVE = a house loan (borrower now holds the bot's card); a
-          // committed DEPOSIT = a held holding owned by the depositor. Wait for the trade-complete
-          // handler to publish the structured trade, and match the partner.
-          if (r.ok && (job.Type == "request" || job.Type == "deposit"))
-          {
-            for (int i = 0; i < 20 && _conn.Exec.CompletedTradeSeq == seqBefore; i++) Thread.Sleep(150);
-            if (string.Equals(_conn.Exec.LastCompletedPartner, job.User, StringComparison.OrdinalIgnoreCase))
-            {
-              if (job.Type == "request")
-                foreach (var g in _conn.Exec.LastCompletedGiven)
-                { var h = _holdings.RecordHouseLoan(g.Name, g.CatId, g.Qty, job.User); _log($"[holding] {job.User} borrowed {g.Qty}x {g.Name} (cat {g.CatId}) — house loan {h.Id}"); }
-              else
-                foreach (var rc in _conn.Exec.LastCompletedReceived)
-                { var h = _holdings.RecordDeposit(job.User, rc.Name, rc.CatId, rc.Qty); _log($"[holding] {job.User} deposited {rc.Qty}x {rc.Name} (cat {rc.CatId}) — holding {h.Id} (owner {job.User})"); }
-            }
-          }
         }
         job.State = r.ok ? JobState.Done : JobState.Failed;
         job.Detail = r.detail;
       }
       catch (Exception ex) { job.State = JobState.Failed; job.Detail = ex.Message; }
+      _custodyJob = null;
       _runningJobId = null;
       job.FinishedAt = DateTime.UtcNow.ToString("o");
       _log($"[serve] {job.Id} -> {job.State.ToString().ToLowerInvariant()} ({job.Detail})");
@@ -431,22 +465,34 @@ public sealed class TradeService
     finally { try { ctx.Response.OutputStream.Close(); } catch { } }
   }
 
-  // Owned tix + top holdings for the dashboard. Reading the collection touches MTGO, so DON'T
-  // race the worker: while a trade runs (or we're reconnecting) the worker owns the client —
-  // return the last good snapshot instead. Otherwise recompute + cache.
+  // Owned tix + top holdings for the dashboard. Reading the collection touches MTGO (a full
+  // per-item RPC scan — expensive), so (a) DON'T race the worker: while a trade runs or we're
+  // reconnecting, return the last good snapshot; (b) only a COMPLETED trade changes the vault,
+  // so serve the cached snapshot until CompletedTradeSeq moves or the TTL lapses; (c) single-
+  // flight the scan so overlapping dashboard tabs / DraftBot polls share one pass.
   void HandleVault(HttpListenerContext ctx)
   {
     if (_vaultFn == null) { Write(ctx, 200, new { available = false, custodian = _conn.Account, reason = "vault read not wired" }); return; }
     bool busy = _conn.Reconnecting || _jobs.Values.Any(j => j.State == JobState.Running);
-    if (!busy)
+    long seq = 0; try { seq = _conn.Exec.CompletedTradeSeq; } catch { }
+    bool Fresh() => _vaultCache != null && _vaultSeq == seq
+                    && (DateTime.UtcNow - _vaultAt).TotalSeconds < VaultTtlSec;
+    if (!busy && !Fresh())
     {
-      try
+      lock (_vaultScanLock)
       {
-        var v = _vaultFn();
-        _vaultCache = new { available = true, custodian = _conn.Account, tix = v.tix, distinct = v.distinct,
-          top = v.top.Select(t => new { name = t.name, qty = t.qty }).ToList(), at = DateTime.UtcNow.ToString("o") };
+        if (!Fresh())   // a concurrent caller may have refreshed while we waited
+        {
+          try
+          {
+            var v = _vaultFn();
+            _vaultCache = new { available = true, custodian = _conn.Account, tix = v.tix, distinct = v.distinct,
+              top = v.top.Select(t => new { name = t.name, qty = t.qty }).ToList(), at = DateTime.UtcNow.ToString("o") };
+            _vaultAt = DateTime.UtcNow; _vaultSeq = seq;
+          }
+          catch (Exception ex) { _vaultCache ??= new { available = false, custodian = _conn.Account, reason = ex.Message.Split('\n')[0] }; }
+        }
       }
-      catch (Exception ex) { _vaultCache ??= new { available = false, custodian = _conn.Account, reason = ex.Message.Split('\n')[0] }; }
     }
     Write(ctx, 200, _vaultCache ?? new { available = false, custodian = _conn.Account, reason = "snapshot pending (busy)" });
   }
@@ -530,6 +576,7 @@ public sealed class TradeService
     public List<ItemDto>? Receive { get; set; }      // /trade
     public int? WaitMinutes { get; set; }            // readiness wait; <=0 or 0 => until ready (unbounded)
     public bool? Commit { get; set; }
+    public string? Intent { get; set; }              // give custody: "loan" | "withdraw"; absent = infer (tix=withdraw, cards=loan)
   }
 
   sealed class ItemDto

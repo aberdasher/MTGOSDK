@@ -77,6 +77,35 @@ public sealed class HoldingStore
     return h;
   }
 
+  /// <summary>
+  /// A player WITHDREW something they had in custody (e.g. tix going back out) — the
+  /// opposite of a deposit, and NOT a loan: nothing is owed back. Consumes up to
+  /// <paramref name="qty"/> from their oldest 'held' holdings of that card (reduce, close
+  /// zeroed rows). Returns how much was actually consumed — less than qty means the rest
+  /// wasn't tracked here (fungible-claim accounting lives in DraftBot).
+  /// </summary>
+  public int ConsumeDeposits(string owner, string card, int qty)
+  {
+    int remaining = Math.Max(0, qty);
+    lock (_lock)
+    {
+      foreach (var h in _db.Holdings
+        .Where(h => h.Status == "held"
+                 && string.Equals(h.Owner, owner, StringComparison.OrdinalIgnoreCase)
+                 && string.Equals(h.Card, card, StringComparison.OrdinalIgnoreCase))
+        .OrderBy(h => h.AcquiredAt).ToList())
+      {
+        if (remaining <= 0) break;
+        int take = Math.Min(h.Qty, remaining);
+        h.Qty -= take; remaining -= take;
+        h.UpdatedAt = DateTime.UtcNow.ToString("o");
+        if (h.Qty <= 0) h.Status = "closed";
+      }
+      if (remaining < qty) Save();
+    }
+    return qty - remaining;
+  }
+
   /// <summary>A card came back from its borrower. House cards close (back in the collection); a
   /// player-owned card returns to "held" in custody. Returns false if unknown/not-on-loan.</summary>
   public bool SettleReturn(string id)

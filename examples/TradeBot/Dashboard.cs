@@ -289,7 +289,7 @@ async function health(){try{const r=await api('/health');if(!r.ok)return;const h
 function esc(s){return String(s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));}
 $('tok').value=tok();
 addRow('give');updateDir();
-tick();vault();health();holdingsTick();setInterval(tick,1500);setInterval(vault,15000);setInterval(health,5000);setInterval(holdingsTick,5000);
+tick();vault();health();holdingsTick();setInterval(tick,1500);setInterval(vault,60000);setInterval(health,5000);setInterval(holdingsTick,5000);
 </script></body></html>
 """;
 }

@@ -1,45 +1,32 @@
 /** @file
-  TradeBot prototype driver.
+  TradeBot driver — mode-dispatch CLI over TradeExecutor.
 
-  Modes:
-    probe            (default) READ-ONLY: validate the trade-execution surface is
-                     callable on the live objects. No state change, no assets.
-    watch            READ-ONLY: subscribe to trade lifecycle events and log them.
-    botstatus <bot>  READ-ONLY: read a bot's marketplace post + classify it
-                     Open/Busy/Unknown (how it signals availability).
-    poolstatus       READ-ONLY: availability sweep across a pool of bots
-                     (default freebots; override with --bots=a,b,c).
-    autograb <bot> <card>
-                     Wait for <bot> to read OPEN, then open a trade and stage
-                     <card>, holding for your Submit. Never commits. Requires --yes.
-    poolgrab <card>  Rotate across a POOL of bots: invite only ones reading OPEN,
-                     move to the next instead of spamming a busy one, stage <card>
-                     on the first that reaches negotiation. Requires --yes.
-    post "<msg>"     OUTWARD-FACING: publish a marketplace message listing, then
-                     clear it. Requires --yes (publishes public content).
-    clearpost        OUTWARD-FACING: retract your marketplace listing. Requires --yes.
-    invite <user>    OUTWARD-FACING: send a trade invite. Requires --yes.
-    gamelog [--stream]
-                     READ-ONLY: list the games the client is aware of + dump the
-                     LogChannel (action log) of any it is WATCHING. --stream tails
-                     new log lines live.
-    spectate <gameId|player> [--stream]   OR   spectate --any [--stream]
-                     Drive the client to WATCH a live game itself (dispatch
-                     PlayerEventActions.WatchGame() into the game's Match), then dump
-                     + stream its action log. --any auto-picks the first live game.
-                     Read-only observation (registers as a watcher; no state change).
-    autoreport --pair=<a>,<b> [--session=<id>] [--dry-run]   OR   autoreport --daemon [--poll=N] [--dry-run]
-                     Auto-report freeform Bo3 draft-match results to DraftBot: watch a
-                     pairing to completion, then POST who won to DRAFTBOT_API_BASE (bearer
-                     DRAFTBOT_API_TOKEN). --daemon polls DraftBot's /pairings/active and
-                     reports each pairing as it finishes. --dry-run observes without POSTing.
+  COMMITTING modes (move real assets; each requires --commit to arm, and the
+  final approve goes through TradeExecutor.ConfirmTrade, which throws unless
+  AllowCommit is true — without --commit every flow stops at a dry-run cancel):
+    serve            The production mode: token-protected HTTP API + dashboard
+                     (give / deposit / swap / recall jobs from DraftBot or the
+                     browser). See `serve --help` line for flags.
+    lend <user>      DM-handshake a recipient, present the Lending binder,
+                     give the intended card(s) with guardrails.
+    swap <partner>   Offer one card, require named card(s) back (both-sides
+                     guardrail).
+    grabfrom <partner>
+                     Receive-only: take a named card, give nothing.
+    autofullgrab <bot> <card>
+                     Freebot-era: acquire a free card from an open bot.
+
+  READ-ONLY / operator modes: probe (default; validates the execution surface),
+  watch, botstatus/poolstatus, gamelog, spectate, autoreport (reports draft
+  results to DraftBot), ledger, dmtail/dmtailid, holdings inspection. Staging
+  experiments that hold a trade open but never commit: autograb, poolgrab,
+  opentrade/takecard/stagetest and friends. OUTWARD-FACING (public but
+  assetless, --yes gated): post, clearpost, invite.
 
   Availability gating: bots advertise "open"/"free" vs "busy" in their post
   message; the acquire modes read that (read-only, no ping) and only invite open
   bots. Classification tokens live in BotAvailability.cs — tune them against what
   `botstatus`/`poolstatus` print for live bots.
-
-  The committing final-approve is never invoked here (AllowCommit stays false).
 
   Login: by default the bot launches MTGO (if needed) and logs in using
   credentials from a .env file at the repo root (USERNAME= / PASSWORD=, see
@@ -1088,9 +1075,9 @@ string? envPath = null;
   if (e != null) envPath = e.Substring("--env=".Length);
 }
 
-// The ONLY modes a commit (final approve) can happen in: autofullgrab (acquire a
-// free card) and lend (give a card), each requiring an explicit --commit flag.
-// Every other mode stays hard-off (AllowCommit=false) even if --commit is passed.
+// The ONLY modes a commit (final approve) can happen in are the ones listed
+// below, each requiring an explicit --commit flag on top. Every other mode
+// stays hard-off (AllowCommit=false) even if --commit is passed.
 bool allowCommit = (mode == "autofullgrab" || mode == "lend" || mode == "swap" || mode == "grabfrom" || mode == "serve") && args.Contains("--commit");
 
 Line("=== MTGOSDK TradeBot prototype ===");
@@ -2298,8 +2285,8 @@ using (var exec = new TradeExecutor { AllowCommit = allowCommit })
           // Owned Event Tickets (headline) + top TRADEABLE holdings, from ONE collection scan.
           // Filter out account-bound / non-tradeable cruft so the list is real cards.
           var col = MTGOSDK.API.Collection.CollectionManager.Collection;
-          System.Collections.Generic.List<int> tixIds;
-          try { tixIds = MTGOSDK.API.Collection.CollectionManager.GetCardIds("Event Ticket").ToList(); }
+          System.Collections.Generic.HashSet<int> tixIds;
+          try { tixIds = MTGOSDK.API.Collection.CollectionManager.GetCardIds("Event Ticket").ToHashSet(); }
           catch { tixIds = new(); }
           string[] hide = { "Play Point", "Reward Pack", "Avatar" };
           int tix = 0;
