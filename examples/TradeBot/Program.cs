@@ -579,7 +579,7 @@ static bool FinalizeTrade(TradeBot.TradeExecutor exec, string partner,
     exec.CancelCurrent(); WaitForNoTrade(); return false;
   }
   long seqBefore = exec.CompletedTradeSeq;
-  bool dispatched = exec.ConfirmTrade();
+  bool dispatched = exec.ConfirmTrade(expectedEscrowId);
   if (!dispatched)
   {
     TradeBot.TradeExecutor.LastFlowDetail = "the final approve was not accepted by the client (nothing moved)";

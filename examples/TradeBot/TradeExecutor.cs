@@ -371,12 +371,22 @@ public sealed class TradeExecutor : IDisposable
     var binder = MTGOSDK.API.Collection.CollectionManager.Binders
       .FirstOrDefault(b => string.Equals(Try(() => b.Name) ?? "", binderName, StringComparison.OrdinalIgnoreCase));
     if (binder is null) { Log($"[binder] '{binderName}' not found — cannot set as last-used."); return false; }
+    int wantId = Try(() => (int)binder.Id) ?? 0;
     try
     {
       dynamic mgr = Unbind((object)ObjectProvider.Get(IGroupingManager, true, false, false));
       dynamic ib  = Unbind((object)binder);
       OnUI(() => { mgr.LastUsedBinder = ib; });
-      Log($"[binder] LastUsedBinder = '{binderName}' (id={Try(() => binder.Id)}).");
+      // READ BACK: a setter that returns without throwing has NOT proven anything — if the
+      // assignment silently didn't take, MTGO would present the previously-used binder and
+      // the partner would see cards we never meant to offer. Verify by id.
+      int gotId = Try(() => (int)Unbind((object)mgr.LastUsedBinder).Id) ?? -1;
+      if (wantId != 0 && gotId != wantId)
+      {
+        Log($"[binder] VERIFY FAILED: LastUsedBinder reads back as id={gotId}, expected '{binderName}' (id={wantId}) — refusing to present it.");
+        return false;
+      }
+      Log($"[binder] LastUsedBinder = '{binderName}' (id={wantId}) — verified by read-back.");
       return true;
     }
     catch (Exception ex) { Log($"[binder] set LastUsedBinder failed: {ex.GetType().Name}: {ex.Message.Split('\n')[0]}"); return false; }
@@ -702,19 +712,34 @@ public sealed class TradeExecutor : IDisposable
   /// <summary>Dispatch the final approve. Returns TRUE only if the confirm command was
   /// actually executable and dispatched — a false return means NOTHING was sent, so the
   /// caller must not report the trade as completed.</summary>
-  public bool ConfirmTrade()
+  public bool ConfirmTrade(int expectedEscrowId = 0)
   {
     if (!AllowCommit)
       throw new InvalidOperationException(
         "ConfirmTrade BLOCKED: AllowCommit is false (dry-run). No assets moved.");
     dynamic vm = GetLiveTradeVM();
-    bool can = false;
+    bool can = false; string why = "";
+    // ATOMIC final gate: identity, approval-state and the dispatch happen in ONE UI-thread
+    // operation, so the partner cannot slip a change in between the checks and the commit.
+    // (MTGO itself drops the escrow out of Approval* whenever either side edits their
+    // offer, so re-reading the state here is what turns "they changed it" into a refusal.)
     OnUI(() =>
     {
-      can = Try<bool>(() => (bool)vm.ConfirmTradeCanExecute());
-      if (can) vm.ConfirmTradeExecute();
+      MTGOSDK.API.Trade.TradeEscrow? cur = null;
+      try { cur = TradeManager.CurrentTrade; } catch { }
+      if (cur is null) { why = "no live trade at confirm time"; return; }
+      int id = Try(() => (int)cur.Id) ?? 0;
+      if (expectedEscrowId != 0 && id != expectedEscrowId)
+      { why = $"escrow changed at confirm time (live {id}, expected {expectedEscrowId})"; return; }
+      string st = Try(() => cur.State.ToString()) ?? "";
+      if (!st.StartsWith("Approval", StringComparison.OrdinalIgnoreCase))
+      { why = $"state is '{st}', not approval-ready — the offer changed"; return; }
+      if (!(Try<bool>(() => (bool)vm.ConfirmTradeCanExecute())))
+      { why = "ConfirmTradeCanExecute=false"; return; }
+      vm.ConfirmTradeExecute();
+      can = true;
     });
-    Log($"[trade] FINAL APPROVE: {(can ? "ConfirmTradeExecute dispatched — COMMIT" : "ConfirmTradeCanExecute=false — skipped")}.");
+    Log($"[trade] FINAL APPROVE: {(can ? "ConfirmTradeExecute dispatched — COMMIT" : $"skipped ({why})")}.");
     return can;
   }
 
