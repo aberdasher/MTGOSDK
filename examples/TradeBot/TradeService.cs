@@ -265,11 +265,10 @@ public sealed class TradeService
       { Write(ctx, 400, new { error = "trade needs a non-empty give[] and/or receive[] (each item {name, qty>=1})" }); return; }
       bool g = give.Count > 0, r = receive.Count > 0;
       type = g && r ? "swap" : g ? "request" : "deposit";
-      // Guardrails matching RunTrade's supported combos (fail fast with a clear message).
-      if (g && r && !(give.Count == 1 && give[0].Qty == 1))
-      { Write(ctx, 400, new { error = "swap v1: give side must be exactly ONE card, qty 1 (receive side may list several)" }); return; }
-      if (r && !g && receive.Count != 1)
-      { Write(ctx, 400, new { error = "receive-only v1 takes exactly ONE distinct card (use qty for copies)" }); return; }
+      // No shape restrictions: the Negotiate engine presents a binder holding exactly
+      // give[] and requests exactly receive[], so multi-give, qty>1 receive, and
+      // give+receive together are all legal. Engine capability is discovered by calling
+      // the engine — never re-declared here.
     }
     else
     {
@@ -537,7 +536,7 @@ public sealed class TradeService
     { Write(ctx, 409, new { error = "busy (a trade is running or reconnecting) — try again when idle" }); return; }
     _conn.EnsureHealthy();
     int n;
-    try { n = _conn.Exec.PruneBinders("Lending", "SwapOffer"); }
+    try { n = _conn.Exec.PruneBinders(TradeExecutor.TransientBinderNames); }
     catch (Exception ex) { Write(ctx, 500, new { error = ex.Message.Split('\n')[0] }); return; }
     Write(ctx, 200, new { pruned = n });
   }

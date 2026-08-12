@@ -908,9 +908,19 @@ static bool Negotiate(TradeBot.TradeExecutor exec, string partner,
   var giveIntended = give.Select(g => (g.name, Math.Max(1, g.qty))).ToList();
   var recvIntended = receive.Select(r => (r.name, Math.Max(1, r.qty))).ToList();
 
+  // ── PHASE 0: make sure we can reach them at all ──
+  // A DM to a non-buddy can be dropped, and presence reads need a resolvable user; without
+  // this a stranger's trade fails later as a mystery "no YES in time".
+  if (!exec.EnsureKnownUser(partner))
+  {
+    TradeBot.TradeExecutor.LastFlowDetail = $"could not resolve '{partner}' as an MTGO user";
+    Line($"Could not resolve or add '{partner}' as a buddy — check the exact username.");
+    return false;
+  }
+
   // ── PHASE 1: the offer binder — exactly what they may take (empty if nothing) ──
   exec.WarmCollectionAndBinders();
-  string? presentBinder = exec.EnsureOfferBinderName("Offer", give);
+  string? presentBinder = exec.EnsureOfferBinderName(TradeBot.TradeExecutor.OfferBinderName, give);
   if (presentBinder is null)
   {
     TradeBot.TradeExecutor.LastFlowDetail = give.Count == 0
@@ -954,11 +964,13 @@ static bool Negotiate(TradeBot.TradeExecutor exec, string partner,
   // ── PHASE 4: watch until BOTH sides are exactly right ──
   // Their presented binder is FIXED at trade start, so snapshot it ONCE (retrying while it
   // populates) instead of re-reading a large binder every tick.
-  var presentedCat = new System.Collections.Generic.Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+  // Keyed by INDEX into receive[], not by name: two entries can share a name but pin
+  // different printings (a recall of one exact copy alongside a generic request).
+  var presentedCat = new System.Collections.Generic.Dictionary<int, int>();
   bool snapped = false;
   long watchMs = yesTimeoutSec >= int.MaxValue / 2 ? long.MaxValue : Math.Max(60_000L, (long)yesTimeoutSec * 1000);
   const int pollMs = 1000;
-  int lastReq = -5000, lastNote = -5000; string lastRemindKey = "";
+  long lastReq = -5000, lastNote = -5000; string lastRemindKey = "";
   bool ready = false;
 
   for (long ms = 0; ms < watchMs && !ready; ms += pollMs)
@@ -985,18 +997,22 @@ static bool Negotiate(TradeBot.TradeExecutor exec, string partner,
         var items = c.PartnerCollection.CollectionItems;
         if (items.Count > 0)
         {
-          foreach (var want in receive)
+          for (int i = 0; i < receive.Count; i++)
           {
+            var want = receive[i];
             foreach (var it in items)
             {
-              string nm = Try2(() => it.Card?.Name) ?? "";
-              int cid = Try2(() => (int?)it.Id) ?? -1;
-              bool nameOk = nm.IndexOf(want.name, StringComparison.OrdinalIgnoreCase) >= 0;
-              if (nameOk && (want.catId <= 0 || cid == want.catId)) { presentedCat[want.name] = cid; break; }
+              string nm = ""; int cid = -1;
+              try { nm = it.Card?.Name ?? ""; cid = it.Id; } catch { }
+              // MUST use the same matcher as the guardrail (ReceiveStatus) — a raw
+              // comparison here would miss MTGO's typographic apostrophe and we'd cancel
+              // a trade for "not presented" on a card sitting in their binder.
+              if (TradeBot.TradeExecutor.NameMatches(nm, want.name) && (want.catId <= 0 || cid == want.catId))
+              { presentedCat[i] = cid; break; }
             }
           }
           snapped = true;
-          var found = receive.Where(w => presentedCat.ContainsKey(w.name)).Select(w => w.name).ToList();
+          var found = Enumerable.Range(0, receive.Count).Where(presentedCat.ContainsKey).Select(i => receive[i].name).ToList();
           Line($"  their binder presents: {(found.Count == 0 ? "(none of what I need)" : string.Join(", ", found))}");
         }
       }
@@ -1031,11 +1047,20 @@ static bool Negotiate(TradeBot.TradeExecutor exec, string partner,
     // Pull what we're owed from their presented binder (exact printing when we know it).
     if (rs.missing.Count > 0 && ms - lastReq >= 1500)
     {
-      lastReq = (int)ms;
-      foreach (var want in receive)
+      lastReq = ms;
+      for (int i = 0; i < receive.Count; i++)
       {
-        int cat = presentedCat.TryGetValue(want.name, out var pc) ? pc : -1;
+        var want = receive[i];
+        int cat = presentedCat.TryGetValue(i, out var pc) ? pc : -1;
         if (cat > 0) exec.RequestViaWishlist(cat, Math.Max(1, want.qty), want.name);
+        else if (want.catId <= 0)
+        {
+          // Couldn't read their presented printing (a failed PartnerCollection read). Fall
+          // back to sweeping every printing of the name — but never for a pinned request
+          // (a recall must get back the EXACT copy we lent, not another printing).
+          try { foreach (var cat2 in MTGOSDK.API.Collection.CollectionManager.GetCardIds(want.name)) exec.RequestViaWishlist(cat2, Math.Max(1, want.qty), want.name); }
+          catch { }
+        }
       }
     }
 
@@ -1064,7 +1089,8 @@ static bool Negotiate(TradeBot.TradeExecutor exec, string partner,
     // What we need isn't in the binder they locked in — they must reopen with the right one.
     if (ms >= 20_000 && receive.Count > 0 && presentedCat.Count < receive.Count)
     {
-      var absent = receive.Where(w => !presentedCat.ContainsKey(w.name)).Select(w => w.qty > 1 ? $"{w.qty}x {w.name}" : w.name).ToList();
+      var absent = Enumerable.Range(0, receive.Count).Where(i => !presentedCat.ContainsKey(i))
+          .Select(i => receive[i].qty > 1 ? $"{receive[i].qty}x {receive[i].name}" : receive[i].name).ToList();
       TradeBot.TradeExecutor.LastFlowDetail = $"partner's presented binder does not contain {string.Join(", ", absent)}";
       Line($"\n!!! CANCELLING — {string.Join(", ", absent)} is not in the binder you presented. !!!\n");
       exec.CancelCurrent(); WaitForNoTrade();
@@ -1074,7 +1100,7 @@ static bool Negotiate(TradeBot.TradeExecutor exec, string partner,
 
     if (ms - lastNote >= 10_000)
     {
-      lastNote = (int)ms;
+      lastNote = ms;
       Line($"  t+{ms / 1000,3}s  WE GIVE: {TradeBot.TradeExecutor.Summarize(c.TradedItems)} (still to grab: {(gs.missing.Count == 0 ? "(none)" : string.Join(", ", gs.missing))})" +
            $"  |  WE RECEIVE: {TradeBot.TradeExecutor.Summarize(c.PartnerTradedItems)} (still needed: {(rs.missing.Count == 0 ? "(none)" : string.Join(", ", rs.missing))})");
     }
@@ -1423,7 +1449,7 @@ using (var exec = new TradeExecutor { AllowCommit = allowCommit })
       exec.Attach();
       Line("Warming collection + binder list (a cold WPF UI thread makes binder ops time out)...");
       exec.WarmCollectionAndBinders();
-      string bname = args.FirstOrDefault(a => a.StartsWith("--binder=", StringComparison.OrdinalIgnoreCase))?.Substring("--binder=".Length) ?? "Offer";
+      string bname = args.FirstOrDefault(a => a.StartsWith("--binder=", StringComparison.OrdinalIgnoreCase))?.Substring("--binder=".Length) ?? TradeBot.TradeExecutor.OfferBinderName;
       string giveRaw = args.FirstOrDefault(a => a.StartsWith("--give=", StringComparison.OrdinalIgnoreCase))?.Substring("--give=".Length) ?? "";
       var give = new System.Collections.Generic.List<(string name, int qty, int catId)>();
       foreach (var part in giveRaw.Split(',', StringSplitOptions.RemoveEmptyEntries))

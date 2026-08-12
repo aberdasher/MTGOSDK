@@ -1011,18 +1011,10 @@ public sealed class TradeExecutor : IDisposable
     int recvCount = 0;
     try { recvCount = esc.PartnerTradedItems.CollectionItems.Count; } catch { }
 
-    // Tolerant name match: MTGO can return a typographic apostrophe (U+2019) where the
-    // caller typed a straight ' — strip both (and trim) so "Kozilek's Command" matches
-    // regardless. Without this, a legitimately-offered grab reads as "not offered".
-    static string Norm(string s) =>
-        (s ?? "").Replace("’", "").Replace("‘", "").Replace("'", "").Trim();
-    bool NameMatch(string given, string want) =>
-        Norm(given).IndexOf(Norm(want), StringComparison.OrdinalIgnoreCase) >= 0;
-
     var missing = new List<string>();
     foreach (var want in intended)
     {
-      int got = give.Where(g => NameMatch(g.name, want.name)).Sum(g => g.qty);
+      int got = give.Where(g => NameMatches(g.name, want.name)).Sum(g => g.qty);
       if (got < want.qty) { int short_ = want.qty - got; missing.Add(short_ > 1 ? $"{short_}x {want.name}" : want.name); }
     }
     var extra = new List<string>();
@@ -1031,11 +1023,26 @@ public sealed class TradeExecutor : IDisposable
       // Total allowed for this given card = SUM of every intended qty whose name matches,
       // so 3x of ONE card is fully allowed however `intended` is split. (A single "qty 2"
       // grab of a 3x lend is then "missing 1", never "extra".)
-      int allowed = intended.Where(w => NameMatch(g.name, w.name)).Sum(w => w.qty);
+      int allowed = intended.Where(w => NameMatches(g.name, w.name)).Sum(w => w.qty);
       if (g.qty > allowed) { int over = g.qty - allowed; extra.Add($"{over}x {g.name}"); }
     }
     bool exact = missing.Count == 0 && extra.Count == 0 && recvCount == 0;
     return (missing, extra, exact);
+  }
+
+  /// <summary>
+  /// THE card-name comparison for every guardrail and binder scan. MTGO can return a
+  /// typographic apostrophe (U+2019) where the caller typed a straight ' — strip both (and
+  /// trim) so "Kozilek's Command" matches regardless. MUST be used everywhere a requested
+  /// name is matched against a live item: a scan that compares raw strings while a guardrail
+  /// compares normalized ones disagrees about whether the partner presented the card, and
+  /// the trade gets cancelled on a card that was right there.
+  /// </summary>
+  public static bool NameMatches(string got, string want)
+  {
+    static string Norm(string s) =>
+        (s ?? "").Replace("’", "").Replace("‘", "").Replace("'", "").Trim();
+    return Norm(got).IndexOf(Norm(want), StringComparison.OrdinalIgnoreCase) >= 0;
   }
 
   /// <summary>
@@ -1054,21 +1061,16 @@ public sealed class TradeExecutor : IDisposable
     try { foreach (var it in esc.PartnerTradedItems.CollectionItems) recv.Add((Try(() => it.Card?.Name) ?? "?", Try(() => (int)it.Quantity) ?? 0)); }
     catch { return (intended.Select(w => w.qty > 1 ? $"{w.qty}x {w.name}" : w.name).ToList(), new(), false); }
 
-    static string Norm(string s) =>
-        (s ?? "").Replace("’", "").Replace("‘", "").Replace("'", "").Trim();
-    bool NameMatch(string got, string want) =>
-        Norm(got).IndexOf(Norm(want), StringComparison.OrdinalIgnoreCase) >= 0;
-
     var missing = new List<string>();
     foreach (var want in intended)
     {
-      int got = recv.Where(r => NameMatch(r.name, want.name)).Sum(r => r.qty);
+      int got = recv.Where(r => NameMatches(r.name, want.name)).Sum(r => r.qty);
       if (got < want.qty) { int short_ = want.qty - got; missing.Add(short_ > 1 ? $"{short_}x {want.name}" : want.name); }
     }
     var extra = new List<string>();
     foreach (var r in recv)
     {
-      int allowed = intended.Where(w => NameMatch(r.name, w.name)).Sum(w => w.qty);
+      int allowed = intended.Where(w => NameMatches(r.name, w.name)).Sum(w => w.qty);
       if (r.qty > allowed) { int over = r.qty - allowed; extra.Add($"{over}x {r.name}"); }
     }
     bool exact = missing.Count == 0 && extra.Count == 0;
@@ -1392,9 +1394,21 @@ public sealed class TradeExecutor : IDisposable
   }
 
   /// <summary>The binder a receive-only trade presents so the partner sees NOTHING of ours
-  /// to take. Reused if it already exists; <see cref="TryCreateEmptyBinder"/> attempts to
-  /// create it when missing.</summary>
+  /// to take. Reused if it already exists; <see cref="TryCreateEmptyBinder"/> creates it when
+  /// missing. NEVER prune this one — it must survive between trades.</summary>
   public const string EmptyBinderName = "Empty";
+
+  /// <summary>The give-side binder the engine rebuilds for every trade to hold exactly what
+  /// the partner may take.</summary>
+  public const string OfferBinderName = "Offer";
+
+  /// <summary>The bot's TRANSIENT trade binders — safe to delete when idle. Deliberately
+  /// excludes <see cref="EmptyBinderName"/> (operator-visible, must persist). "Lending" and
+  /// "SwapOffer" are the older flows' binders and are still created by the CLI modes.</summary>
+  public static readonly string[] TransientBinderNames = { OfferBinderName, "Lending", "SwapOffer" };
+
+  // Set once the client is confirmed loaded; cleared on Attach so a reconnect re-warms.
+  bool _warm;
 
   /// <summary>
   /// Wait until the collection AND binder list are actually loaded. Right after an attach /
@@ -1404,6 +1418,9 @@ public sealed class TradeExecutor : IDisposable
   /// </summary>
   public bool WarmCollectionAndBinders(int maxSeconds = 40)
   {
+    // A warm client doesn't go cold; re-checking costs a full binder enumeration on EVERY
+    // trade. Latch it (cleared by Attach, so a reconnect re-warms).
+    if (_warm) return true;
     bool items = false; int binders = 0;
     for (int waited = 0; waited < maxSeconds; waited += 2)
     {
@@ -1413,7 +1430,7 @@ public sealed class TradeExecutor : IDisposable
       // give binders a few more seconds before proceeding (a genuinely binder-less account
       // must not wait forever).
       if (items && (binders > 0 || waited >= 10))
-      { Log($"[warm] collection loaded, {binders} binder(s) visible after {waited}s."); return true; }
+      { _warm = true; Log($"[warm] collection loaded, {binders} binder(s) visible after {waited}s."); return true; }
       System.Threading.Thread.Sleep(2000);
     }
     Log($"[warm] gave up after {maxSeconds}s (collection loaded: {items}, binders: {binders}).");
@@ -1517,11 +1534,13 @@ public sealed class TradeExecutor : IDisposable
   }
 
   /// <summary>
-  /// Get the confirmed-EMPTY binder for a receive-only trade. Never creates or deletes:
-  /// MTGO cannot create a zero-item binder, so this binder is set up once by the operator
-  /// (see <see cref="EmptyBinderName"/>) and the bot only ever verifies + reuses it.
-  /// Returns null when it's missing or has drifted non-empty — callers MUST fail closed
-  /// rather than open a trade presenting an unknown binder.
+  /// Get the confirmed-EMPTY binder for a receive-only trade, creating it when missing
+  /// (<see cref="TryCreateEmptyBinder"/>). MTGO CAN create a zero-item binder — an early
+  /// failure here was a cold-client `Dispatcher operation timed out` in an inner exception,
+  /// not a rejection, so warm the client first and read the whole exception chain before
+  /// concluding otherwise. Never deletes: the binder must survive between trades.
+  /// Returns null when it can't be created or has drifted non-empty — callers MUST fail
+  /// closed rather than open a trade presenting an unknown binder.
   /// </summary>
   public MTGOSDK.API.Collection.Binder? GetEmptyBinder(string binderName)
   {
@@ -1689,6 +1708,7 @@ public sealed class TradeExecutor : IDisposable
 
   public void Attach()
   {
+    _warm = false;   // a fresh attach may mean a cold client
     Action<TradeEscrow, bool> started = (e, isPlayer) =>
       Log($"[event] TradeStarted player={isPlayer} partner={Try(() => e.TradePartnerName) ?? "?"} state={e.State}");
     TradeManager.TradeStarted += started;
