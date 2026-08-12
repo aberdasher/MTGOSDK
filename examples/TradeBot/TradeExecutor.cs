@@ -693,7 +693,10 @@ public sealed class TradeExecutor : IDisposable
   /// (ApprovalNone -> ApprovalSubmittedLocal -> ... -> TradeComplete). Point of no
   /// return — gated by AllowCommit; throws in dry-run so nothing commits by accident.
   /// </summary>
-  public void ConfirmTrade()
+  /// <summary>Dispatch the final approve. Returns TRUE only if the confirm command was
+  /// actually executable and dispatched — a false return means NOTHING was sent, so the
+  /// caller must not report the trade as completed.</summary>
+  public bool ConfirmTrade()
   {
     if (!AllowCommit)
       throw new InvalidOperationException(
@@ -706,6 +709,7 @@ public sealed class TradeExecutor : IDisposable
       if (can) vm.ConfirmTradeExecute();
     });
     Log($"[trade] FINAL APPROVE: {(can ? "ConfirmTradeExecute dispatched — COMMIT" : "ConfirmTradeCanExecute=false — skipped")}.");
+    return can;
   }
 
   // ─────────────────────────────────────────────────────────────────────────

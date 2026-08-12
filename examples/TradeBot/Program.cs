@@ -459,7 +459,16 @@ static MTGOSDK.API.Trade.TradeEscrow? TryReachNegotiation(TradeBot.TradeExecutor
           // binder FIRST so the parameterless invite action presents ONLY it, then
           // dispatch the invite via the proven AdvanceBinderSelection (the dialog
           // OkCommand path does NOT advance the escrow — verified live).
-          if (presentBinder != null) exec.SetLastUsedBinder(presentBinder);
+          // FAIL CLOSED: if we can't select our binder, MTGO would present whatever was
+          // last used — exactly the "partner sees random cards of ours" failure the
+          // Offer/Empty binders exist to prevent. Abort instead of advancing.
+          if (presentBinder != null && !exec.SetLastUsedBinder(presentBinder))
+          {
+            Line($"Could not select binder '{presentBinder}' — cancelling rather than presenting an unknown binder.");
+            try { exec.CancelCurrent(); } catch { }
+            WaitForNoTrade();
+            return null;
+          }
           exec.AdvanceBinderSelection(e0);
           advanced = true;
         }
@@ -525,8 +534,15 @@ static MTGOSDK.API.Trade.TradeEscrow? HandshakeThenInitiate(
 // iff committed; always sets TradeBot.TradeExecutor.LastFlowDetail.
 static bool FinalizeTrade(TradeBot.TradeExecutor exec, string partner,
     Func<MTGOSDK.API.Trade.TradeEscrow, bool> guardrail, bool allowCommit,
-    string commitLabel, string? doneDm)
+    string commitLabel, string? doneDm, int expectedEscrowId = 0)
 {
+  // Identity guard: everything below must act on the SAME escrow the caller verified.
+  // If the intended trade closes and another opens, acting on the replacement could
+  // submit or commit against the wrong partner entirely.
+  static int EscrowId(MTGOSDK.API.Trade.TradeEscrow? e)
+  { try { return e is null ? 0 : (int)e.Id; } catch { return 0; } }
+  bool WrongEscrow(MTGOSDK.API.Trade.TradeEscrow? e) =>
+      expectedEscrowId != 0 && EscrowId(e) != expectedEscrowId;
   exec.SubmitDeposit();
   MTGOSDK.API.Trade.TradeEscrow? esc = null;
   bool approveReady = false;
@@ -535,6 +551,12 @@ static bool FinalizeTrade(TradeBot.TradeExecutor exec, string partner,
     System.Threading.Thread.Sleep(300);
     var c = MTGOSDK.API.Trade.TradeManager.CurrentTrade;
     if (c is null) { TradeBot.TradeExecutor.LastFlowDetail = "trade closed before approval"; Line("Trade closed before approval."); return false; }
+    if (WrongEscrow(c))
+    {
+      TradeBot.TradeExecutor.LastFlowDetail = "a DIFFERENT trade replaced ours before approval";
+      Line("A different escrow is now current — abandoning without approving.");
+      exec.CancelCurrent(); WaitForNoTrade(); return false;
+    }
     esc = c; string sst = c.State.ToString();
     if (ms % 3_000 < 300) Line($"  t+{ms / 1000,2}s state={sst}");
     if (sst.StartsWith("Approval")) approveReady = true;
@@ -547,7 +569,13 @@ static bool FinalizeTrade(TradeBot.TradeExecutor exec, string partner,
     return false;
   }
 
-  // RE-VERIFY right before committing (belt and suspenders).
+  // RE-VERIFY right before committing (belt and suspenders) — on the EXPECTED escrow.
+  if (WrongEscrow(esc))
+  {
+    TradeBot.TradeExecutor.LastFlowDetail = "the verified trade was replaced before the final check";
+    Line("Escrow identity changed before the final check — cancelling.");
+    exec.CancelCurrent(); WaitForNoTrade(); return false;
+  }
   if (!guardrail(esc!))
   {
     TradeBot.TradeExecutor.LastFlowDetail = "guardrail re-check failed at approval";
@@ -567,15 +595,49 @@ static bool FinalizeTrade(TradeBot.TradeExecutor exec, string partner,
   }
 
   Line($"\n*** COMMITTING the {commitLabel} (ConfirmTrade) ***");
-  exec.ConfirmTrade();
-  for (int ms = 0; ms < 40_000; ms += 300)
+  // PROOF OF COMPLETION, not assumption. Reporting "done" for a trade that didn't
+  // actually commit makes DraftBot credit tix that never moved (and settles loans whose
+  // card never came back), so success must be positively evidenced:
+  //   * ConfirmTrade must report that it really dispatched the approve, and
+  //   * CompletedTradeSeq must advance — the executor bumps it ONLY when an escrow
+  //     closes with FinalState == TradeComplete.
+  // FINAL identity check immediately before the only asset-moving call.
+  if (WrongEscrow(MTGOSDK.API.Trade.TradeManager.CurrentTrade))
+  {
+    TradeBot.TradeExecutor.LastFlowDetail = "the trade was replaced just before the final approve";
+    Line("Escrow identity changed at commit time — refusing to approve.");
+    exec.CancelCurrent(); WaitForNoTrade(); return false;
+  }
+  long seqBefore = exec.CompletedTradeSeq;
+  bool dispatched = exec.ConfirmTrade();
+  if (!dispatched)
+  {
+    TradeBot.TradeExecutor.LastFlowDetail = "the final approve was not accepted by the client (nothing moved)";
+    Line("ConfirmTrade could not execute — cancelling; nothing moved.");
+    exec.CancelCurrent(); WaitForNoTrade();
+    return false;
+  }
+  bool completed = false;
+  for (int ms = 0; ms < 40_000 && !completed; ms += 300)
   {
     System.Threading.Thread.Sleep(300);
+    if (exec.CompletedTradeSeq > seqBefore) { completed = true; break; }
     var c = MTGOSDK.API.Trade.TradeManager.CurrentTrade;
-    if (c is null) { Line($"{commitLabel} complete — client clear."); break; }
+    if (c is null) { System.Threading.Thread.Sleep(1500); completed = exec.CompletedTradeSeq > seqBefore; break; }
     if (ms % 3_000 < 300) Line($"  t+{ms / 1000,2}s state={c.State}");
-    if (c.State == MTGOSDK.API.Trade.Enums.TradeState.Closed) break;
   }
+  if (!completed)
+  {
+    // The escrow never reported TradeComplete. It may still be open, or it closed for
+    // another reason — either way we must NOT report success.
+    string why = exec.LastCloseReason is string r && r.Length > 0 && r != "TradeComplete"
+        ? $"the trade closed as '{r}'" : "the trade never confirmed as complete";
+    TradeBot.TradeExecutor.LastFlowDetail = $"{why} — treat as NOT completed";
+    Line($"!!! {why} — reporting failure so nothing is credited. !!!");
+    exec.CancelCurrent(); WaitForNoTrade();
+    return false;
+  }
+  Line($"{commitLabel} COMPLETE (confirmed by the client).");
   if (doneDm != null) { try { exec.SendDM(partner, doneDm); } catch { } }
   Line("\nLedger (latest):");
   var lp = TradeBot.TradeExecutor.LedgerPath;
@@ -974,6 +1036,20 @@ static bool Negotiate(TradeBot.TradeExecutor exec, string partner,
     return false;
   }
 
+  // Pin the escrow we just opened. Everything from here acts on THIS trade only: if it
+  // closes and another opens, we must not silently adopt the replacement.
+  int expectedEscrowId = 0;
+  try { expectedEscrowId = (int)esc.Id; } catch { }
+  string expectedPartner = "";
+  try { expectedPartner = esc.TradePartnerName ?? ""; } catch { }
+  if (expectedPartner.Length > 0 && !string.Equals(expectedPartner, partner, StringComparison.OrdinalIgnoreCase))
+  {
+    TradeBot.TradeExecutor.LastFlowDetail = $"the open trade is with '{expectedPartner}', not '{partner}'";
+    Line($"Opened trade is with {expectedPartner}, not {partner} — cancelling.");
+    exec.CancelCurrent(); WaitForNoTrade();
+    return false;
+  }
+
   // ── PHASE 4: watch until BOTH sides are exactly right ──
   // Their presented binder is FIXED at trade start, so snapshot it ONCE (retrying while it
   // populates) instead of re-reading a large binder every tick.
@@ -984,6 +1060,7 @@ static bool Negotiate(TradeBot.TradeExecutor exec, string partner,
   long watchMs = yesTimeoutSec >= int.MaxValue / 2 ? long.MaxValue : Math.Max(60_000L, (long)yesTimeoutSec * 1000);
   const int pollMs = 1000;
   long lastReq = -5000, lastNote = -5000; string lastRemindKey = "";
+  int nullReads = 0;
   bool ready = false;
 
   for (long ms = 0; ms < watchMs && !ready; ms += pollMs)
@@ -994,11 +1071,27 @@ static bool Negotiate(TradeBot.TradeExecutor exec, string partner,
       Line("Cancelled by operator — closing the trade (nothing moved)."); exec.CancelCurrent(); WaitForNoTrade(); return false;
     }
     System.Threading.Thread.Sleep(pollMs);
-    var c = MTGOSDK.API.Trade.TradeManager.CurrentTrade;
+    MTGOSDK.API.Trade.TradeEscrow? c = null;
+    try { c = MTGOSDK.API.Trade.TradeManager.CurrentTrade; } catch { c = null; }
     if (c is null)
     {
+      // A momentary null/throw is normal (TryReachNegotiation tolerates it too); only a
+      // sustained disappearance means the trade is really gone. Never abandon a possibly
+      // -live trade with our offer still exposed — cancel on the way out.
+      if (++nullReads < 5) { System.Threading.Thread.Sleep(500); continue; }
       TradeBot.TradeExecutor.LastFlowDetail = "the partner closed the trade before it was complete";
-      Line("Trade closed before completion."); return false;
+      Line("Trade closed before completion — clearing any residual escrow.");
+      exec.CancelCurrent(); WaitForNoTrade();
+      return false;
+    }
+    nullReads = 0;
+    int curId = 0; try { curId = (int)c.Id; } catch { }
+    if (expectedEscrowId != 0 && curId != 0 && curId != expectedEscrowId)
+    {
+      TradeBot.TradeExecutor.LastFlowDetail = "a DIFFERENT trade replaced ours mid-negotiation";
+      Line("A different escrow became current — cancelling rather than acting on the wrong trade.");
+      exec.CancelCurrent(); WaitForNoTrade();
+      return false;
     }
     esc = c;
 
@@ -1134,7 +1227,7 @@ static bool Negotiate(TradeBot.TradeExecutor exec, string partner,
         return exec.StatusById(c2.TradedItems, giveIntended).exact
             && exec.StatusById(c2.PartnerTradedItems, recvIntended).exact;
       },
-      allowCommit, label, doneDm);
+      allowCommit, label, doneDm, expectedEscrowId);
 }
 
 // Small guarded read used by the engine's binder snapshot.

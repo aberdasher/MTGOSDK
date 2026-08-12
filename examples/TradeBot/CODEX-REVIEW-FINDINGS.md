@@ -4,8 +4,16 @@ Reviewed `git diff e3fc901..HEAD` for CORRECTNESS ONLY (money-path bugs). Four
 quality reviews (reuse/simplify/efficiency/altitude) had already run and missed all
 of these — they are behavioural, not structural.
 
-**STATUS: DO NOT RUN THE ENGINE WITH `--commit` UNTIL 1-5 AND 9 ARE FIXED.**
-Dry-run (`allowCommit=false`) is safe: it cancels at approval.
+**STATUS (2026-08-12): the happy path is LIVE-VALIDATED with real tix.** Two deposits
+committed through this engine (jobs `e39b9a662b28` 2x tix, `86e8bab6f946` 1x tix) and
+the full tournament cycle ran on top of them: deposit -> entry-fee escrow -> prize
+wallet -> payout, with the prize wallet draining to 0 and total claims (3) matching
+the tix physically deposited. Custody recorded them as DEPOSITS, not loans.
+
+Findings 1-4 are FIXED (identity is now the catalog id — see decision 8 in
+NEGOTIATE-DESIGN.md). The remaining findings are FAILURE-PATH risks that could not
+fire on a successful trade, so the live run does not clear them. Risk now lives in
+what happens when something goes wrong mid-trade, not in the normal case.
 
 Several of these are PRE-EXISTING (inherited from the old flows via GiveStatus),
 but the engine made them universal by routing every trade through one guardrail.
