@@ -496,36 +496,6 @@ static MTGOSDK.API.Trade.TradeEscrow? TryReachNegotiation(TradeBot.TradeExecutor
   return null;
 }
 
-// STANDARD trade-initiation handshake for any flow that trades with a HUMAN
-// (lend, swap, ...). The point: NEVER fire an invite into a 30-second accept race.
-// Instead DM the partner a "reply YES" prompt and WAIT (default 5 min) for their
-// YES — that both confirms they're available AND means they're watching, so the
-// invite that follows is accepted immediately. Only after the YES do we clear any
-// stale trade, initiate, and present the binder (with a wide accept window). No
-// YES within the window => no invite is ever sent. Returns the negotiating escrow,
-// or null (with a reason logged). This is what makes the flow run without
-// babysitting: the human replies YES once, then the bot drives the rest.
-static MTGOSDK.API.Trade.TradeEscrow? HandshakeThenInitiate(
-    TradeBot.TradeExecutor exec, string partner, string readyMsg, string presentBinder, int yesTimeoutSec = 300)
-{
-  if (!exec.EnsureKnownUser(partner))
-  { Line($"Could not resolve '{partner}' (spelling? they may need to accept the buddy request) — aborting."); return null; }
-
-  // Presence-aware: send the prompt now AND re-send whenever they come online (a DM to an
-  // offline user can be dropped by MTGO), returning on their YES. This is what makes an
-  // offline recipient work — when they log back in they get a fresh prompt they can see.
-  Line(yesTimeoutSec >= int.MaxValue / 2
-    ? $"Prompt sent to {partner} — waiting (no timeout) for them to be online + reply YES; re-sending on each reconnect."
-    : $"Prompt sent to {partner} — waiting up to {yesTimeoutSec / 60} min for them to be online + reply YES.");
-  if (!exec.SendPromptWhenOnlineAndWaitForYes(partner, readyMsg, yesTimeoutSec))
-  { Line($"No YES from {partner} within the window — aborting (no invite was sent)."); return null; }
-
-  try { exec.SendDM(partner, "Great — sending the trade now; accept the invite when it pops up."); } catch { }
-
-  // Clear any stale/wedged escrow, then initiate with a HUMAN-sized accept window.
-  exec.CancelCurrent(); WaitForNoTrade();
-  return TryReachNegotiation(exec, partner, presentBinder, negotiateWaitSec: 90);
-}
 
 // ── The shared finalize tail for EVERY trade flow ──────────────────────────────
 // submit deposit → wait approval-ready → re-verify the guardrail → dry-run cancel
@@ -652,310 +622,14 @@ static bool FinalizeTrade(TradeBot.TradeExecutor exec, string partner,
   return true;
 }
 
-// One SWAP cycle from a live negotiating escrow to completion: find the GET card in
-// the partner's presented binder (cancel if unavailable), request it, wait until
-// BOTH sides are EXACTLY right (cancel if incomplete), submit our deposit,
-// re-verify, then (with allowCommit) approve. Moves nothing unless both sides
-// match the guardrail. Returns true iff the swap committed.
-static bool RunSwapCycle(TradeBot.TradeExecutor exec, MTGOSDK.API.Trade.TradeEscrow esc,
-    string partner, string giveCard, int giveQty, System.Collections.Generic.List<string> getNames, bool allowCommit)
-{
-  string wantList = string.Join(", ", getNames);
-  Line($"\nTrade open with {esc.TradePartnerName}. You should present: {wantList}. I'm offering {giveQty}x {giveCard} — grab it from my SwapOffer binder.");
 
-  // WE GIVE must be EXACTLY our offer (safety); WE RECEIVE must contain every required card.
-  bool GiveIsExactly(MTGOSDK.API.Trade.TradeEscrow t)
-  {
-    var g = new System.Collections.Generic.List<(string n, int q)>();
-    try { foreach (var it in t.TradedItems.CollectionItems) g.Add((it.Card?.Name ?? "?", (int)it.Quantity)); } catch { return false; }
-    return g.Count == 1 && g[0].q == giveQty && g[0].n.IndexOf(giveCard, StringComparison.OrdinalIgnoreCase) >= 0;
-  }
-  bool ReceiveHas(MTGOSDK.API.Trade.TradeEscrow t, string name)
-  {
-    try { foreach (var it in t.PartnerTradedItems.CollectionItems) if ((it.Card?.Name ?? "").IndexOf(name, StringComparison.OrdinalIgnoreCase) >= 0) return true; } catch { }
-    return false;
-  }
-
-  // The required cards must be in the binder the partner PRESENTS (esc.PartnerCollection).
-  // The presented binder is FIXED at trade start — the partner CANNOT change it mid-
-  // trade — so a required card that isn't there now never will be. Therefore: as soon
-  // as the trade is open (checkAtSec, giving their binder a moment to populate) and
-  // any required card is absent from their presented offer, CANCEL immediately and DM
-  // the exact missing list. This is NOT gated on them grabbing our offer. Cards they
-  // DO present are requested so a complete offer can still finish.
-  var requested = new System.Collections.Generic.HashSet<string>(StringComparer.OrdinalIgnoreCase);
-  bool bothReady = false;
-  int lastDump = -100;
-  const int overallSec = 40, checkAtSec = 5;
-
-  for (int i = 0; i < overallSec; i++)
-  {
-    var c = MTGOSDK.API.Trade.TradeManager.CurrentTrade;
-    if (c is null) { Line("Trade closed before it completed."); return false; }
-    esc = c;
-
-    // What the partner PRESENTS right now (their presented binder is readable here).
-    var shown = new System.Collections.Generic.Dictionary<string, (int cat, int qty)>(StringComparer.OrdinalIgnoreCase);
-    try { foreach (var it in c.PartnerCollection.CollectionItems) { string nm = it.Card?.Name ?? ""; if (nm.Length > 0) shown[nm] = (it.Id, it.Quantity); } } catch { }
-
-    var missing = getNames.Where(w => !shown.Keys.Any(k => k.IndexOf(w, StringComparison.OrdinalIgnoreCase) >= 0)).ToList();
-
-    // Request each required card they DO present (so a complete offer can finish).
-    foreach (var want in getNames)
-    {
-      if (requested.Contains(want)) continue;
-      var hit = shown.Keys.FirstOrDefault(k => k.IndexOf(want, StringComparison.OrdinalIgnoreCase) >= 0);
-      if (hit != null) { Line($"  saw '{want}' (catId={shown[hit].cat}) — requesting it."); exec.RequestViaWishlist(shown[hit].cat, 1, want); requested.Add(want); }
-    }
-
-    var secured = getNames.Where(w => ReceiveHas(c, w)).ToList();
-    bool grabbed = GiveIsExactly(c);
-
-    if (i - lastDump >= 3)
-    {
-      lastDump = i;
-      Line($"  [t+{i,3}s] you present: {(shown.Count == 0 ? "(nothing)" : string.Join(", ", shown.Keys.Take(12)))}  |  MISSING from your offer: {(missing.Count == 0 ? "(none)" : string.Join(", ", missing))}  |  secured: {(secured.Count == 0 ? "(none)" : string.Join(", ", secured))}  |  you grabbed my {giveCard}: {(grabbed ? "yes" : "no")}");
-    }
-
-    // COMPLETE: every required card present + secured AND you grabbed my offer.
-    if (missing.Count == 0 && getNames.All(w => ReceiveHas(c, w)) && grabbed) { bothReady = true; break; }
-
-    // CANCEL AS SOON AS POSSIBLE: trade is open and a required card isn't in your offer.
-    if (i >= checkAtSec && missing.Count > 0)
-    {
-      Line($"\n!!! CANCELLING — your offer is missing required card(s): {string.Join(", ", missing)}. !!!\n");
-      exec.CancelCurrent(); WaitForNoTrade();
-      try { exec.SendDM(partner, $"Trade cancelled — your offer is missing: {string.Join(", ", missing)}. (You can't change the shown binder mid-trade — set it up with those cards first, then reply YES to retry.)"); } catch { }
-      return false;
-    }
-    System.Threading.Thread.Sleep(1000);
-  }
-
-  if (!bothReady)
-  {
-    var c = MTGOSDK.API.Trade.TradeManager.CurrentTrade;
-    var missing = c == null ? getNames : getNames.Where(w => !ReceiveHas(c, w)).ToList();
-    string why = missing.Count > 0 ? $"couldn't secure: {string.Join(", ", missing)}" : $"you didn't grab the {giveCard}";
-    Line($"\n!!! CANCELLING — {why}. !!!\n");
-    exec.CancelCurrent(); WaitForNoTrade();
-    try { exec.SendDM(partner, $"Trade cancelled — {why}. Reply YES to retry."); } catch { }
-    return false;
-  }
-  Line("All required cards secured and you grabbed my offer — finalizing.");
-
-  return FinalizeTrade(exec, partner,
-      c => GiveIsExactly(c) && getNames.All(w => ReceiveHas(c, w)),
-      allowCommit, "swap",
-      $"Done — you got {giveQty} {giveCard}, I got {wantList}. Thanks!");
-}
-
-// One GRAB cycle from a live negotiating escrow to completion: request the card
-// from the partner's presented binder (the MATCH count is the real "is it in their
-// offer" signal — reads the true partner trade-binder), guardrail (WE RECEIVE ==
-// exactly the card, WE GIVE nothing), deposit, approve. Cancels on any take-from-us,
-// if the card isn't in their offer, or if it's there but can't be pulled (stale VM).
-// Returns true iff committed.
-static bool RunGrabCycle(TradeBot.TradeExecutor exec, MTGOSDK.API.Trade.TradeEscrow esc,
-    string partner, string card, System.Collections.Generic.List<int> cats, bool allowCommit, int qty = 1, int requiredCat = -1)
-{
-  string qtyCard = qty > 1 ? $"{qty}x {card}" : card;
-  Line($"\nTrade open with {esc.TradePartnerName}. Looking for {qtyCard} in your presented binder...");
-  bool ready = false, matchedEver = false;
-  int lastReq = -5000, lastNote = -5000;
-  const int findMs = 12_000, windowMs = 90_000, pollMs = 300;
-  for (int ms = 0; ms < windowMs && !ready; ms += pollMs)
-  {
-    var c = MTGOSDK.API.Trade.TradeManager.CurrentTrade;
-    if (c is null) { Line("Trade closed."); return false; }
-    esc = c;
-
-    int giveCount = 0; try { giveCount = c.TradedItems.CollectionItems.Count; } catch { }
-    if (giveCount > 0)
-    {
-      Line($"You grabbed from my side ({TradeBot.TradeExecutor.Summarize(c.TradedItems)}) — cancelling; this is one-way, I give nothing.");
-      exec.CancelCurrent(); WaitForNoTrade();
-      try { exec.SendDM(partner, "Cancelled — this is a one-way grab (you give me the card, I give nothing). Don't take anything from my side; reply YES to retry."); } catch { }
-      return false;
-    }
-
-    bool haveIt = false; try { foreach (var it in c.PartnerTradedItems.CollectionItems) if ((it.Card?.Name ?? "").IndexOf(card, StringComparison.OrdinalIgnoreCase) >= 0) { haveIt = true; break; } } catch { }
-    if (exec.VerifyReceiveIsOnly(c, card, qty)) { ready = true; break; }
-
-    // Request the EXACT printing the partner PRESENTS (their binder is fixed at trade start) — NOT
-    // every printing of the name. Trying all printings spams wrong-printing requests, and the
-    // MatchDesiredCards count is unreliable (reports "matched 1" for a printing it never stages).
-    // Reading their presented binder gives the one true catId to request; only fall back to the
-    // all-printings sweep if that read fails.
-    // For a recall (requiredCat set) require that EXACT printing — refuse a different printing.
-    int presentedCat = -1;
-    try { foreach (var it in c.PartnerCollection.CollectionItems) if ((it.Card?.Name ?? "").IndexOf(card, StringComparison.OrdinalIgnoreCase) >= 0 && (requiredCat <= 0 || it.Id == requiredCat)) { presentedCat = it.Id; break; } } catch { }
-    if (presentedCat > 0) matchedEver = true;   // the right card (and, for a recall, the right printing) is present
-
-    if (!exec.VerifyReceiveIsOnly(c, card, qty) && ms - lastReq >= 1500)
-    {
-      lastReq = ms;
-      if (presentedCat > 0) exec.RequestViaWishlist(presentedCat, qty, card);       // exact printing — preferred
-      else if (requiredCat <= 0) foreach (var cat in cats) { exec.RequestViaWishlist(cat, qty, card); if (exec.LastMatchCount > 0) matchedEver = true; }  // fallback only when no exact printing is required
-    }
-
-    if (ms - lastNote >= 3000) { lastNote = ms; Line($"  [t+{ms/1000,3}s] {card} is in your offer: {(matchedEver ? "yes" : "not yet")}  |  I've secured it: {(haveIt ? "yes" : "no")}  |  WE RECEIVE: {TradeBot.TradeExecutor.Summarize(c.PartnerTradedItems)}"); }
-
-    if (ms >= findMs && !matchedEver && !haveIt)
-    {
-      string need = requiredCat > 0 ? $"{card} (printing {requiredCat} — the exact copy I lent)" : card;
-      Line($"\n!!! CANCELLING — {need} isn't in your presented binder (not found). !!!\n");
-      exec.CancelCurrent(); WaitForNoTrade();
-      try { exec.SendDM(partner, $"Cancelled — I didn't find {need} in the binder you presented. Pick a binder that has it (before accepting), then reply YES to retry."); } catch { }
-      return false;
-    }
-    if (ms >= findMs + 20_000 && matchedEver && !haveIt)
-    {
-      Line($"\n!!! CANCELLING — the {card} is in your binder but I can't pull it onto my side (stale trade view-model). A client restart is needed. !!!\n");
-      exec.CancelCurrent(); WaitForNoTrade();
-      try { exec.SendDM(partner, $"Cancelled — I see the {card} but couldn't complete the pull (client hiccup)."); } catch { }
-      return false;
-    }
-    System.Threading.Thread.Sleep(pollMs);
-  }
-  if (!ready) { Line("Didn't secure the cards in time — cancelling."); exec.CancelCurrent(); WaitForNoTrade(); return false; }
-  Line($"GUARDRAIL passed: we receive exactly {qtyCard} and give nothing.");
-
-  return FinalizeTrade(exec, partner,
-      c => exec.VerifyReceiveIsOnly(c, card, qty),
-      allowCommit, "grab",
-      $"Thanks — got {qtyCard}!");
-}
 
 // ── Full one-shot flows (handshake → cycle → commit), shared by the interactive
 //    modes and the order `worker`. Each returns true iff it committed. ────────────
 
-// LEND a SET of cards to a recipient (qty-aware). Builds the Lending binder EXACTLY,
-// handshake, present it, wait for them to grab all of it (reminding on an early
-// submit / cancelling on extras), submit our deposit, re-verify, then approve.
-static bool RunLend(TradeBot.TradeExecutor exec, string recipient,
-    System.Collections.Generic.List<(string name, int qty, int catId)> intended, bool allowCommit,
-    bool keepOpen = false, int yesTimeoutSec = 300)
-{
-  var giveNames = intended.SelectMany(it => System.Linq.Enumerable.Repeat(it.name, System.Math.Max(1, it.qty))).ToList();
-  // (name, exact-catId) flattened by qty — pins the Lending binder to the EXACT printings when
-  // specified (catId > 0), so the partner can only grab that version.
-  var giveItems = intended.SelectMany(it => System.Linq.Enumerable.Repeat((it.name, it.catId), System.Math.Max(1, it.qty))).ToList();
-  var intended2 = intended.Select(i => (i.name, i.qty)).ToList();   // name+qty for the give guardrail
-  // Human-readable list, e.g. "3x Kozilek's Command". Used for BOTH console and DMs —
-  // do NOT wrap it in [ ] in a DM: MTGO chat treats [text] as a card-link and renders a
-  // comma/qty blob as empty (recipient saw "Ready for ?").
-  string cardList = string.Join(", ", intended.Select(it => it.qty > 1 ? $"{it.qty}x {it.name}" : it.name));
-  int totalQty = intended.Sum(it => it.qty);
-  string cardCount = totalQty == 1 ? "the card" : $"all {totalQty} cards";
 
-  var lendBinder = exec.EnsureBinderExact("Lending", giveItems);
-  if (lendBinder is null) { Line("Could not build the Lending binder — aborting."); return false; }
-  Line($"Lending binder ready: '{lendBinder.Name}' (id={lendBinder.Id}, items={lendBinder.ItemCount}).");
 
-  var esc = HandshakeThenInitiate(exec, recipient,
-    $"Ready for {cardList}? Reply YES and I'll send you a trade — then accept it and grab {cardCount} from my offer.",
-    presentBinder: "Lending", yesTimeoutSec: keepOpen ? int.MaxValue : yesTimeoutSec);
-  if (esc is null)
-  {
-    try { exec.SendDM(recipient, "Couldn't open the trade — reply YES when you're ready and I'll retry."); } catch { }
-    return false;
-  }
-  Line($"\nTrade open with {esc.TradePartnerName}. They should grab: {cardList}.");
 
-  bool ready = false;
-  string lastRemindKey = "";
-  // keepOpen: no grab-window timeout — hold the offer until they finish grabbing or the
-  // trade closes (the c==null check below breaks out on a close/cancel).
-  for (int ms = 0; (keepOpen || ms < 300_000) && !ready; ms += 300)   // 300ms poll -> react to their grab fast
-  {
-    if (exec.AbortRequested) { Line("Cancelled by operator — closing the trade (gave nothing)."); exec.CancelCurrent(); WaitForNoTrade(); return false; }
-    System.Threading.Thread.Sleep(300);
-    var c = MTGOSDK.API.Trade.TradeManager.CurrentTrade;
-    if (c is null) { Line("Trade closed before they finished grabbing."); return false; }
-    esc = c;
-    var (missing, extra, exact) = exec.GiveStatus(c, intended2);
-
-    if (extra.Count > 0)
-    {
-      Line($"They grabbed something not offered ({string.Join(", ", extra)}) — cancelling for safety.");
-      exec.CancelCurrent(); WaitForNoTrade();
-      try { exec.SendDM(recipient, $"Cancelled — you grabbed {string.Join(", ", extra)}, which isn't part of this lend. Please grab ONLY {cardList}, then reply YES to retry."); } catch { }
-      return false;
-    }
-    if (exact) { ready = true; break; }
-
-    if (missing.Count > 0 && TradeBot.TradeExecutor.PartnerHasSubmitted(c))
-    {
-      string key = string.Join("|", missing);
-      if (key != lastRemindKey)
-      {
-        lastRemindKey = key;
-        Line($"  [reminder] {recipient} submitted but still needs to grab: {string.Join(", ", missing)}");
-        try { exec.SendDM(recipient, $"Hold on — you submitted, but you still need to grab: {string.Join(", ", missing)}. Please grab {(missing.Count == 1 ? "it" : "them")} from my offer and submit again. I won't approve until you have everything."); } catch { }
-      }
-    }
-    else
-    {
-      if (!TradeBot.TradeExecutor.PartnerHasSubmitted(c)) lastRemindKey = "";
-      if (ms % 10_000 < 300) Line($"  t+{ms/1000,3}s  WE GIVE: {TradeBot.TradeExecutor.Summarize(c.TradedItems)}  (still to grab: {(missing.Count == 0 ? "(none)" : string.Join(", ", missing))})");
-    }
-  }
-  if (!ready)
-  {
-    Line("They didn't grab the full set in time — cancelling.");
-    exec.CancelCurrent(); WaitForNoTrade();
-    try { exec.SendDM(recipient, $"Cancelled — didn't get all of {cardList} grabbed in time. Reply YES to retry."); } catch { }
-    return false;
-  }
-  Line("GUARDRAIL passed: we give exactly the intended set and receive nothing.");
-
-  return FinalizeTrade(exec, recipient,
-      c => exec.GiveStatus(c, intended2).exact,
-      allowCommit, "give",
-      $"Done — enjoy {cardList}!");
-}
-
-// SWAP: give one card, request one-or-more back. Ensures the SwapOffer binder,
-// handshake, then runs the swap cycle.
-static bool RunSwapFlow(TradeBot.TradeExecutor exec, string partner, string giveCard,
-    System.Collections.Generic.List<string> getNames, bool allowCommit, int yesTimeoutSec = 300)
-{
-  var offer = exec.EnsureBinderExact("SwapOffer", new[] { giveCard });
-  if (offer is null) { Line("Could not build the SwapOffer binder — aborting."); return false; }
-  string getList = string.Join(", ", getNames);
-  var esc = HandshakeThenInitiate(exec, partner,
-    $"Swap offer: my 1 {giveCard} for your [{getList}]. Reply YES when ready — then accept the trade, present [{getList}], and grab the {giveCard} from my SwapOffer binder.",
-    presentBinder: "SwapOffer", yesTimeoutSec: yesTimeoutSec);
-  if (esc is null) { Line($"Swap not started with {partner} (no YES / not accepted)."); exec.CancelCurrent(); WaitForNoTrade(); return false; }
-  return RunSwapCycle(exec, esc, partner, giveCard, 1, getNames, allowCommit);
-}
-
-// GRAB: receive one card, give nothing. Handshake, then runs the grab cycle.
-static bool RunGrabFlow(TradeBot.TradeExecutor exec, string partner, string card, bool allowCommit,
-    int yesTimeoutSec = 300, int qty = 1, int requiredCat = -1)
-{
-  System.Collections.Generic.List<int> cats;
-  try { cats = MTGOSDK.API.Collection.CollectionManager.GetCardIds(card).ToList(); }
-  catch { Line($"Unknown card '{card}'."); return false; }
-  string qtyCard = qty > 1 ? $"{qty}x {card}" : card;
-  string printingNote = requiredCat > 0 ? $" (the exact copy I lent you — printing {requiredCat})" : "";
-  var esc = HandshakeThenInitiate(exec, partner,
-    $"Ready to give me back {qtyCard}{printingNote}? Reply YES, accept the trade, and present a binder that HAS it (pick it before accepting). I'll grab it; take nothing from my side.",
-    presentBinder: null, yesTimeoutSec: yesTimeoutSec);
-  if (esc is null) { try { exec.SendDM(partner, "Couldn't open the trade — reply YES when ready and I'll retry."); } catch { } return false; }
-  return RunGrabCycle(exec, esc, partner, card, cats, allowCommit, qty, requiredCat);
-}
-
-// UNIFIED DISPATCH — a trade is "what we GIVE + what we RECEIVE"; route to the right flow.
-// This is the SINGLE source of truth for give/recv/swap selection (the old `worker` mode
-// inlined this, and the serve had it half-split across two delegates). The serve worker
-// and any CLI both call this, so the routing lives in exactly one place.
-//   give-only                    -> RunLend   (custodian gives; guardrail: receive nothing)
-//   single receive-only          -> RunGrabFlow (custodian receives qty of one card; give nothing)
-//   single give(qty1) + receive  -> RunSwapFlow (give one card, request the listed cards)
-// `allowCommit` here is the EFFECTIVE commit (caller already ANDed process + job commit).
-static string FmtItems(System.Collections.Generic.IEnumerable<(string name, int qty, int catId)> xs) =>
-  string.Join(", ", xs.Select(i => i.qty > 1 ? $"{i.qty}x {i.name}" : i.name));
 
 // ── THE unified trade engine ──────────────────────────────────────────────────
 // ONE pipeline for every shape: present a binder holding EXACTLY `give` (empty when we
@@ -2542,7 +2216,7 @@ using (var exec = new TradeExecutor { AllowCommit = allowCommit })
       // and stops. Stop the task to end. Without it: original single 5-min-window attempt.
       while (true)
       {
-        bool committed = RunLend(exec, recipient, intended, allowCommit, keepOpen);
+        bool committed = RunTrade(exec, recipient, intended, new(), allowCommit, keepOpen ? int.MaxValue : 300).ok;
         if (committed || !keepOpen) break;
         Line("\n[keepopen] attempt ended without a completed give — re-opening the desk. Reply YES to try again (stop this task to end).");
       }
@@ -2724,53 +2398,16 @@ using (var exec = new TradeExecutor { AllowCommit = allowCommit })
 
       exec.Attach();
 
-      System.Collections.Generic.List<int> cats;
-      try { cats = MTGOSDK.API.Collection.CollectionManager.GetCardIds(card).ToList(); }
-      catch { Line($"Unknown card '{card}'."); break; }
-
-      string readyMsg = $"Ready to give me the {card}? Reply YES, accept the trade, and present a binder that HAS the {card} (pick it before accepting — you can't change it mid-trade). I'll grab it; take nothing from my side.";
-
-      if (listen)
+      // ONE engine for both modes. Negotiate resolves the card to catalog ids, presents an
+      // EMPTY binder (we give nothing), requests exactly the card, and verifies both sides.
+      var want = new System.Collections.Generic.List<(string name, int qty, int catId)> { (card, 1, 0) };
+      if (listen) Line($"\n>>> LISTENING continuously for {partner}. Reply YES whenever ready; stop this task to end. <<<\n");
+      do
       {
-        // PERSISTENT LISTENER: watch the chat FOREVER; each YES fires one grab cycle,
-        // then back to listening. No window — reply YES whenever the card binder is set.
-        if (!exec.EnsureKnownUser(partner)) { Line($"Could not resolve '{partner}' — aborting."); break; }
-        try { exec.SendDM(partner, $"Grab desk is OPEN: reply YES any time you're ready to hand me the {card}. Have a binder that HAS the {card} active before you accept — I'm watching continuously; take nothing from my side."); } catch { }
-        Line($"\n>>> LISTENING continuously for a YES from {partner}. Reply YES in MTGO whenever ready; stop this task to end. <<<\n");
-        while (true)
-        {
-          if (!exec.WaitForDMYes(partner, int.MaxValue)) continue;
-          Line($"\n>>> YES received from {partner} — starting a grab cycle. <<<");
-          try { exec.SendDM(partner, $"On it — sending the trade now. Accept it with a binder that has the {card}, and take nothing from my side."); } catch { }
-          exec.CancelCurrent(); WaitForNoTrade();
-          var le = TryReachNegotiation(exec, partner, presentBinder: null, negotiateWaitSec: 90);
-          if (le is null)
-          {
-            exec.CancelCurrent(); WaitForNoTrade();
-            string why = exec.LastCloseReason ?? "";
-            if (why.IndexOf("Busy", StringComparison.OrdinalIgnoreCase) >= 0)
-            {
-              Line($"\n!!! Invite auto-DECLINED — {partner} is 'busy trading' ({why}). Close any open trade window / restart MTGO on that account, then reply YES. (Still listening.) !!!\n");
-              try { exec.SendDM(partner, "Couldn't reach you — your client says you're already in a trade. Close any open trade window (or restart MTGO), then reply YES."); } catch { }
-            }
-            else
-            {
-              Line($"Invite not accepted (closed: {(why.Length > 0 ? why : "unknown")}) — back to listening.");
-              try { exec.SendDM(partner, "Didn't see you accept the trade — reply YES again when you're ready."); } catch { }
-            }
-            continue;
-          }
-          bool ok = RunGrabCycle(exec, le, partner, card, cats, allowCommit);
-          Line(ok ? "\n>>> Grab cycle COMPLETE — back to listening for the next YES. <<<\n"
-                  : "\n>>> Grab cycle ended (cancelled/incomplete) — back to listening for the next YES. <<<\n");
-        }
-        // (unreachable — loop only exits when the task is stopped)
-      }
-
-      // ONE-SHOT: standardized handshake (DM -> wait up to 5 min for YES) then one cycle.
-      var esc = HandshakeThenInitiate(exec, partner, readyMsg, presentBinder: null);
-      if (esc is null) { try { exec.SendDM(partner, "Couldn't open the trade — reply YES when ready and I'll retry."); } catch { } break; }
-      RunGrabCycle(exec, esc, partner, card, cats, allowCommit);
+        var r = RunTrade(exec, partner, new(), want, allowCommit, listen ? int.MaxValue : 300);
+        Line($"\n>>> {r.detail} <<<\n");
+        if (r.ok && !listen) break;
+      } while (listen);
       break;
     }
 
@@ -2798,58 +2435,17 @@ using (var exec = new TradeExecutor { AllowCommit = allowCommit })
       exec.Attach();
 
       // ensure our offer binder holds the give card (owned printing).
-      var offer = exec.CreateSingleCardBinder("SwapOffer", giveCard);
-      if (offer is null) { Line("Could not create the SwapOffer binder — aborting."); break; }
-      Line($"Offer binder ready: '{offer.Name}' (id={offer.Id}, items={offer.ItemCount}).");
-
-      if (listen)
+      // ONE engine for both modes: Negotiate builds the offer binder holding exactly our
+      // give, requests exactly the listed cards, and verifies BOTH sides by catalog id.
+      var giveItems = new System.Collections.Generic.List<(string name, int qty, int catId)> { (giveCard, giveQty, 0) };
+      var getItems = getNames.Select(n => (name: n, qty: 1, catId: 0)).ToList();
+      if (listen) Line($"\n>>> LISTENING continuously for {partner}. Reply YES whenever ready; stop this task to end. <<<\n");
+      do
       {
-        // PERSISTENT LISTENER: stay running and watch the chat with the partner
-        // FOREVER. Each time they reply YES — whenever that is — fire one swap
-        // cycle, then go back to listening. No window, purely trigger-driven. Stop
-        // by ending the task (there is no other exit).
-        if (!exec.EnsureKnownUser(partner)) { Line($"Could not resolve '{partner}' — aborting."); break; }
-        try { exec.SendDM(partner, $"Swap desk is OPEN: my {giveQty} {giveCard} for your [{getList}]. Reply YES any time you're ready — I'm watching continuously. When I send the trade, accept it, present [{getList}], and grab the {giveCard}."); } catch { }
-        Line($"\n>>> LISTENING continuously for a YES from {partner}. Reply YES in MTGO whenever ready; stop this task to end. <<<\n");
-        while (true)
-        {
-          if (!exec.WaitForDMYes(partner, int.MaxValue)) continue;   // blocks until a NEW 'yes'
-          Line($"\n>>> YES received from {partner} — starting a swap cycle. <<<");
-          try { exec.SendDM(partner, $"On it — sending the trade now. Accept it, present [{getList}], and grab the {giveCard} from my SwapOffer binder."); } catch { }
-          exec.CancelCurrent(); WaitForNoTrade();
-          var le = TryReachNegotiation(exec, partner, presentBinder: "SwapOffer", negotiateWaitSec: 90);
-          if (le is null)
-          {
-            exec.CancelCurrent(); WaitForNoTrade();
-            string why = exec.LastCloseReason ?? "";
-            if (why.IndexOf("Busy", StringComparison.OrdinalIgnoreCase) >= 0)
-            {
-              // The partner's client auto-declined because IT thinks it's already
-              // trading (a stuck/leftover trade on their end). Retrying is futile
-              // until they clear it — say so plainly instead of looping.
-              Line($"\n!!! Invite auto-DECLINED — {partner} is 'busy trading' ({why}). Their MTGO client has a stuck/open trade, so it rejects invites WITHOUT showing them. Fix: on the {partner} account, CLOSE any trade window, or fully restart MTGO. Then reply YES again. (Still listening.) !!!\n");
-              try { exec.SendDM(partner, "Couldn't reach you — your client reports you're already in a trade, so it declined mine automatically. Close any open trade window (or restart MTGO), then reply YES."); } catch { }
-            }
-            else
-            {
-              Line($"Invite not accepted (closed: {(why.Length > 0 ? why : "unknown")}) — back to listening.");
-              try { exec.SendDM(partner, "Didn't see you accept the trade — reply YES again when you're ready."); } catch { }
-            }
-            continue;
-          }
-          bool ok = RunSwapCycle(exec, le, partner, giveCard, giveQty, getNames, allowCommit);
-          Line(ok ? "\n>>> Swap cycle COMPLETE — back to listening for the next YES. <<<\n"
-                  : "\n>>> Swap cycle ended (cancelled/incomplete) — back to listening for the next YES. <<<\n");
-        }
-        // (unreachable — loop only exits when the task is stopped)
-      }
-
-      // ONE-SHOT: standardized handshake (DM -> wait up to 5 min for YES) then one cycle.
-      var esc = HandshakeThenInitiate(exec, partner,
-        $"Swap offer: my {giveQty} {giveCard} for your [{getList}]. Reply YES when ready — then accept the trade, present [{getList}], and grab the {giveCard} from my SwapOffer binder.",
-        presentBinder: "SwapOffer");
-      if (esc is null) { Line($"Swap not started with {partner} (no YES, or the invite wasn't accepted). Nothing moved."); exec.CancelCurrent(); WaitForNoTrade(); break; }
-      RunSwapCycle(exec, esc, partner, giveCard, giveQty, getNames, allowCommit);
+        var r = RunTrade(exec, partner, giveItems, getItems, allowCommit, listen ? int.MaxValue : 300);
+        Line($"\n>>> {r.detail} <<<\n");
+        if (r.ok && !listen) break;
+      } while (listen);
       break;
     }
 

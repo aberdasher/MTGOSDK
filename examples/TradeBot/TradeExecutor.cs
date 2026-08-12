@@ -981,64 +981,7 @@ public sealed class TradeExecutor : IDisposable
     }
   }
 
-  /// <summary>
-  /// SAFETY GUARDRAIL for a one-way GRAB (receive-only): true ONLY if WE RECEIVE is
-  /// EXACTLY one card matching <paramref name="cardName"/> (qty == expectedQty) and
-  /// WE GIVE nothing. Never submit/approve a grab unless we're getting exactly the
-  /// target and handing over nothing. (The give-side guardrail for a set is
-  /// <see cref="GiveStatus"/>.)
-  /// </summary>
-  public bool VerifyReceiveIsOnly(TradeEscrow esc, string cardName, int expectedQty = 1)
-  {
-    var recv = new List<(string name, int qty)>();
-    try { foreach (var it in esc.PartnerTradedItems.CollectionItems) recv.Add((Try(() => it.Card?.Name) ?? "?", Try(() => (int)it.Quantity) ?? 0)); }
-    catch (Exception ex) { Log($"[guardrail] could not read WE RECEIVE: {ex.Message}"); return false; }
 
-    int giveCount = 0;
-    try { giveCount = esc.TradedItems.CollectionItems.Count; } catch { }
-
-    bool nameOk = recv.Count == 1 && recv[0].qty == expectedQty
-               && (recv[0].name?.ToLowerInvariant().Contains(cardName.ToLowerInvariant()) ?? false);
-    bool ok = nameOk && giveCount == 0;
-    Log($"[guardrail] WE RECEIVE = {(recv.Count == 0 ? "(none)" : string.Join(", ", recv.Select(r => $"{r.qty}x {r.name}")))}; WE GIVE items = {giveCount} => {(ok ? "OK (exactly the target, giving nothing)" : "REJECT")}");
-    return ok;
-  }
-
-  /// <summary>
-  /// Status of a multi-card GIVE vs the intended set: what the partner still needs
-  /// to grab (<c>missing</c>), what they grabbed that they SHOULDN'T (<c>extra</c>),
-  /// and whether WE GIVE is EXACTLY the intended set with nothing received
-  /// (<c>exact</c>). Used to remind the partner what's left to grab, and as the
-  /// give-side guardrail for a set. Read-only.
-  /// </summary>
-  public (List<string> missing, List<string> extra, bool exact) GiveStatus(
-      TradeEscrow esc, IReadOnlyList<(string name, int qty)> intended)
-  {
-    var give = new List<(string name, int qty)>();
-    try { foreach (var it in esc.TradedItems.CollectionItems) give.Add((Try(() => it.Card?.Name) ?? "?", Try(() => (int)it.Quantity) ?? 0)); }
-    catch { return (intended.Select(w => w.qty > 1 ? $"{w.qty}x {w.name}" : w.name).ToList(), new(), false); }
-
-    int recvCount = 0;
-    try { recvCount = esc.PartnerTradedItems.CollectionItems.Count; } catch { }
-
-    var missing = new List<string>();
-    foreach (var want in intended)
-    {
-      int got = give.Where(g => NameMatches(g.name, want.name)).Sum(g => g.qty);
-      if (got < want.qty) { int short_ = want.qty - got; missing.Add(short_ > 1 ? $"{short_}x {want.name}" : want.name); }
-    }
-    var extra = new List<string>();
-    foreach (var g in give)
-    {
-      // Total allowed for this given card = SUM of every intended qty whose name matches,
-      // so 3x of ONE card is fully allowed however `intended` is split. (A single "qty 2"
-      // grab of a 3x lend is then "missing 1", never "extra".)
-      int allowed = intended.Where(w => NameMatches(g.name, w.name)).Sum(w => w.qty);
-      if (g.qty > allowed) { int over = g.qty - allowed; extra.Add($"{over}x {g.name}"); }
-    }
-    bool exact = missing.Count == 0 && extra.Count == 0 && recvCount == 0;
-    return (missing, extra, exact);
-  }
 
   /// <summary>
   /// A trade item resolved to IDENTITY: which printings satisfy it, and how many.
@@ -1192,52 +1135,7 @@ public sealed class TradeExecutor : IDisposable
     return (missing, extra, missing.Count == 0 && extra.Count == 0);
   }
 
-  /// <summary>
-  /// THE card-name comparison for every guardrail and binder scan. MTGO can return a
-  /// typographic apostrophe (U+2019) where the caller typed a straight ' — strip both (and
-  /// trim) so "Kozilek's Command" matches regardless. MUST be used everywhere a requested
-  /// name is matched against a live item: a scan that compares raw strings while a guardrail
-  /// compares normalized ones disagrees about whether the partner presented the card, and
-  /// the trade gets cancelled on a card that was right there.
-  /// </summary>
-  public static bool NameMatches(string got, string want)
-  {
-    static string Norm(string s) =>
-        (s ?? "").Replace("’", "").Replace("‘", "").Replace("'", "").Trim();
-    return Norm(got).IndexOf(Norm(want), StringComparison.OrdinalIgnoreCase) >= 0;
-  }
 
-  /// <summary>
-  /// The receive-side mirror of <see cref="GiveStatus"/>: status of WE RECEIVE vs the
-  /// intended set — what the partner still hasn't presented/staged (<c>missing</c>),
-  /// what's staged that we did NOT ask for (<c>extra</c>), and whether WE RECEIVE is
-  /// EXACTLY the intended set (<c>exact</c>). intended empty = "we take nothing"
-  /// (exact iff nothing is staged our way). Same tolerant name matching. Read-only.
-  /// NOTE: unlike GiveStatus this does NOT constrain the give side — the caller
-  /// combines both statuses for a full both-sides guardrail.
-  /// </summary>
-  public (List<string> missing, List<string> extra, bool exact) ReceiveStatus(
-      TradeEscrow esc, IReadOnlyList<(string name, int qty)> intended)
-  {
-    var recv = new List<(string name, int qty)>();
-    try { foreach (var it in esc.PartnerTradedItems.CollectionItems) recv.Add((Try(() => it.Card?.Name) ?? "?", Try(() => (int)it.Quantity) ?? 0)); }
-    catch { return (intended.Select(w => w.qty > 1 ? $"{w.qty}x {w.name}" : w.name).ToList(), new(), false); }
-
-    var missing = new List<string>();
-    foreach (var want in intended)
-    {
-      int got = recv.Where(r => NameMatches(r.name, want.name)).Sum(r => r.qty);
-      if (got < want.qty) { int short_ = want.qty - got; missing.Add(short_ > 1 ? $"{short_}x {want.name}" : want.name); }
-    }
-    var extra = new List<string>();
-    foreach (var r in recv)
-    {
-      int allowed = intended.Where(w => NameMatches(r.name, w.name)).Sum(w => w.qty);
-      if (r.qty > allowed) { int over = r.qty - allowed; extra.Add($"{over}x {r.name}"); }
-    }
-    bool exact = missing.Count == 0 && extra.Count == 0;
-    return (missing, extra, exact);
-  }
 
   /// <summary>True if the trade partner (the OTHER party) has SUBMITTED their
   /// deposit — MTGO signals this in the escrow state ("...DepositReceivedOther" /
