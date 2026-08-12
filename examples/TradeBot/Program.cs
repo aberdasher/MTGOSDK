@@ -886,6 +886,226 @@ static bool RunGrabFlow(TradeBot.TradeExecutor exec, string partner, string card
 //   single receive-only          -> RunGrabFlow (custodian receives qty of one card; give nothing)
 //   single give(qty1) + receive  -> RunSwapFlow (give one card, request the listed cards)
 // `allowCommit` here is the EFFECTIVE commit (caller already ANDed process + job commit).
+static string FmtItems(System.Collections.Generic.IEnumerable<(string name, int qty, int catId)> xs) =>
+  string.Join(", ", xs.Select(i => i.qty > 1 ? $"{i.qty}x {i.name}" : i.name));
+
+// ── THE unified trade engine ──────────────────────────────────────────────────
+// ONE pipeline for every shape: present a binder holding EXACTLY `give` (empty when we
+// give nothing), request EXACTLY `receive`, verify BOTH sides, then finalize. Lend is
+// Negotiate(cards, []), grab is Negotiate([], [card]), swap is Negotiate([x], [y...]) —
+// and every combination in between works, so there is no "unsupported combo".
+//
+// Fails closed everywhere: any binder problem, guardrail miss, or timeout cancels the
+// trade having moved nothing, and DMs the partner HOW to fix it. Returns true iff
+// committed; always sets TradeExecutor.LastFlowDetail with the real reason.
+static bool Negotiate(TradeBot.TradeExecutor exec, string partner,
+    System.Collections.Generic.List<(string name, int qty, int catId)> give,
+    System.Collections.Generic.List<(string name, int qty, int catId)> receive,
+    bool allowCommit, int yesTimeoutSec, string label)
+{
+  give ??= new(); receive ??= new();
+  string giveList = FmtItems(give), recvList = FmtItems(receive);
+  var giveIntended = give.Select(g => (g.name, Math.Max(1, g.qty))).ToList();
+  var recvIntended = receive.Select(r => (r.name, Math.Max(1, r.qty))).ToList();
+
+  // ── PHASE 1: the offer binder — exactly what they may take (empty if nothing) ──
+  exec.WarmCollectionAndBinders();
+  string? presentBinder = exec.EnsureOfferBinderName("Offer", give);
+  if (presentBinder is null)
+  {
+    TradeBot.TradeExecutor.LastFlowDetail = give.Count == 0
+        ? "could not prepare an empty offer binder"
+        : $"could not build an offer binder holding exactly {giveList}";
+    Line($"Aborting before opening a trade — {TradeBot.TradeExecutor.LastFlowDetail}.");
+    return false;
+  }
+  Line($"Offer binder ready: '{presentBinder}' presents {(give.Count == 0 ? "NOTHING (you can take nothing from me)" : giveList)}.");
+
+  // ── PHASE 2: handshake — tell them EXACTLY what to do on their side ──
+  var ask = new System.Collections.Generic.List<string>();
+  if (give.Count > 0) ask.Add($"grab {giveList} from the '{presentBinder}' binder I present (and nothing else)");
+  if (receive.Count > 0)
+    ask.Add($"present a binder that CONTAINS {recvList} — pick it BEFORE you accept, MTGO locks it in once the trade opens — and let me take {(recvIntended.Count == 1 ? "it" : "them")}");
+  string prompt = give.Count == 0 && receive.Count > 0
+      ? $"Ready to send me {recvList}? Pick a binder containing {recvList} BEFORE accepting (MTGO locks it in), then reply YES. I present an empty binder — there's nothing of mine to take."
+      : $"Trade ready: please {string.Join("; and ", ask)}. Reply YES when you're set.";
+  Line($"\nPrompting {partner} — waiting for YES ({(yesTimeoutSec >= int.MaxValue / 2 ? "until ready" : yesTimeoutSec + "s")})...");
+  if (!exec.SendPromptWhenOnlineAndWaitForYes(partner, prompt, yesTimeoutSec))
+  {
+    TradeBot.TradeExecutor.LastFlowDetail = exec.AbortRequested ? "cancelled by operator" : "no YES from the partner in time";
+    Line($"No go — {TradeBot.TradeExecutor.LastFlowDetail}.");
+    return false;
+  }
+  try { exec.SendDM(partner, "On it — opening the trade now."); } catch { }
+
+  // ── PHASE 3: open the trade presenting OUR binder ──
+  exec.CancelCurrent(); WaitForNoTrade();
+  var esc = TryReachNegotiation(exec, partner, presentBinder, negotiateWaitSec: 90);
+  if (esc is null)
+  {
+    string why = (exec.LastCloseReason ?? "").IndexOf("Busy", StringComparison.OrdinalIgnoreCase) >= 0
+        ? "you were busy in another trade" : "the trade didn't open";
+    TradeBot.TradeExecutor.LastFlowDetail = $"could not reach negotiation ({why})";
+    Line($"Couldn't reach negotiation — {why}.");
+    try { exec.SendDM(partner, $"Couldn't open the trade — {why}. Close any open trade window (restart MTGO if it's stuck), then reply YES to retry."); } catch { }
+    return false;
+  }
+
+  // ── PHASE 4: watch until BOTH sides are exactly right ──
+  // Their presented binder is FIXED at trade start, so snapshot it ONCE (retrying while it
+  // populates) instead of re-reading a large binder every tick.
+  var presentedCat = new System.Collections.Generic.Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+  bool snapped = false;
+  long watchMs = yesTimeoutSec >= int.MaxValue / 2 ? long.MaxValue : Math.Max(60_000L, (long)yesTimeoutSec * 1000);
+  const int pollMs = 1000;
+  int lastReq = -5000, lastNote = -5000; string lastRemindKey = "";
+  bool ready = false;
+
+  for (long ms = 0; ms < watchMs && !ready; ms += pollMs)
+  {
+    if (exec.AbortRequested)
+    {
+      TradeBot.TradeExecutor.LastFlowDetail = "cancelled by operator";
+      Line("Cancelled by operator — closing the trade (nothing moved)."); exec.CancelCurrent(); WaitForNoTrade(); return false;
+    }
+    System.Threading.Thread.Sleep(pollMs);
+    var c = MTGOSDK.API.Trade.TradeManager.CurrentTrade;
+    if (c is null)
+    {
+      TradeBot.TradeExecutor.LastFlowDetail = "the partner closed the trade before it was complete";
+      Line("Trade closed before completion."); return false;
+    }
+    esc = c;
+
+    // Snapshot their presented binder once it has content (they may still be loading).
+    if (!snapped && receive.Count > 0)
+    {
+      try
+      {
+        var items = c.PartnerCollection.CollectionItems;
+        if (items.Count > 0)
+        {
+          foreach (var want in receive)
+          {
+            foreach (var it in items)
+            {
+              string nm = Try2(() => it.Card?.Name) ?? "";
+              int cid = Try2(() => (int?)it.Id) ?? -1;
+              bool nameOk = nm.IndexOf(want.name, StringComparison.OrdinalIgnoreCase) >= 0;
+              if (nameOk && (want.catId <= 0 || cid == want.catId)) { presentedCat[want.name] = cid; break; }
+            }
+          }
+          snapped = true;
+          var found = receive.Where(w => presentedCat.ContainsKey(w.name)).Select(w => w.name).ToList();
+          Line($"  their binder presents: {(found.Count == 0 ? "(none of what I need)" : string.Join(", ", found))}");
+        }
+      }
+      catch { }
+    }
+
+    var gs = exec.GiveStatus(c, giveIntended);
+    var rs = exec.ReceiveStatus(c, recvIntended);
+
+    // They took something we didn't offer -> cancel (this is the asset guardrail).
+    if (gs.extra.Count > 0)
+    {
+      TradeBot.TradeExecutor.LastFlowDetail = $"partner took {string.Join(", ", gs.extra)}, which was not offered";
+      Line($"They grabbed something not offered ({string.Join(", ", gs.extra)}) — cancelling for safety.");
+      exec.CancelCurrent(); WaitForNoTrade();
+      try { exec.SendDM(partner, $"Cancelled — you took {string.Join(", ", gs.extra)}, which isn't part of this trade. " + (give.Count == 0 ? "I'm giving nothing here; please don't take anything from my side." : $"Please take ONLY {giveList}.") + " Reply YES to retry."); } catch { }
+      return false;
+    }
+    // We'd be receiving something we didn't ask for -> cancel (protects THEM, and keeps
+    // the ledger exact: DraftBot credits only what was requested).
+    if (rs.extra.Count > 0)
+    {
+      TradeBot.TradeExecutor.LastFlowDetail = $"partner staged {string.Join(", ", rs.extra)}, which was not requested";
+      Line($"They staged extra ({string.Join(", ", rs.extra)}) — cancelling.");
+      exec.CancelCurrent(); WaitForNoTrade();
+      try { exec.SendDM(partner, $"Cancelled — you staged {string.Join(", ", rs.extra)}, which I didn't ask for. Please offer exactly {recvList}, then reply YES to retry."); } catch { }
+      return false;
+    }
+
+    if (gs.missing.Count == 0 && rs.exact) { ready = true; break; }
+
+    // Pull what we're owed from their presented binder (exact printing when we know it).
+    if (rs.missing.Count > 0 && ms - lastReq >= 1500)
+    {
+      lastReq = (int)ms;
+      foreach (var want in receive)
+      {
+        int cat = presentedCat.TryGetValue(want.name, out var pc) ? pc : -1;
+        if (cat > 0) exec.RequestViaWishlist(cat, Math.Max(1, want.qty), want.name);
+      }
+    }
+
+    // They pressed Submit while something is still missing — tell them precisely what.
+    if (gs.missing.Count > 0 && TradeBot.TradeExecutor.PartnerHasSubmitted(c))
+    {
+      string key = string.Join("|", gs.missing);
+      if (key != lastRemindKey)
+      {
+        lastRemindKey = key;
+        Line($"  [reminder] {partner} submitted but still needs to grab: {string.Join(", ", gs.missing)}");
+        try { exec.SendDM(partner, $"Hold on — you submitted, but you still need to grab: {string.Join(", ", gs.missing)} from the '{presentBinder}' binder. Grab {(gs.missing.Count == 1 ? "it" : "them")} and submit again; I won't approve until it's exact."); } catch { }
+      }
+    }
+    else if (!TradeBot.TradeExecutor.PartnerHasSubmitted(c)) lastRemindKey = "";
+
+    // The card is in their binder but won't come across — the known stale view-model bug.
+    if (snapped && ms >= 25_000 && rs.missing.Count > 0 && presentedCat.Count > 0)
+    {
+      TradeBot.TradeExecutor.LastFlowDetail = "partner's card is presented but could not be pulled (stale trade view-model)";
+      Line($"\n!!! CANCELLING — {string.Join(", ", rs.missing)} is in your binder but I can't pull it (stale trade view-model). !!!\n");
+      exec.CancelCurrent(); WaitForNoTrade();
+      try { exec.SendDM(partner, $"Cancelled — I can see {string.Join(", ", rs.missing)} in your binder but couldn't pull it across (an MTGO hiccup). Please restart your MTGO client, then reply YES to retry."); } catch { }
+      return false;
+    }
+    // What we need isn't in the binder they locked in — they must reopen with the right one.
+    if (ms >= 20_000 && receive.Count > 0 && presentedCat.Count < receive.Count)
+    {
+      var absent = receive.Where(w => !presentedCat.ContainsKey(w.name)).Select(w => w.qty > 1 ? $"{w.qty}x {w.name}" : w.name).ToList();
+      TradeBot.TradeExecutor.LastFlowDetail = $"partner's presented binder does not contain {string.Join(", ", absent)}";
+      Line($"\n!!! CANCELLING — {string.Join(", ", absent)} is not in the binder you presented. !!!\n");
+      exec.CancelCurrent(); WaitForNoTrade();
+      try { exec.SendDM(partner, $"Cancelled — {string.Join(", ", absent)} isn't in the binder you presented, and MTGO won't let you change it mid-trade. Pick a binder that HAS {(absent.Count == 1 ? "it" : "them")} (select it before accepting), then reply YES to retry."); } catch { }
+      return false;
+    }
+
+    if (ms - lastNote >= 10_000)
+    {
+      lastNote = (int)ms;
+      Line($"  t+{ms / 1000,3}s  WE GIVE: {TradeBot.TradeExecutor.Summarize(c.TradedItems)} (still to grab: {(gs.missing.Count == 0 ? "(none)" : string.Join(", ", gs.missing))})" +
+           $"  |  WE RECEIVE: {TradeBot.TradeExecutor.Summarize(c.PartnerTradedItems)} (still needed: {(rs.missing.Count == 0 ? "(none)" : string.Join(", ", rs.missing))})");
+    }
+  }
+
+  if (!ready)
+  {
+    TradeBot.TradeExecutor.LastFlowDetail = "the trade wasn't completed in time";
+    Line("Didn't reach an exact trade in time — cancelling.");
+    exec.CancelCurrent(); WaitForNoTrade();
+    try { exec.SendDM(partner, "Cancelled — we ran out of time before both sides were exact. Reply YES to retry."); } catch { }
+    return false;
+  }
+  Line($"GUARDRAIL passed: WE GIVE exactly {(give.Count == 0 ? "nothing" : giveList)}; WE RECEIVE exactly {(receive.Count == 0 ? "nothing" : recvList)}.");
+
+  // ── PHASE 5: the shared finalize tail (submit -> re-verify -> commit/dry-run) ──
+  string doneDm = give.Count > 0 && receive.Count > 0 ? $"Done — you got {giveList}, I got {recvList}. Thanks!"
+                : give.Count > 0 ? $"Done — enjoy {giveList}!"
+                : $"Thanks — got {recvList}!";
+  return FinalizeTrade(exec, partner,
+      c2 =>
+      {
+        var g2 = exec.GiveStatus(c2, giveIntended);
+        return g2.missing.Count == 0 && g2.extra.Count == 0 && exec.ReceiveStatus(c2, recvIntended).exact;
+      },
+      allowCommit, label, doneDm);
+}
+
+// Small guarded read used by the engine's binder snapshot.
+static T? Try2<T>(Func<T?> f) { try { return f(); } catch { return default; } }
+
 static (bool ok, string detail) RunTrade(TradeBot.TradeExecutor exec, string partner,
     System.Collections.Generic.List<(string name, int qty, int catId)> give,
     System.Collections.Generic.List<(string name, int qty, int catId)> receive,
@@ -899,41 +1119,29 @@ static (bool ok, string detail) RunTrade(TradeBot.TradeExecutor exec, string par
   static string Fmt(System.Collections.Generic.List<(string name, int qty, int catId)> xs) =>
     string.Join(", ", xs.Select(i => i.qty > 1 ? $"{i.qty}x {i.name}" : i.name));
 
+  // EVERY shape goes through the one engine: it presents a binder holding exactly `give`
+  // (empty when we give nothing) and requests exactly `receive`. There is no unsupported
+  // combo — multi-give, qty>1 receive, and give+receive together all just work.
+  // yesTimeoutSec is the READINESS wait (partner online + YES); int.MaxValue = until ready,
+  // and the watch phase inherits it. An operator cancel breaks out -> "cancelled" below.
   bool giveOnly = give.Count > 0 && receive.Count == 0;
   bool recvOnly = give.Count == 0 && receive.Count > 0;
+  string label = giveOnly ? "give" : recvOnly ? "grab" : "swap";
 
-  // yesTimeoutSec is the READINESS wait (how long to wait for the partner to be online + reply
-  // YES); int.MaxValue = "until they're ready". The grab/completion phase stays bounded inside
-  // each flow. An operator cancel (exec.AbortRequested) breaks the wait -> "cancelled" below.
-  TradeBot.TradeExecutor.LastFlowDetail = null;   // flows that reach the finalize phase report the REAL outcome here
-  bool ok; string okDetail, failDetail;
-  if (giveOnly)
-  {
-    ok = RunLend(exec, partner, give, allowCommit: allowCommit, keepOpen: false, yesTimeoutSec: yesTimeoutSec);
-    okDetail = allowCommit ? $"committed — gave {Fmt(give)}" : $"dry-run — reached ready, gave nothing ({Fmt(give)})";
-    failDetail = "not completed (declined / grab incomplete / guardrail)";
-  }
-  else if (recvOnly && receive.Count == 1)
-  {
-    var r = receive[0];
-    ok = RunGrabFlow(exec, partner, r.name, allowCommit: allowCommit, yesTimeoutSec: yesTimeoutSec, qty: r.qty, requiredCat: r.catId);
-    okDetail = allowCommit ? $"committed — received {Fmt(receive)}{(r.catId > 0 ? $" (printing {r.catId})" : "")}" : $"dry-run — reached ready, received nothing ({Fmt(receive)})";
-    failDetail = "not completed (cards not presented / took-from-us / guardrail)";
-  }
-  else if (give.Count == 1 && give[0].qty == 1 && receive.Count > 0)
-  {
-    // SWAP: give one card, request the listed cards back (receive-side qty not yet honored —
-    // requests each name once, matching the old worker).
-    ok = RunSwapFlow(exec, partner, give[0].name, receive.Select(i => i.name).ToList(), allowCommit, yesTimeoutSec: yesTimeoutSec);
-    okDetail = allowCommit ? $"committed — swapped {give[0].name} for {Fmt(receive)}" : $"dry-run — swap reached ready ({give[0].name} for {Fmt(receive)})";
-    failDetail = "not completed (declined / guardrail)";
-  }
-  else return (false, "unsupported give/receive combo (v1: give-only lend, single receive-only grab, or single-give+receive swap; multi-give / qty>1 receive-with-give not yet)");
+  TradeBot.TradeExecutor.LastFlowDetail = null;   // the engine records the REAL outcome here
+  bool ok = Negotiate(exec, partner, give, receive, allowCommit, yesTimeoutSec, label);
+
+  string okDetail =
+      allowCommit
+        ? (giveOnly ? $"committed — gave {Fmt(give)}"
+         : recvOnly ? $"committed — received {Fmt(receive)}"
+         : $"committed — gave {Fmt(give)} for {Fmt(receive)}")
+        : $"dry-run — reached ready, nothing moved ({(giveOnly ? Fmt(give) : recvOnly ? Fmt(receive) : $"{Fmt(give)} for {Fmt(receive)}")})";
 
   if (ok) return (true, okDetail);
   if (exec.AbortRequested) return (false, "cancelled by operator");
-  // Prefer the flow's actual reason (set by FinalizeTrade) over the canned per-shape guess.
-  return (false, TradeBot.TradeExecutor.LastFlowDetail ?? failDetail);
+  // The engine always sets the real reason; the fallback should never be needed.
+  return (false, TradeBot.TradeExecutor.LastFlowDetail ?? $"{label} not completed");
 }
 
 // Given a negotiating escrow, stage the requested card (non-committing) and HOLD
@@ -2307,12 +2515,15 @@ using (var exec = new TradeExecutor { AllowCommit = allowCommit })
         },
         recallFn: (partner, card, catId, qty, jobCommit, waitSec) =>
         {
-          // Recall = receive the EXACT owed printing (requiredCat) back, giving nothing.
+          // Recall is just a receive-only trade pinned to the EXACT printing we lent —
+          // same engine as everything else (it presents an empty binder, so the borrower
+          // has nothing of ours to take while returning our card).
           bool effectiveCommit = allowCommit && jobCommit;
-          bool ok = RunGrabFlow(conn.Exec, partner, card, allowCommit: effectiveCommit, yesTimeoutSec: waitSec, qty: qty, requiredCat: catId);
+          var want = new System.Collections.Generic.List<(string name, int qty, int catId)> { (card, qty, catId) };
+          var r = RunTrade(conn.Exec, partner, new(), want, allowCommit: effectiveCommit, yesTimeoutSec: waitSec);
           string set = qty > 1 ? $"{qty}x {card}" : card;
-          return (ok, ok ? (effectiveCommit ? $"committed — recalled {set} (printing {catId})" : $"dry-run — recall reached ready ({set})")
-                         : "not completed (declined / wrong printing / guardrail)");
+          return (r.ok, r.ok ? (effectiveCommit ? $"committed — recalled {set} (printing {catId})" : $"dry-run — recall reached ready ({set})")
+                             : r.detail);
         },
         vaultFn: () =>
         {
