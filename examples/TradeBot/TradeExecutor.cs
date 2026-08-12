@@ -1038,6 +1038,43 @@ public sealed class TradeExecutor : IDisposable
     return (missing, extra, exact);
   }
 
+  /// <summary>
+  /// The receive-side mirror of <see cref="GiveStatus"/>: status of WE RECEIVE vs the
+  /// intended set — what the partner still hasn't presented/staged (<c>missing</c>),
+  /// what's staged that we did NOT ask for (<c>extra</c>), and whether WE RECEIVE is
+  /// EXACTLY the intended set (<c>exact</c>). intended empty = "we take nothing"
+  /// (exact iff nothing is staged our way). Same tolerant name matching. Read-only.
+  /// NOTE: unlike GiveStatus this does NOT constrain the give side — the caller
+  /// combines both statuses for a full both-sides guardrail.
+  /// </summary>
+  public (List<string> missing, List<string> extra, bool exact) ReceiveStatus(
+      TradeEscrow esc, IReadOnlyList<(string name, int qty)> intended)
+  {
+    var recv = new List<(string name, int qty)>();
+    try { foreach (var it in esc.PartnerTradedItems.CollectionItems) recv.Add((Try(() => it.Card?.Name) ?? "?", Try(() => (int)it.Quantity) ?? 0)); }
+    catch { return (intended.Select(w => w.qty > 1 ? $"{w.qty}x {w.name}" : w.name).ToList(), new(), false); }
+
+    static string Norm(string s) =>
+        (s ?? "").Replace("’", "").Replace("‘", "").Replace("'", "").Trim();
+    bool NameMatch(string got, string want) =>
+        Norm(got).IndexOf(Norm(want), StringComparison.OrdinalIgnoreCase) >= 0;
+
+    var missing = new List<string>();
+    foreach (var want in intended)
+    {
+      int got = recv.Where(r => NameMatch(r.name, want.name)).Sum(r => r.qty);
+      if (got < want.qty) { int short_ = want.qty - got; missing.Add(short_ > 1 ? $"{short_}x {want.name}" : want.name); }
+    }
+    var extra = new List<string>();
+    foreach (var r in recv)
+    {
+      int allowed = intended.Where(w => NameMatch(r.name, w.name)).Sum(w => w.qty);
+      if (r.qty > allowed) { int over = r.qty - allowed; extra.Add($"{over}x {r.name}"); }
+    }
+    bool exact = missing.Count == 0 && extra.Count == 0;
+    return (missing, extra, exact);
+  }
+
   /// <summary>True if the trade partner (the OTHER party) has SUBMITTED their
   /// deposit — MTGO signals this in the escrow state ("...DepositReceivedOther" /
   /// "...DepositSubmittedOther" / "...DepositReceivedBoth"). Lets us catch a partner
@@ -1090,6 +1127,47 @@ public sealed class TradeExecutor : IDisposable
     return (-1, 0);
   }
 
+  /// <summary>
+  /// BATCH printing resolution in ONE collection scan. Per-item resolution
+  /// (<see cref="ResolveOwnedPrinting"/> + <see cref="OwnedQtyOfCat"/>) costs a full remote
+  /// scan EACH, so a 50-copy give cost ~100 scans; this pays for one. For every requested
+  /// (name, catId): keep the pinned printing when we own it, else pick an owned printing of
+  /// that name, else -1 (caller decides — fail-closed for an Offer binder).
+  /// Returns the resolved catId per input index. Read-only.
+  /// </summary>
+  public List<int> ResolveOwnedPrintings(IReadOnlyList<(string name, int catId)> items)
+  {
+    var owned = new Dictionary<int, int>();          // catId -> qty (one scan)
+    try
+    {
+      foreach (var it in MTGOSDK.API.Collection.CollectionManager.Collection.Items)
+      {
+        int id = Try(() => it.Id) ?? -1, q = Try(() => it.Quantity) ?? 0;
+        if (id > 0 && q > 0) owned[id] = q;
+      }
+    }
+    catch (Exception ex) { Log($"[binder] batch collection scan failed: {ex.Message.Split('\n')[0]}"); }
+
+    var printingsOf = new Dictionary<string, HashSet<int>>(StringComparer.OrdinalIgnoreCase);
+    var result = new List<int>(items.Count);
+    foreach (var (name, wantCat) in items)
+    {
+      if (wantCat > 0 && owned.ContainsKey(wantCat)) { result.Add(wantCat); continue; }
+      if (wantCat > 0) Log($"[binder] don't OWN pinned printing catId={wantCat} of '{name}' — resolving another owned printing.");
+      if (!printingsOf.TryGetValue(name, out var cats))
+      {
+        try { cats = MTGOSDK.API.Collection.CollectionManager.GetCardIds(name).ToHashSet(); }
+        catch { cats = new HashSet<int>(); }
+        printingsOf[name] = cats;
+      }
+      int pick = -1;
+      foreach (var c in cats) if (owned.ContainsKey(c)) { pick = c; break; }
+      if (pick <= 0) Log($"[binder] '{name}': NOT owned in any printing.");
+      result.Add(pick);
+    }
+    return result;
+  }
+
   /// <summary>Owned quantity of an EXACT printing (catId). 0 if not owned.</summary>
   public int OwnedQtyOfCat(int catId)
   {
@@ -1107,7 +1185,8 @@ public sealed class TradeExecutor : IDisposable
   /// cards. Each item may pin an EXACT printing (catId &gt; 0) — so a lend hands over the specific
   /// version; catId 0 resolves an owned printing by name. Returns the Binder, or null.
   /// </summary>
-  public MTGOSDK.API.Collection.Binder? CreateBinder(string binderName, System.Collections.Generic.IReadOnlyList<(string name, int catId)> items)
+  public MTGOSDK.API.Collection.Binder? CreateBinder(string binderName, System.Collections.Generic.IReadOnlyList<(string name, int catId)> items,
+      bool preResolved = false)
   {
     var existing = MTGOSDK.API.Collection.CollectionManager.Binders
       .FirstOrDefault(b => string.Equals(Try(() => b.Name) ?? "", binderName, StringComparison.OrdinalIgnoreCase));
@@ -1127,9 +1206,15 @@ public sealed class TradeExecutor : IDisposable
       try
       {
         int useCat = wantCat;
-        if (useCat > 0 && OwnedQtyOfCat(useCat) <= 0)
-        { Log($"[binder] don't OWN requested printing catId={useCat} of '{cn}' — falling back to an owned printing."); useCat = 0; }
-        if (useCat <= 0) { var (oc, _) = ResolveOwnedPrinting(cn); useCat = oc; }
+        // preResolved: the caller already batch-resolved ownership in ONE scan
+        // (ResolveOwnedPrintings) — re-checking here would cost a full collection scan PER
+        // item, which is what made large gives so slow.
+        if (!preResolved)
+        {
+          if (useCat > 0 && OwnedQtyOfCat(useCat) <= 0)
+          { Log($"[binder] don't OWN requested printing catId={useCat} of '{cn}' — falling back to an owned printing."); useCat = 0; }
+          if (useCat <= 0) { var (oc, _) = ResolveOwnedPrinting(cn); useCat = oc; }
+        }
         if (useCat > 0)
         {
           d = Unbind(MTGOSDK.API.Collection.CollectionManager.GetCard(useCat));
@@ -1274,7 +1359,8 @@ public sealed class TradeExecutor : IDisposable
   public MTGOSDK.API.Collection.Binder? EnsureBinderExact(string binderName, System.Collections.Generic.IReadOnlyList<string> cardNames)
     => EnsureBinderExact(binderName, cardNames.Select(n => (n, 0)).ToList());
 
-  public MTGOSDK.API.Collection.Binder? EnsureBinderExact(string binderName, System.Collections.Generic.IReadOnlyList<(string name, int catId)> items)
+  public MTGOSDK.API.Collection.Binder? EnsureBinderExact(string binderName, System.Collections.Generic.IReadOnlyList<(string name, int catId)> items,
+      bool preResolved = false)
   {
     var existing = MTGOSDK.API.Collection.CollectionManager.Binders
       .FirstOrDefault(b => string.Equals(Try(() => b.Name) ?? "", binderName, StringComparison.OrdinalIgnoreCase));
@@ -1302,7 +1388,197 @@ public sealed class TradeExecutor : IDisposable
         return null;
       }
     }
-    return CreateBinder(binderName, items);
+    return CreateBinder(binderName, items, preResolved);
+  }
+
+  /// <summary>The binder a receive-only trade presents so the partner sees NOTHING of ours
+  /// to take. Reused if it already exists; <see cref="TryCreateEmptyBinder"/> attempts to
+  /// create it when missing.</summary>
+  public const string EmptyBinderName = "Empty";
+
+  /// <summary>
+  /// Wait until the collection AND binder list are actually loaded. Right after an attach /
+  /// login both read empty or stale and MTGO's WPF UI thread is busy, which makes binder
+  /// creation time out ("Dispatcher operation timed out after 5 seconds"). Every binder
+  /// operation should warm first. Returns true if the collection came up.
+  /// </summary>
+  public bool WarmCollectionAndBinders(int maxSeconds = 40)
+  {
+    bool items = false; int binders = 0;
+    for (int waited = 0; waited < maxSeconds; waited += 2)
+    {
+      try { items = MTGOSDK.API.Collection.CollectionManager.Collection.Items.Any(); } catch { }
+      try { binders = MTGOSDK.API.Collection.CollectionManager.Binders.Count(); } catch { }
+      // The binder list populates SLOWER than the collection; once the collection is up,
+      // give binders a few more seconds before proceeding (a genuinely binder-less account
+      // must not wait forever).
+      if (items && (binders > 0 || waited >= 10))
+      { Log($"[warm] collection loaded, {binders} binder(s) visible after {waited}s."); return true; }
+      System.Threading.Thread.Sleep(2000);
+    }
+    Log($"[warm] gave up after {maxSeconds}s (collection loaded: {items}, binders: {binders}).");
+    return items;
+  }
+
+  /// <summary>
+  /// DIAGNOSTIC: dump the collection-grouping manager's binder API (every CreateNewBinder
+  /// overload and any add/remove/clear entry points), so we can see EXACTLY which signature
+  /// can make an empty binder rather than guessing from one failed call. Read-only.
+  /// </summary>
+  public void ProbeBinderApi()
+  {
+    ProbeService("grouping-manager", IGroupingManager,
+        new[] { "CreateNewBinder", "CreateNew", "Delete", "Add", "Remove", "Clear", "Grouping", "Binder" });
+  }
+
+  /// <summary>
+  /// Try hard to create an EMPTY binder, reporting the full exception chain for each
+  /// strategy: (1) an empty List&lt;ICardDefinition&gt;, (2) a null card list, (3) any
+  /// name-only / name+image CreateNewBinder overload discovered by reflection. Returns the
+  /// binder if one of them yields a real zero-item binder, else null.
+  /// </summary>
+  public MTGOSDK.API.Collection.Binder? TryCreateEmptyBinder(string binderName)
+  {
+    string asmName = Try(() => RemoteClient.GetInstanceType(ICardDefinition).Assembly.GetName().Name)
+                     ?? "WotC.MtGO.Client.Model";
+    string listType = $"System.Collections.Generic.List`1[[{ICardDefinition}, {asmName}]]";
+    dynamic mgr = Unbind((object)ObjectProvider.Get(IGroupingManager, true, false, false));
+
+    MTGOSDK.API.Collection.Binder? Found() =>
+      MTGOSDK.API.Collection.CollectionManager.Binders
+        .FirstOrDefault(b => string.Equals(Try(() => b.Name) ?? "", binderName, StringComparison.OrdinalIgnoreCase));
+
+    void Report(string strategy, Exception ex)
+    {
+      var chain = new List<string>();
+      for (Exception? e = ex; e != null; e = e.InnerException)
+        chain.Add($"{e.GetType().Name}: {e.Message.Split('\n')[0]}");
+      Log($"[binder] empty-create via {strategy} FAILED -> {string.Join("  ||  ", chain)}");
+    }
+
+    // A cold/busy WPF UI thread makes CreateNewBinder time out after 5s — warm first, then
+    // RETRY: the observed failure is transient, not a rejection of the empty list.
+    WarmCollectionAndBinders();
+
+    // Strategy 1: empty List<ICardDefinition>, retried through transient UI-thread timeouts.
+    for (int attempt = 1; attempt <= 4; attempt++)
+    {
+      try
+      {
+        dynamic list = RemoteClient.CreateInstance(listType);
+        OnUI(() => mgr.CreateNewBinder(binderName, null, list));
+      }
+      catch (Exception ex) { Report($"empty-list attempt {attempt}", ex); }
+
+      System.Threading.Thread.Sleep(2000);
+      var b = Found(); int c = b is null ? -1 : (Try(() => b.ItemCount) ?? -1);
+      Log($"[binder] strategy 'empty-list' attempt {attempt} -> binder {(b is null ? "NOT created" : $"created with {c} item(s)")}.");
+      if (b != null && c == 0) return b;
+      if (b != null) { DeleteBinder(binderName); }
+      if (attempt < 4) System.Threading.Thread.Sleep(3000);
+    }
+
+    // Strategy 2: null card list
+    try
+    {
+      OnUI(() => mgr.CreateNewBinder(binderName, null, null));
+      System.Threading.Thread.Sleep(1500);
+      var b = Found(); int c = b is null ? -1 : (Try(() => b.ItemCount) ?? -1);
+      Log($"[binder] strategy 'null-list' -> binder {(b is null ? "NOT created" : $"created with {c} item(s)")}.");
+      if (b != null && c == 0) return b;
+    }
+    catch (Exception ex) { Report("null-list", ex); }
+
+    // Strategy 3: any other CreateNewBinder arity the type exposes (name only, name+image, ...)
+    try
+    {
+      var t = ((DynamicRemoteObject)mgr).__type;
+      foreach (var m in t.GetMethods().Where(m => m.Name.IndexOf("CreateNewBinder", StringComparison.OrdinalIgnoreCase) >= 0))
+      {
+        var ps = m.GetParameters();
+        Log($"[binder] discovered overload: {m.Name}({string.Join(", ", ps.Select(p => p.ParameterType.Name + " " + p.Name))})");
+        if (ps.Length == 3) continue;                        // already tried above
+        try
+        {
+          var argv = new object?[ps.Length];
+          for (int i = 0; i < ps.Length; i++) argv[i] = i == 0 ? binderName : null;
+          OnUI(() => m.Invoke(mgr, argv));
+          System.Threading.Thread.Sleep(1500);
+          var b = Found(); int c = b is null ? -1 : (Try(() => b.ItemCount) ?? -1);
+          Log($"[binder] strategy '{ps.Length}-arg overload' -> binder {(b is null ? "NOT created" : $"created with {c} item(s)")}.");
+          if (b != null && c == 0) return b;
+        }
+        catch (Exception ex) { Report($"{ps.Length}-arg overload", ex); }
+      }
+    }
+    catch (Exception ex) { Report("overload discovery", ex); }
+
+    return null;
+  }
+
+  /// <summary>
+  /// Get the confirmed-EMPTY binder for a receive-only trade. Never creates or deletes:
+  /// MTGO cannot create a zero-item binder, so this binder is set up once by the operator
+  /// (see <see cref="EmptyBinderName"/>) and the bot only ever verifies + reuses it.
+  /// Returns null when it's missing or has drifted non-empty — callers MUST fail closed
+  /// rather than open a trade presenting an unknown binder.
+  /// </summary>
+  public MTGOSDK.API.Collection.Binder? GetEmptyBinder(string binderName)
+  {
+    var existing = MTGOSDK.API.Collection.CollectionManager.Binders
+      .FirstOrDefault(b => string.Equals(Try(() => b.Name) ?? "", binderName, StringComparison.OrdinalIgnoreCase));
+    if (existing is null)
+    {
+      Log($"[binder] no binder named '{binderName}' — attempting to create an empty one...");
+      var made = TryCreateEmptyBinder(binderName);
+      if (made != null) return made;
+      Log($"[binder] SETUP NEEDED: could not create '{binderName}' via any API path. In the MTGO client, " +
+          $"make a new binder called '{binderName}' and leave it EMPTY — receive-only trades present it " +
+          $"so the partner has nothing of ours to take.");
+      return null;
+    }
+    int count = Try(() => existing.ItemCount) ?? -1;
+    if (count == 0) { Log($"[binder] '{binderName}' verified EMPTY — presenting it (partner can take nothing)."); return existing; }
+    Log($"[binder] '{binderName}' holds {count} item(s) but MUST be empty — refusing to present it. " +
+        $"Remove everything from '{binderName}' in the MTGO client.");
+    return null;
+  }
+
+  /// <summary>
+  /// THE binder step for a negotiated trade. Returns the NAME of the binder to present —
+  /// one holding EXACTLY what the partner may take:
+  ///   give empty    -> the operator-owned <see cref="EmptyBinderName"/> (nothing to grab)
+  ///   give non-empty-> <paramref name="binderName"/> rebuilt to exactly those items/printings
+  /// Printings are batch-resolved in ONE collection scan, then expanded by quantity.
+  /// Returns null on any failure — callers MUST fail closed rather than open a trade
+  /// presenting an unknown binder.
+  /// </summary>
+  public string? EnsureOfferBinderName(
+      string binderName, IReadOnlyList<(string name, int qty, int catId)> give)
+  {
+    if (give is null || give.Count == 0)
+      return GetEmptyBinder(EmptyBinderName) is null ? null : EmptyBinderName;
+    return EnsureOfferBinder(binderName, give) is null ? null : binderName;
+  }
+
+  /// <summary>Build the give-side offer binder to hold EXACTLY <paramref name="give"/>
+  /// (batch-resolved printings, quantity-expanded). Null on failure.</summary>
+  public MTGOSDK.API.Collection.Binder? EnsureOfferBinder(
+      string binderName, IReadOnlyList<(string name, int qty, int catId)> give)
+  {
+    if (give is null || give.Count == 0) return null;
+
+    // Batch-resolve printings (ONE collection scan), then expand by quantity.
+    var resolved = ResolveOwnedPrintings(give.Select(g => (g.name, g.catId)).ToList());
+    var items = new List<(string name, int catId)>();
+    for (int i = 0; i < give.Count; i++)
+    {
+      int cat = resolved[i];
+      if (cat <= 0)
+      { Log($"[binder] cannot offer '{give[i].name}' — not owned in any printing; aborting the offer binder."); return null; }
+      for (int q = 0; q < Math.Max(1, give[i].qty); q++) items.Add((give[i].name, cat));
+    }
+    return EnsureBinderExact(binderName, items, preResolved: true);
   }
 
   // True iff the binder's contents are EXACTLY the requested items. If every item pins a printing

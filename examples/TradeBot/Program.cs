@@ -1205,6 +1205,67 @@ using (var exec = new TradeExecutor { AllowCommit = allowCommit })
       System.Threading.Thread.Sleep(TimeSpan.FromSeconds(60));
       break;
 
+    // Phase-1 self-test for the Negotiate engine's OFFER BINDER (no trade, no partner,
+    // no assets move): build the binder a given give-list would present and read back
+    // exactly what a partner would see. `testbinder` alone tests the EMPTY case (what a
+    // deposit presents); `--give=Card:qty,Card:qty` tests the exact case.
+    //   testbinder [--give=Event Ticket:2] [--binder=Offer]
+    case "testbinder":
+    {
+      exec.Attach();
+      Line("Warming collection + binder list (a cold WPF UI thread makes binder ops time out)...");
+      exec.WarmCollectionAndBinders();
+      string bname = args.FirstOrDefault(a => a.StartsWith("--binder=", StringComparison.OrdinalIgnoreCase))?.Substring("--binder=".Length) ?? "Offer";
+      string giveRaw = args.FirstOrDefault(a => a.StartsWith("--give=", StringComparison.OrdinalIgnoreCase))?.Substring("--give=".Length) ?? "";
+      var give = new System.Collections.Generic.List<(string name, int qty, int catId)>();
+      foreach (var part in giveRaw.Split(',', StringSplitOptions.RemoveEmptyEntries))
+      {
+        var bits = part.Split(':');
+        string nm = bits[0].Trim();
+        int q = bits.Length > 1 && int.TryParse(bits[1], out var qq) ? qq : 1;
+        int cid = bits.Length > 2 && int.TryParse(bits[2], out var cc) ? cc : 0;
+        if (nm.Length > 0) give.Add((nm, q, cid));
+      }
+      Line($"\n=== testbinder: '{bname}' should present " +
+           (give.Count == 0 ? "NOTHING (empty — the deposit/grab case)"
+                            : string.Join(", ", give.Select(g => $"{g.qty}x {g.name}{(g.catId > 0 ? $"#{g.catId}" : "")}"))) + " ===");
+      Line("Binders on this account: " + string.Join(", ",
+          exec.ListBinders().Select(b => $"{b.name}({b.items})")));
+      if (give.Count == 0 && args.Any(a => a.Equals("--probe", StringComparison.OrdinalIgnoreCase)))
+      {
+        Line("\n--- binder API surface (which CreateNewBinder overloads exist) ---");
+        exec.ProbeBinderApi();
+        Line("--- end surface ---\n");
+      }
+      var sw = System.Diagnostics.Stopwatch.StartNew();
+      string? presentName = exec.EnsureOfferBinderName(bname, give);
+      sw.Stop();
+      if (presentName is null) { Line($"\nRESULT: FAILED to prepare a binder — a real trade would FAIL CLOSED here (correct)."); break; }
+      var binder = exec.ListBinders().Any(b => string.Equals(b.name, presentName, StringComparison.OrdinalIgnoreCase))
+          ? MTGOSDK.API.Collection.CollectionManager.Binders.FirstOrDefault(b => string.Equals(b.Name, presentName, StringComparison.OrdinalIgnoreCase))
+          : null;
+      if (binder is null) { Line($"RESULT: FAIL — '{presentName}' vanished after preparation."); break; }
+
+      // Read back what the partner would actually see.
+      int count = -1; var seen = new System.Collections.Generic.List<string>();
+      try
+      {
+        count = binder.ItemCount;
+        foreach (var it in binder.Items.Take(30))
+          seen.Add($"{(int?)it.Quantity}x {it.Card?.Name} (cat {(int?)it.Id})");
+      }
+      catch (Exception ex) { Line($"(read-back partial: {ex.Message.Split('\n')[0]})"); }
+      Line($"\nPREPARED in {sw.ElapsedMilliseconds}ms — will present binder '{presentName}', which reports {count} item(s):");
+      if (seen.Count == 0) Line("   (nothing — a partner sees an EMPTY binder)");
+      else foreach (var s in seen) Line("   " + s);
+
+      int wantTotal = give.Sum(g => Math.Max(1, g.qty));
+      bool pass = give.Count == 0 ? count == 0 : count == wantTotal;
+      Line($"\nRESULT: {(pass ? "PASS" : "FAIL")} — expected {(give.Count == 0 ? 0 : wantTotal)} item(s), binder holds {count}.");
+      Line("(No trade was opened and nothing moved.)");
+      break;
+    }
+
     case "post":
       if (!yes) { Line("Refusing: 'post' publishes a public marketplace listing. Re-run with --yes to confirm."); break; }
       exec.PublishMessagePost(arg1.Length > 0 ? arg1 : "MTGOSDK TradeBot test listing");
