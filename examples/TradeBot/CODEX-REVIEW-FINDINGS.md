@@ -13,11 +13,16 @@ the tix physically deposited. Custody recorded them as DEPOSITS, not loans.
 **CORRECTED STATUS after a second review round (2026-08-12).** An earlier version of
 this file claimed "findings 1-4 are FIXED" — that was an OVERCLAIM in two ways:
 
-1. Findings 1-4 are fixed ONLY on the `Negotiate` path. The legacy CLI flows
+1. Findings 1-4 were fixed ONLY on the `Negotiate` path. The legacy CLI flows
    (`RunLend`, `RunSwapCycle`, `RunGrabCycle`, reachable from `lend`/`swap`/`grabfrom`)
-   still use substring name matching, per-entry aggregation, and discard catIds. `lend`
-   remains a name-gated commit path. Retiring those flows is the only thing that makes
-   decision 8 true rather than aspirational.
+   still matched names by substring, aggregated per entry, and discarded catIds — so
+   `lend` remained a name-gated commit path where `Island` could be satisfied by
+   `Snow-Covered Island`.
+   **RESOLVED 2026-08-12: those flows are DELETED** (526 lines), along with the
+   name-based guardrails `GiveStatus` / `ReceiveStatus` / `VerifyReceiveIsOnly` /
+   `NameMatches`. Every trade — CLI and serve — now goes through `RunTrade` ->
+   `Negotiate`, so decision 8 is enforced structurally: there is no name comparison
+   left to call.
 2. The fixes themselves had holes, found by re-reviewing them (below).
 
 Per-finding, for the ENGINE path: 1,2,3,4,5,6,8,9,10 addressed; **7 still open** (the
