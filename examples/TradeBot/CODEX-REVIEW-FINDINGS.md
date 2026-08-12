@@ -10,10 +10,39 @@ the full tournament cycle ran on top of them: deposit -> entry-fee escrow -> pri
 wallet -> payout, with the prize wallet draining to 0 and total claims (3) matching
 the tix physically deposited. Custody recorded them as DEPOSITS, not loans.
 
-Findings 1-4 are FIXED (identity is now the catalog id — see decision 8 in
-NEGOTIATE-DESIGN.md). The remaining findings are FAILURE-PATH risks that could not
-fire on a successful trade, so the live run does not clear them. Risk now lives in
-what happens when something goes wrong mid-trade, not in the normal case.
+**CORRECTED STATUS after a second review round (2026-08-12).** An earlier version of
+this file claimed "findings 1-4 are FIXED" — that was an OVERCLAIM in two ways:
+
+1. Findings 1-4 are fixed ONLY on the `Negotiate` path. The legacy CLI flows
+   (`RunLend`, `RunSwapCycle`, `RunGrabCycle`, reachable from `lend`/`swap`/`grabfrom`)
+   still use substring name matching, per-entry aggregation, and discard catIds. `lend`
+   remains a name-gated commit path. Retiring those flows is the only thing that makes
+   decision 8 true rather than aspirational.
+2. The fixes themselves had holes, found by re-reviewing them (below).
+
+Per-finding, for the ENGINE path: 1,2,3,4,5,6,8,9,10 addressed; **7 still open** (the
+re-verify -> confirm window is still not one atomic UI-thread operation, so a partner
+can in principle alter their side between the final guardrail read and the approve).
+**8 is only partly closed**: we now abort when `SetLastUsedBinder` returns false, but we
+never READ BACK the last-used binder to verify its id/contents, which is what the
+finding asked for.
+
+Round-2 fixes applied (holes in the round-1 fixes):
+- Completion proof was GLOBAL: `CompletedTradeSeq` advances when ANY trade completes, so
+  another trade finishing could "prove" ours did. Now escrow-scoped via
+  `LastCompletedEscrowId`.
+- A successful trade could be reported FAILED (the regression risk): the old loop broke
+  after a single null + 1.5s grace. Now it polls the full window.
+- Unreadable escrow rows became qty 0, hiding an unrequested item from extra-detection
+  and letting a wrong trade look exact. Now a read failure makes the whole side
+  unreadable (not-exact) — fail closed.
+- Overlapping-but-not-identical printing sets (a pinned catId also present in another
+  item's unpinned set) were aggregated independently, so each counted the same staged
+  copy and a short receive looked exact. Now rejected at resolution with an actionable
+  message.
+- Give resolution could hand the SAME printing to two items and exceed what we own; the
+  chosen quantity is now reserved as each item resolves.
+- `qty <= 0` was clamped to 1 — a bogus request could move a real asset. Now rejected.
 
 Several of these are PRE-EXISTING (inherited from the old flows via GiveStatus),
 but the engine made them universal by routing every trade through one guardrail.

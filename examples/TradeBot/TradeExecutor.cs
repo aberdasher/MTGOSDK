@@ -103,6 +103,12 @@ public sealed class TradeExecutor : IDisposable
   public string? LastCompletedPartner { get; private set; }
   public long CompletedTradeSeq { get; private set; }
 
+  /// <summary>Escrow id of the most recently COMPLETED trade. Completion proof must be tied
+  /// to THIS escrow — a bare counter also advances when some OTHER trade completes (an
+  /// operator finishing a trade by hand, a listen desk running alongside the serve), which
+  /// would "prove" a commit that never happened for our job.</summary>
+  public int LastCompletedEscrowId { get; private set; }
+
   /// <summary>
   /// Fired once per COMMITTED trade (FinalState == TradeComplete) with
   /// (partner, given, received). This is THE custody hook: every flow — serve job or
@@ -1080,13 +1086,21 @@ public sealed class TradeExecutor : IDisposable
 
     foreach (var (name, qtyRaw, catId) in requested)
     {
-      int qty = Math.Max(1, qtyRaw);
+      // Never clamp a money quantity: a bogus 0/negative must be rejected, not turned into
+      // a real item that moves an asset.
+      if (qtyRaw <= 0) return (acc, $"invalid quantity {qtyRaw} for '{name}'");
+      int qty = qtyRaw;
       List<int> cats;
       if (catId > 0)
       {
         cats = new List<int> { catId };
-        if (forGive && (owned!.TryGetValue(catId, out var have) ? have : 0) < qty)
-          return (acc, $"we don't own {qty}x of the requested printing (catId {catId}) of '{name}' — refusing to substitute a different printing");
+        if (forGive)
+        {
+          int have = owned!.TryGetValue(catId, out var h0) ? h0 : 0;
+          if (have < qty)
+            return (acc, $"we don't own {qty}x of the requested printing (catId {catId}) of '{name}' — refusing to substitute a different printing");
+          owned[catId] = have - qty;   // reserve it so a later item can't spend the same copies
+        }
       }
       else
       {
@@ -1099,6 +1113,7 @@ public sealed class TradeExecutor : IDisposable
           // Pick ONE owned printing with enough copies — that is what we will hand over.
           int pick = all.FirstOrDefault(c => (owned!.TryGetValue(c, out var h) ? h : 0) >= qty);
           if (pick <= 0) return (acc, $"we don't own {qty}x of any printing of '{name}'");
+          owned[pick] -= qty;          // reserve it so a later item can't spend the same copies
           cats = new List<int> { pick };
         }
         else cats = all;   // receive: any printing of the card is acceptable
@@ -1106,6 +1121,18 @@ public sealed class TradeExecutor : IDisposable
 
       // Merge with an existing item that accepts EXACTLY the same printings.
       var key = cats.OrderBy(c => c).ToList();
+      // Sets that OVERLAP without being identical (e.g. a pinned catId that also appears in
+      // another item's unpinned set) cannot be aggregated independently — each item would
+      // count the same staged copy and a short receive would look exact. Rather than
+      // implement a constrained allocation, refuse the request: it is always expressible
+      // as one merged item.
+      foreach (var prev in acc)
+      {
+        bool identical = prev.CatIds.Count == key.Count && prev.CatIds.OrderBy(c => c).SequenceEqual(key);
+        bool overlaps = prev.CatIds.Any(key.Contains);
+        if (overlaps && !identical)
+          return (acc, $"'{name}' overlaps another requested item's printings — combine them into a single entry with the total quantity");
+      }
       var same = acc.FirstOrDefault(r => r.CatIds.Count == key.Count && r.CatIds.OrderBy(c => c).SequenceEqual(key));
       if (same != null)
       { acc[acc.IndexOf(same)] = new ResolvedItem { Display = same.Display, Qty = same.Qty + qty, CatIds = same.CatIds }; }
@@ -1119,7 +1146,15 @@ public sealed class TradeExecutor : IDisposable
   {
     var outp = new List<(int, int)>();
     foreach (var it in coll.CollectionItems)
-      outp.Add((Try(() => (int)it.Id) ?? -1, Try(() => (int)it.Quantity) ?? 0));
+    {
+      int id = Try(() => (int)it.Id) ?? -1;
+      int q = Try(() => (int)it.Quantity) ?? -1;
+      // A row we cannot read is NOT an empty row. Substituting 0 would hide an unrequested
+      // item from the extra-detection below and let a wrong trade look exact — so make the
+      // whole side unreadable instead (the caller treats that as not-exact).
+      if (id <= 0 || q < 0) throw new InvalidOperationException("unreadable escrow row");
+      outp.Add((id, q));
+    }
     return outp;
   }
 
@@ -1889,7 +1924,9 @@ public sealed class TradeExecutor : IDisposable
           RecordAcquisition(_lastPartner ?? "?", _lastReceived, _lastGiven, fs);
           // Publish the completed trade for the serve's loan tracking (NOT reset below).
           LastCompletedGiven = _lastGivenS; LastCompletedReceived = _lastReceivedS;
-          LastCompletedPartner = _lastPartner; CompletedTradeSeq++;
+          LastCompletedPartner = _lastPartner;
+          LastCompletedEscrowId = Try(() => (int)e.Id) ?? 0;
+          CompletedTradeSeq++;
           try { TradeCompleted?.Invoke(_lastPartner ?? "?", LastCompletedGiven, LastCompletedReceived); }
           catch (Exception ex) { Log($"[event] TradeCompleted subscriber threw: {ex.Message.Split('\n')[0]}"); }
         }

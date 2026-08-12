@@ -617,14 +617,20 @@ static bool FinalizeTrade(TradeBot.TradeExecutor exec, string partner,
     exec.CancelCurrent(); WaitForNoTrade();
     return false;
   }
+  // Completion must be OUR escrow's: the counter alone also advances when some other
+  // trade completes. Keep polling for the full window — a completed trade whose event
+  // lands late must not be reported as a failure (that would under-credit a real deposit).
+  bool Completed() =>
+      exec.CompletedTradeSeq > seqBefore &&
+      (expectedEscrowId == 0 || exec.LastCompletedEscrowId == expectedEscrowId);
   bool completed = false;
   for (int ms = 0; ms < 40_000 && !completed; ms += 300)
   {
     System.Threading.Thread.Sleep(300);
-    if (exec.CompletedTradeSeq > seqBefore) { completed = true; break; }
-    var c = MTGOSDK.API.Trade.TradeManager.CurrentTrade;
-    if (c is null) { System.Threading.Thread.Sleep(1500); completed = exec.CompletedTradeSeq > seqBefore; break; }
-    if (ms % 3_000 < 300) Line($"  t+{ms / 1000,2}s state={c.State}");
+    if (Completed()) { completed = true; break; }
+    MTGOSDK.API.Trade.TradeEscrow? c = null;
+    try { c = MTGOSDK.API.Trade.TradeManager.CurrentTrade; } catch { }
+    if (c != null && ms % 3_000 < 300) Line($"  t+{ms / 1000,2}s state={c.State}");
   }
   if (!completed)
   {
