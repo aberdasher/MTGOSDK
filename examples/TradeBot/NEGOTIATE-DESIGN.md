@@ -1,5 +1,26 @@
 # Negotiate(give[], receive[]) — unified trade engine
 
+## DECISION 8 — IDENTITY IS THE CATALOG ID, NEVER THE NAME (settled 2026-08-12)
+
+Names are for humans; catalog ids are for guardrails. Substring name matching let
+"Island" be satisfied by "Snow-Covered Island" (codex finding 1), and per-entry name
+aggregation hid both short receives and over-gives (finding 2).
+
+- A trade request is RESOLVED ONCE, up front, into `ResolvedItem { Display, Qty,
+  CatIds[] }`. `CatIds` is the set of printings that satisfy the item:
+    * pinned catId  -> exactly that one id
+    * give, unpinned -> exactly ONE owned printing chosen at resolution
+    * receive, unpinned -> every printing of that card (any is acceptable)
+- Items whose CatId SETS are identical are MERGED with summed qty at resolution, so
+  duplicate entries can never each "see" the same staged copy.
+- Every guardrail compares CatId -> quantity aggregates for EXACT equality. No name
+  comparison ever gates a commit.
+- Resolution FAILS CLOSED: unknown card, or a pinned give printing we don't own in
+  sufficient quantity, aborts before any trade opens (finding 4).
+- PARTIAL NAMES ARE NOT ACCEPTED by the engine. If a CLI mode wants to accept a
+  partial, IT resolves the partial to an id first and passes the id. The engine's
+  input is already-resolved identity.
+
 ## DECISIONS (settled 2026-08-11, build to these)
 
 1. Counterparty wording is a FIRST-CLASS requirement: every DM must tell the partner

@@ -1031,6 +1031,129 @@ public sealed class TradeExecutor : IDisposable
   }
 
   /// <summary>
+  /// A trade item resolved to IDENTITY: which printings satisfy it, and how many.
+  /// Guardrails compare these, never names — "Island" must not be satisfiable by
+  /// "Snow-Covered Island". <see cref="CatIds"/> is one id for a pinned item or a give
+  /// (we choose the exact printing we hand over), and every printing of the card for an
+  /// unpinned receive (any version is acceptable).
+  /// </summary>
+  public sealed class ResolvedItem
+  {
+    public string Display { get; init; } = "";      // canonical name, for DMs/logs only
+    public int Qty { get; init; }
+    public IReadOnlyList<int> CatIds { get; init; } = Array.Empty<int>();
+    public string Label => Qty > 1 ? $"{Qty}x {Display}" : Display;
+  }
+
+  /// <summary>
+  /// Resolve request items to identity ONCE, before any trade opens. Fails closed with a
+  /// reason: an unknown card, or (for a give) a printing we don't own enough of, aborts
+  /// rather than silently substituting another printing. Items with identical printing
+  /// sets are MERGED with summed quantity, so two "1x Island" entries become "2x Island"
+  /// and can never each match the same staged copy.
+  /// NOTE: names must be EXACT — the engine does not accept partial names. A caller that
+  /// wants partial matching resolves it to a catId itself and passes that.
+  /// </summary>
+  public (List<ResolvedItem> items, string? error) ResolveTradeItems(
+      IReadOnlyList<(string name, int qty, int catId)> requested, bool forGive)
+  {
+    var acc = new List<ResolvedItem>();
+    // One collection scan up front when we need ownership facts (give side only).
+    Dictionary<int, int>? owned = null;
+    if (forGive)
+    {
+      owned = new Dictionary<int, int>();
+      try
+      {
+        foreach (var it in MTGOSDK.API.Collection.CollectionManager.Collection.Items)
+        {
+          int id = Try(() => it.Id) ?? -1, q = Try(() => it.Quantity) ?? 0;
+          if (id > 0 && q > 0) owned[id] = q;
+        }
+      }
+      catch (Exception ex) { return (acc, $"could not read the collection ({ex.Message.Split('\n')[0]})"); }
+    }
+
+    foreach (var (name, qtyRaw, catId) in requested)
+    {
+      int qty = Math.Max(1, qtyRaw);
+      List<int> cats;
+      if (catId > 0)
+      {
+        cats = new List<int> { catId };
+        if (forGive && (owned!.TryGetValue(catId, out var have) ? have : 0) < qty)
+          return (acc, $"we don't own {qty}x of the requested printing (catId {catId}) of '{name}' — refusing to substitute a different printing");
+      }
+      else
+      {
+        List<int> all;
+        try { all = MTGOSDK.API.Collection.CollectionManager.GetCardIds(name).ToList(); }
+        catch { all = new List<int>(); }
+        if (all.Count == 0) return (acc, $"unknown card '{name}' (names must be exact)");
+        if (forGive)
+        {
+          // Pick ONE owned printing with enough copies — that is what we will hand over.
+          int pick = all.FirstOrDefault(c => (owned!.TryGetValue(c, out var h) ? h : 0) >= qty);
+          if (pick <= 0) return (acc, $"we don't own {qty}x of any printing of '{name}'");
+          cats = new List<int> { pick };
+        }
+        else cats = all;   // receive: any printing of the card is acceptable
+      }
+
+      // Merge with an existing item that accepts EXACTLY the same printings.
+      var key = cats.OrderBy(c => c).ToList();
+      var same = acc.FirstOrDefault(r => r.CatIds.Count == key.Count && r.CatIds.OrderBy(c => c).SequenceEqual(key));
+      if (same != null)
+      { acc[acc.IndexOf(same)] = new ResolvedItem { Display = same.Display, Qty = same.Qty + qty, CatIds = same.CatIds }; }
+      else acc.Add(new ResolvedItem { Display = name, Qty = qty, CatIds = key });
+    }
+    return (acc, null);
+  }
+
+  /// <summary>Aggregate one escrow side as catId -> quantity. Batched read; no name reads.</summary>
+  List<(int catId, int qty)> ReadSideByCat(ItemCollection coll)
+  {
+    var outp = new List<(int, int)>();
+    foreach (var it in coll.CollectionItems)
+      outp.Add((Try(() => (int)it.Id) ?? -1, Try(() => (int)it.Quantity) ?? 0));
+    return outp;
+  }
+
+  /// <summary>
+  /// EXACT identity comparison of one escrow side against the resolved request:
+  /// aggregates staged quantities per accepted printing set and requires equality.
+  /// Anything staged whose printing satisfies no item is <c>extra</c>; any shortfall is
+  /// <c>missing</c>. This is THE commit guardrail — a name never gates a trade.
+  /// </summary>
+  public (List<string> missing, List<string> extra, bool exact) StatusById(
+      ItemCollection side, IReadOnlyList<ResolvedItem> intended)
+  {
+    List<(int catId, int qty)> staged;
+    try { staged = ReadSideByCat(side); }
+    catch { return (intended.Select(i => i.Label).ToList(), new(), false); }   // unreadable => not exact
+
+    var missing = new List<string>();
+    var claimed = new HashSet<int>();
+    foreach (var item in intended)
+    {
+      int got = staged.Where(s => item.CatIds.Contains(s.catId)).Sum(s => s.qty);
+      foreach (var s in staged) if (item.CatIds.Contains(s.catId)) claimed.Add(s.catId);
+      if (got < item.Qty) missing.Add(item.Qty - got > 1 ? $"{item.Qty - got}x {item.Display}" : item.Display);
+    }
+    var extra = new List<string>();
+    foreach (var item in intended)
+    {
+      int got = staged.Where(s => item.CatIds.Contains(s.catId)).Sum(s => s.qty);
+      if (got > item.Qty) extra.Add($"{got - item.Qty}x {item.Display}");
+    }
+    // Anything staged that no item accepts at all.
+    foreach (var s in staged)
+      if (s.qty > 0 && !claimed.Contains(s.catId)) extra.Add($"{s.qty}x (printing {s.catId})");
+
+    return (missing, extra, missing.Count == 0 && extra.Count == 0);
+  }
+
+  /// <summary>
   /// THE card-name comparison for every guardrail and binder scan. MTGO can return a
   /// typographic apostrophe (U+2019) where the caller typed a straight ' — strip both (and
   /// trim) so "Kozilek's Command" matches regardless. MUST be used everywhere a requested
@@ -1578,6 +1701,27 @@ public sealed class TradeExecutor : IDisposable
     if (give is null || give.Count == 0)
       return GetEmptyBinder(EmptyBinderName) is null ? null : EmptyBinderName;
     return EnsureOfferBinder(binderName, give) is null ? null : binderName;
+  }
+
+  /// <summary>
+  /// Offer-binder step driven by ALREADY-RESOLVED identity: each item carries the exact
+  /// printing we will hand over, so no name lookup or printing substitution can happen
+  /// here. Returns the binder name to present, or null (fail closed).
+  /// </summary>
+  public string? EnsureOfferBinderName(string binderName, IReadOnlyList<ResolvedItem> give)
+  {
+    if (give is null || give.Count == 0)
+      return GetEmptyBinder(EmptyBinderName) is null ? null : EmptyBinderName;
+
+    // Expand by quantity against the exact resolved printing (give items resolve to one).
+    var items = new List<(string name, int catId)>();
+    foreach (var g in give)
+    {
+      int cat = g.CatIds.Count > 0 ? g.CatIds[0] : -1;
+      if (cat <= 0) { Log($"[binder] '{g.Display}' has no resolved printing — aborting the offer binder."); return null; }
+      for (int q = 0; q < Math.Max(1, g.Qty); q++) items.Add((g.Display, cat));
+    }
+    return EnsureBinderExact(binderName, items, preResolved: true) is null ? null : binderName;
   }
 
   /// <summary>Build the give-side offer binder to hold EXACTLY <paramref name="give"/>
