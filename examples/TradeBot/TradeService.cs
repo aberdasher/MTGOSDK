@@ -112,7 +112,22 @@ public sealed class TradeService
     _token = token; _bind = bind; _port = port; _conn = conn;
     _perJobTimeoutSec = perJobTimeoutSec; _commitArmed = commitArmed; _tradeFn = tradeFn; _recallFn = recallFn; _vaultFn = vaultFn; _holdings = holdings;
     // Tee every service log line into a ring buffer so the dashboard's GET /log can show it.
-    _log = s => { log(s); lock (_logRing) { _logRing.Add($"{DateTime.UtcNow:HH:mm:ss}  {s}"); if (_logRing.Count > 400) _logRing.RemoveRange(0, _logRing.Count - 400); } };
+    // Stamped through LogFormat so service lines and executor lines in the same ring share
+    // one format and can be diffed against each other.
+    _log = s => { log(s); Note(LogFormat.Stamp(s)); };
+  }
+
+  /// <summary>
+  /// Append an ALREADY-STAMPED line to the ring buffer verbatim. This is how executor
+  /// output (which stamps itself) reaches GET /log without acquiring a second timestamp.
+  /// </summary>
+  public void Note(string preStamped)
+  {
+    lock (_logRing)
+    {
+      _logRing.Add(preStamped);
+      if (_logRing.Count > 400) _logRing.RemoveRange(0, _logRing.Count - 400);
+    }
   }
 
   /// <summary>Start the worker + HTTP listener. BLOCKS (accept loop) until the process ends.</summary>

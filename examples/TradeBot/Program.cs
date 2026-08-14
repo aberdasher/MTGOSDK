@@ -47,7 +47,10 @@ using GS = MTGOSDK.API.Play.Games;
 using GSProc = MTGOSDK.API.Play.Games.Processors;
 using GSArgs = MTGOSDK.API.Play.Games.Processors.EventArgs;
 
-static void Line(string s = "") => Console.WriteLine(s);
+// Stamped so phase durations can be read straight off the log. Blank lines stay blank —
+// a timestamp on a spacer just adds noise.
+static void Line(string s = "") =>
+  Console.WriteLine(s.Length == 0 ? s : TradeBot.LogFormat.Stamp(s));
 
 // Reads the private chat channel bound to a trade and prints the last `last`
 // messages. Used to confirm from chat that a trade session is actually live
@@ -413,14 +416,17 @@ static string[]? ParseBots(string[] argv)
 // client cleared. Tolerates transient nulls by requiring the null to persist.
 static bool WaitForNoTrade(int maxMs = 6000)
 {
-  for (int waited = 0; waited < maxMs; waited += 500)
+  var sw = System.Diagnostics.Stopwatch.StartNew();
+  while (true)
   {
     MTGOSDK.API.Trade.TradeEscrow? c = null;
     try { c = MTGOSDK.API.Trade.TradeManager.CurrentTrade; } catch { c = null; }
     if (c is null) return true;
-    System.Threading.Thread.Sleep(500);
+    // Real clock, not a tick counter: each poll costs a remote read, so counting
+    // ticks made the effective wait longer than maxMs.
+    if (sw.ElapsedMilliseconds >= maxMs) return false;
+    System.Threading.Thread.Sleep(250);
   }
-  return false;
 }
 
 // ONE invite -> advance-past-binder -> reach-negotiation attempt against `bot`.
@@ -439,14 +445,22 @@ static MTGOSDK.API.Trade.TradeEscrow? TryReachNegotiation(TradeBot.TradeExecutor
   // bot and trip its throttle. CurrentTrade can read null between ticks even on
   // a live escrow, so tolerate a few transient nulls before giving up.
   bool advanced = false;
-  bool dispatched = false;
   int nulls = 0;
-  for (int ms = 0; ms < 15_000 && !dispatched; ms += 300)   // up to ~15s, 300ms poll
+  // CHECK FIRST, then sleep: the escrow can already be past binder-selection when we
+  // get here, and sleeping first burned a full tick on every trade. Driven by a real
+  // clock so the 15s cap is wall-clock (a tick also costs remote reads).
+  var swAdvance = System.Diagnostics.Stopwatch.StartNew();
+  while (swAdvance.ElapsedMilliseconds < 15_000)   // up to ~15s, 300ms poll
   {
-    System.Threading.Thread.Sleep(300);
+    long seq = exec.StateSeq;   // capture before the read, so a transition can't be missed
     MTGOSDK.API.Trade.TradeEscrow? e0 = null;
     try { e0 = MTGOSDK.API.Trade.TradeManager.CurrentTrade; } catch { e0 = null; }
-    if (e0 is null) { if (++nulls >= 7) return null; continue; } // escrow gone -> rotate (~2s tolerance)
+    if (e0 is null)
+    {
+      if (++nulls >= 7) return null; // escrow gone -> rotate (~2s tolerance)
+      exec.WaitForStateChange(seq, 300);
+      continue;
+    }
     nulls = 0;
     var st0 = e0.State;
     if (st0 == MTGOSDK.API.Trade.Enums.TradeState.InviteSelectBinder)
@@ -477,21 +491,33 @@ static MTGOSDK.API.Trade.TradeEscrow? TryReachNegotiation(TradeBot.TradeExecutor
     }
     else if (st0 != MTGOSDK.API.Trade.Enums.TradeState.Uninitialized)
     {
-      dispatched = true; // moved to InviteSent / InviteAccepted / Negotiate...
+      break; // moved to InviteSent / InviteAccepted / Negotiate...
     }
+    // Everything this loop waits for (leaving Uninitialized, leaving InviteSelectBinder)
+    // is a state transition, so this is event-speed rather than a fixed 300ms tick.
+    exec.WaitForStateChange(seq, 300);
   }
 
   // Wait for negotiation (or an early close = bot busy/declined). Humans need more
   // room to click Accept than a bot does, so callers can widen this window.
+  // CHECK FIRST here too — the escrow is often already negotiating by now.
   nulls = 0;
-  for (int ms = 0; ms < negotiateWaitSec * 1000; ms += 400)
+  var swNeg = System.Diagnostics.Stopwatch.StartNew();
+  while (swNeg.ElapsedMilliseconds < (long)negotiateWaitSec * 1000)
   {
-    System.Threading.Thread.Sleep(400);
+    long seq = exec.StateSeq;   // capture before the read, so the partner's Accept can't be missed
     MTGOSDK.API.Trade.TradeEscrow? esc = null;
     try { esc = MTGOSDK.API.Trade.TradeManager.CurrentTrade; } catch { esc = null; }
-    if (esc is null) { if (++nulls >= 8) return null; continue; } // closed -> rotate/retry (~3s tolerance)
+    if (esc is null)
+    {
+      if (++nulls >= 8) return null; // closed -> rotate/retry (~3s tolerance)
+      exec.WaitForStateChange(seq, 400);
+      continue;
+    }
     nulls = 0;
     if (esc.State.ToString().StartsWith("Negotiate")) return esc;
+    // The partner accepting is a state transition — wake on it instead of ticking.
+    exec.WaitForStateChange(seq, 400);
   }
   return null;
 }
@@ -502,9 +528,12 @@ static MTGOSDK.API.Trade.TradeEscrow? TryReachNegotiation(TradeBot.TradeExecutor
 // or ConfirmTrade → wait Closed → done-DM + ledger tail. One implementation so the
 // safety-critical phase is provably identical across lend/swap/grab. Returns true
 // iff committed; always sets TradeBot.TradeExecutor.LastFlowDetail.
+// approvalWaitSec: how long to keep waiting for the PARTNER's approve once ours is in.
+// Comes from the job's own budget (--timeout / per-job waitSec) rather than a second
+// hardcoded constant that would silently diverge from it.
 static bool FinalizeTrade(TradeBot.TradeExecutor exec, string partner,
     Func<MTGOSDK.API.Trade.TradeEscrow, bool> guardrail, bool allowCommit,
-    string commitLabel, string? doneDm, int expectedEscrowId = 0)
+    string commitLabel, string? doneDm, int expectedEscrowId = 0, int approvalWaitSec = 600)
 {
   // Identity guard: everything below must act on the SAME escrow the caller verified.
   // If the intended trade closes and another opens, acting on the replacement could
@@ -516,9 +545,15 @@ static bool FinalizeTrade(TradeBot.TradeExecutor exec, string partner,
   exec.SubmitDeposit();
   MTGOSDK.API.Trade.TradeEscrow? esc = null;
   bool approveReady = false;
-  for (int ms = 0; ms < 30_000 && !approveReady; ms += 300)
+  // CHECK FIRST, real clock: the escrow can reach Approval* immediately after the
+  // deposit submits, and the old sleep-first tick cost 300ms on every trade while
+  // making the 30s cap drift long (each tick also does remote reads).
+  var swApprove = System.Diagnostics.Stopwatch.StartNew();
+  long lastState = -3_000;
+  while (!approveReady && swApprove.ElapsedMilliseconds < 30_000)
   {
-    System.Threading.Thread.Sleep(300);
+    long seq = exec.StateSeq;   // capture before the read, so a transition can't be missed
+    long ms = swApprove.ElapsedMilliseconds;
     var c = MTGOSDK.API.Trade.TradeManager.CurrentTrade;
     if (c is null) { TradeBot.TradeExecutor.LastFlowDetail = "trade closed before approval"; Line("Trade closed before approval."); return false; }
     if (WrongEscrow(c))
@@ -528,8 +563,10 @@ static bool FinalizeTrade(TradeBot.TradeExecutor exec, string partner,
       exec.CancelCurrent(); WaitForNoTrade(); return false;
     }
     esc = c; string sst = c.State.ToString();
-    if (ms % 3_000 < 300) Line($"  t+{ms / 1000,2}s state={sst}");
-    if (sst.StartsWith("Approval")) approveReady = true;
+    if (ms - lastState >= 3_000) { lastState = ms; Line($"  t+{ms / 1000,2}s state={sst}"); }
+    if (sst.StartsWith("Approval")) { approveReady = true; break; }
+    // Reaching Approval* IS a state transition, so this wakes on the event itself.
+    exec.WaitForStateChange(seq, 300);
   }
   if (!approveReady)
   {
@@ -594,13 +631,49 @@ static bool FinalizeTrade(TradeBot.TradeExecutor exec, string partner,
       exec.CompletedTradeSeq > seqBefore &&
       (expectedEscrowId == 0 || exec.LastCompletedEscrowId == expectedEscrowId);
   bool completed = false;
-  for (int ms = 0; ms < 40_000 && !completed; ms += 300)
+  // CHECK FIRST, real clock: the completion event can already have landed by the time
+  // ConfirmTrade returns, so sleeping first delayed every successful commit by 300ms.
+  //
+  // TWO budgets, because our approve is only half of the commit — MTGO needs the PARTNER to
+  // approve too, and that is human-paced. A flat 40s cap reported failure on a trade that
+  // completed 13s later (observed 2026-08-13: partner took 53.5s, we gave up at 40s, the
+  // tickets moved anyway and the depositor went uncredited). While the escrow is still in an
+  // Approval* state the human is actively committing, so keep waiting; the short budget
+  // applies only when there is no such evidence (e.g. the escrow is gone and we are just
+  // giving a late completion event time to land).
+  const long doneWaitMs = 40_000;             // no evidence anyone is still acting
+  long approvingWaitMs = Math.Max(60_000L, (long)Math.Min(approvalWaitSec, 3600) * 1000);
+  var swDone = System.Diagnostics.Stopwatch.StartNew();
+  long lastDoneNote = -3_000;
+  bool loggedExtend = false;
+  while (!completed)
   {
-    System.Threading.Thread.Sleep(300);
+    long seq = exec.StateSeq;   // capture before the check, so the closing event can't be missed
     if (Completed()) { completed = true; break; }
+    long ms = swDone.ElapsedMilliseconds;
     MTGOSDK.API.Trade.TradeEscrow? c = null;
     try { c = MTGOSDK.API.Trade.TradeManager.CurrentTrade; } catch { }
-    if (c != null && ms % 3_000 < 300) Line($"  t+{ms / 1000,2}s state={c.State}");
+    string st = ""; if (c != null) { try { st = c.State.ToString(); } catch { } }
+
+    // Still in Approval*? Then the trade is live and a human is committing — the same
+    // condition CancelCurrent uses to refuse to tear the trade down. Reporting failure here
+    // while simultaneously declining to cancel is self-contradictory, so extend instead.
+    bool humanApproving = TradeBot.TradeExecutor.IsHumanApproving(st);
+    if (humanApproving && ms >= doneWaitMs && !loggedExtend)
+    {
+      loggedExtend = true;
+      Line($"  (still {st} at t+{ms / 1000}s — partner hasn't approved yet; waiting up to {approvingWaitMs / 1000}s rather than reporting a false failure)");
+    }
+    if (ms >= (humanApproving ? approvingWaitMs : doneWaitMs)) break;
+
+    if (c != null && ms - lastDoneNote >= 3_000) { lastDoneNote = ms; Line($"  t+{ms / 1000,2}s state={st}"); }
+    // The escrow closing as TradeComplete is what sets the counter Completed() reads, and
+    // that is published by the state-change handler — so this wakes on the commit landing.
+    //
+    // Back off once we're past the base budget and merely waiting on a human to click: the
+    // real transition arrives as an event, so a tight fallback tick here buys nothing and
+    // would otherwise poll the escrow every 300ms for up to the full extension.
+    exec.WaitForStateChange(seq, loggedExtend ? 2_000 : 300);
   }
   if (!completed)
   {
@@ -646,6 +719,18 @@ static bool Negotiate(TradeBot.TradeExecutor exec, string partner,
     bool allowCommit, int yesTimeoutSec, string label)
 {
   give ??= new(); receive ??= new();
+
+  // Phase timing for the whole negotiation. Each Phase() call reports the time since the
+  // previous mark plus the running total, so a slow trade can be attributed to a phase
+  // (waiting on the human, opening the trade, pulling items, finalizing) from the log alone.
+  var swPhase = System.Diagnostics.Stopwatch.StartNew();
+  long phaseMark = 0;
+  void Phase(string name)
+  {
+    long now = swPhase.ElapsedMilliseconds;
+    Line($"[perf] phase {name} {now - phaseMark}ms (t+{now}ms)");
+    phaseMark = now;
+  }
 
   // ── RESOLVE IDENTITY ONCE, BEFORE ANYTHING OPENS ──
   // Every guardrail below compares catalog IDs, never names: "Island" must not be
@@ -701,6 +786,7 @@ static bool Negotiate(TradeBot.TradeExecutor exec, string partner,
     Line($"No go — {TradeBot.TradeExecutor.LastFlowDetail}.");
     return false;
   }
+  Phase("setup+wait-for-YES");   // mostly human time — the baseline everything else is judged against
   try { exec.SendDM(partner, "On it — opening the trade now."); } catch { }
 
   // ── PHASE 3: open the trade presenting OUR binder ──
@@ -715,6 +801,8 @@ static bool Negotiate(TradeBot.TradeExecutor exec, string partner,
     try { exec.SendDM(partner, $"Couldn't open the trade — {why}. Close any open trade window (restart MTGO if it's stuck), then reply YES to retry."); } catch { }
     return false;
   }
+
+  Phase("open-trade");   // invite -> binder select -> partner accepts -> negotiating
 
   // Pin the escrow we just opened. Everything from here acts on THIS trade only: if it
   // closes and another opens, we must not silently adopt the replacement.
@@ -738,19 +826,32 @@ static bool Negotiate(TradeBot.TradeExecutor exec, string partner,
   var presentedCat = new System.Collections.Generic.Dictionary<int, int>();
   bool snapped = false;
   long watchMs = yesTimeoutSec >= int.MaxValue / 2 ? long.MaxValue : Math.Max(60_000L, (long)yesTimeoutSec * 1000);
-  const int pollMs = 1000;
+  // Poll fast: this is the loop a human is watching. At the old 1s tick a partner's grab
+  // took up to a second to even be noticed, and the pull was throttled a further 1.5s.
+  const int pollMs = 300;
+  // How long CurrentTrade may read null before we call the trade closed. TIME-based, not
+  // tick-based, so it stays ~6s no matter what pollMs is set to (at the old 1s tick this
+  // was 5 reads; expressing it in ticks would have silently cut it to 1.5s here).
+  const long nullToleranceMs = 6000;
   long lastReq = -5000, lastNote = -5000; string lastRemindKey = "";
-  int nullReads = 0;
+  long firstNullAt = -1;
   bool ready = false;
 
-  for (long ms = 0; ms < watchMs && !ready; ms += pollMs)
+  // Driven by a REAL clock, not a tick counter: every iteration also does remote reads,
+  // so `ms += pollMs` under-counted elapsed time and made each threshold below (and the
+  // caller's --timeout) fire late in wall-clock terms.
+  var watch = System.Diagnostics.Stopwatch.StartNew();
+  while (!ready && watch.ElapsedMilliseconds < watchMs)
   {
+    // Captured BEFORE the reads below so a transition landing mid-iteration still wakes
+    // the wait at the bottom rather than being missed.
+    long seq = exec.StateSeq;
+    long ms = watch.ElapsedMilliseconds;
     if (exec.AbortRequested)
     {
       TradeBot.TradeExecutor.LastFlowDetail = "cancelled by operator";
       Line("Cancelled by operator — closing the trade (nothing moved)."); exec.CancelCurrent(); WaitForNoTrade(); return false;
     }
-    System.Threading.Thread.Sleep(pollMs);
     MTGOSDK.API.Trade.TradeEscrow? c = null;
     try { c = MTGOSDK.API.Trade.TradeManager.CurrentTrade; } catch { c = null; }
     if (c is null)
@@ -758,13 +859,14 @@ static bool Negotiate(TradeBot.TradeExecutor exec, string partner,
       // A momentary null/throw is normal (TryReachNegotiation tolerates it too); only a
       // sustained disappearance means the trade is really gone. Never abandon a possibly
       // -live trade with our offer still exposed — cancel on the way out.
-      if (++nullReads < 5) { System.Threading.Thread.Sleep(500); continue; }
+      if (firstNullAt < 0) firstNullAt = ms;
+      if (ms - firstNullAt < nullToleranceMs) { exec.WaitForStateChange(seq, pollMs); continue; }
       TradeBot.TradeExecutor.LastFlowDetail = "the partner closed the trade before it was complete";
       Line("Trade closed before completion — clearing any residual escrow.");
       exec.CancelCurrent(); WaitForNoTrade();
       return false;
     }
-    nullReads = 0;
+    firstNullAt = -1;
     int curId = 0; try { curId = (int)c.Id; } catch { }
     if (expectedEscrowId != 0 && curId != 0 && curId != expectedEscrowId)
     {
@@ -802,8 +904,13 @@ static bool Negotiate(TradeBot.TradeExecutor exec, string partner,
       catch { }
     }
 
-    var gs = exec.StatusById(c.TradedItems, giveIntended);
-    var rs = exec.StatusById(c.PartnerTradedItems, recvIntended);
+    // Fetch each side ONCE per tick and reuse: every access re-fetches the item collection
+    // over the remoting bridge, and these are the most expensive reads in the loop.
+    var giveSide = c.TradedItems;
+    var recvSide = c.PartnerTradedItems;
+    var gs = exec.StatusById(giveSide, giveIntended);
+    var rs = exec.StatusById(recvSide, recvIntended);
+    bool partnerSubmitted = TradeBot.TradeExecutor.PartnerHasSubmitted(c);
 
     // They took something we didn't offer -> cancel (this is the asset guardrail).
     if (gs.extra.Count > 0)
@@ -828,7 +935,9 @@ static bool Negotiate(TradeBot.TradeExecutor exec, string partner,
     if (gs.missing.Count == 0 && rs.exact) { ready = true; break; }
 
     // Pull what we're owed from their presented binder (exact printing when we know it).
-    if (rs.missing.Count > 0 && ms - lastReq >= 1500)
+    // Re-request throttle: enough to not spam the client, short enough that a card they
+    // just presented comes across promptly (was 1500ms, which dominated perceived lag).
+    if (rs.missing.Count > 0 && ms - lastReq >= 500)
     {
       lastReq = ms;
       for (int i = 0; i < recvIntended.Count; i++)
@@ -845,7 +954,7 @@ static bool Negotiate(TradeBot.TradeExecutor exec, string partner,
     }
 
     // They pressed Submit while something is still missing — tell them precisely what.
-    if (gs.missing.Count > 0 && TradeBot.TradeExecutor.PartnerHasSubmitted(c))
+    if (gs.missing.Count > 0 && partnerSubmitted)
     {
       string key = string.Join("|", gs.missing);
       if (key != lastRemindKey)
@@ -855,7 +964,7 @@ static bool Negotiate(TradeBot.TradeExecutor exec, string partner,
         try { exec.SendDM(partner, $"Hold on — you submitted, but you still need to grab: {string.Join(", ", gs.missing)} from the '{presentBinder}' binder. Grab {(gs.missing.Count == 1 ? "it" : "them")} and submit again; I won't approve until it's exact."); } catch { }
       }
     }
-    else if (!TradeBot.TradeExecutor.PartnerHasSubmitted(c)) lastRemindKey = "";
+    else if (!partnerSubmitted) lastRemindKey = "";
 
     // The card is in their binder but won't come across — the known stale view-model bug.
     if (snapped && ms >= 25_000 && rs.missing.Count > 0 && presentedCat.Count > 0)
@@ -881,9 +990,14 @@ static bool Negotiate(TradeBot.TradeExecutor exec, string partner,
     if (ms - lastNote >= 10_000)
     {
       lastNote = ms;
-      Line($"  t+{ms / 1000,3}s  WE GIVE: {TradeBot.TradeExecutor.Summarize(c.TradedItems)} (still to grab: {(gs.missing.Count == 0 ? "(none)" : string.Join(", ", gs.missing))})" +
-           $"  |  WE RECEIVE: {TradeBot.TradeExecutor.Summarize(c.PartnerTradedItems)} (still needed: {(rs.missing.Count == 0 ? "(none)" : string.Join(", ", rs.missing))})");
+      Line($"  t+{ms / 1000,3}s  WE GIVE: {TradeBot.TradeExecutor.Summarize(giveSide)} (still to grab: {(gs.missing.Count == 0 ? "(none)" : string.Join(", ", gs.missing))})" +
+           $"  |  WE RECEIVE: {TradeBot.TradeExecutor.Summarize(recvSide)} (still needed: {(rs.missing.Count == 0 ? "(none)" : string.Join(", ", rs.missing))})");
     }
+
+    // Wake the instant MTGO reports a transition (the partner pressing Submit is one),
+    // falling back to the poll interval for changes that raise no state event — a partner
+    // grabbing a card off our binder only moves the item lists.
+    exec.WaitForStateChange(seq, pollMs);
   }
 
   if (!ready)
@@ -894,20 +1008,26 @@ static bool Negotiate(TradeBot.TradeExecutor exec, string partner,
     try { exec.SendDM(partner, "Cancelled — we ran out of time before both sides were exact. Reply YES to retry."); } catch { }
     return false;
   }
+  Phase("watch-loop→both-sides-exact");   // the wishlist pulls live here
   Line($"GUARDRAIL passed: WE GIVE exactly {(giveIntended.Count == 0 ? "nothing" : giveList)}; WE RECEIVE exactly {(recvIntended.Count == 0 ? "nothing" : recvList)}.");
 
   // ── PHASE 5: the shared finalize tail (submit -> re-verify -> commit/dry-run) ──
   string doneDm = giveIntended.Count > 0 && recvIntended.Count > 0 ? $"Done — you got {giveList}, I got {recvList}. Thanks!"
                 : giveIntended.Count > 0 ? $"Done — enjoy {giveList}!"
                 : $"Thanks — got {recvList}!";
-  return FinalizeTrade(exec, partner,
+  bool finalized = FinalizeTrade(exec, partner,
       c2 =>
       {
         // BOTH sides must be exactly the resolved request, by catalog id.
         return exec.StatusById(c2.TradedItems, giveIntended).exact
             && exec.StatusById(c2.PartnerTradedItems, recvIntended).exact;
       },
-      allowCommit, label, doneDm, expectedEscrowId);
+      allowCommit, label, doneDm, expectedEscrowId,
+      // The partner-approve wait derives from THIS job's budget. yesTimeoutSec is
+      // int.MaxValue for "wait until ready", which is not a sane approval budget, so cap it.
+      approvalWaitSec: yesTimeoutSec >= int.MaxValue / 2 ? 600 : yesTimeoutSec);
+  Phase("finalize(submit→approve→commit)");
+  return finalized;
 }
 
 // Small guarded read used by the engine's binder snapshot.
@@ -2357,6 +2477,11 @@ using (var exec = new TradeExecutor { AllowCommit = allowCommit })
         },
         holdings: holdings,
         log: s => Line(s));
+
+      // Executor output ([trade], [wishlist], [handshake], [perf]) stamps itself and now also
+      // lands in the ring buffer, so GET /log and the dashboard finally show the trade internals
+      // rather than only the service-level queue events.
+      TradeBot.TradeExecutor.Sink = svc.Note;
 
       Line($"[serve] trade service (give / deposit / swap) as {whoami}; per-job wait {perJobTimeout}s; " +
            $"commits {(allowCommit ? "ENABLED (--commit)" : "DISABLED — dry-run only")}.");

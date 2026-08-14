@@ -28,6 +28,17 @@ using static MTGOSDK.Core.Reflection.DLRWrapper;    // Unbind(...)
 
 namespace TradeBot;
 
+/// <summary>
+/// The one place the log timestamp format lives. Program.cs (Line), TradeExecutor (Log) and
+/// TradeService (the /log ring buffer) all stamp through this — they previously each had
+/// their own copy, and the ring buffer had already drifted to a different format and
+/// timezone, which made console and dashboard lines impossible to line up.
+/// </summary>
+public static class LogFormat
+{
+  public static string Stamp(string s) => $"{DateTime.Now:HH:mm:ss.fff}  {s}";
+}
+
 public sealed class TradeExecutor : IDisposable
 {
   // Live WotC model query-paths (confirmed via reference-assembly metadata dump).
@@ -64,6 +75,11 @@ public sealed class TradeExecutor : IDisposable
   // client's own logic, instead of us synthesizing a CollectionItem and guessing
   // the permission code (which the trade server rejects with ErrorReceived).
   const string ActiveTradeVM  = "Shiny.Trade.ViewModels.ActiveTradeViewModel";
+  // The scene view-model that OWNS the active trade view-model (private field
+  // m_activeTradeViewModel). Reaching the VM through this interface goes via MTGO's own
+  // service locator — the same cheap path used for IGroupingManager / IShellViewModel —
+  // instead of dumping the entire managed heap to find one object. See GetLiveTradeVM.
+  const string ITradeSceneVM  = "Shiny.Core.Interfaces.ITradeSceneViewModel";
 
   // File-import types used by MTGO's own "import a wishlist into the trade" flow.
   // Building an IFileImportCardGrouping of desired cards and matching it against
@@ -101,6 +117,40 @@ public sealed class TradeExecutor : IDisposable
   public IReadOnlyList<TradedItemInfo> LastCompletedGiven { get; private set; } = new List<TradedItemInfo>();
   public IReadOnlyList<TradedItemInfo> LastCompletedReceived { get; private set; } = new List<TradedItemInfo>();
   public string? LastCompletedPartner { get; private set; }
+  // ── State-change signal ───────────────────────────────────────────────────────
+  // MTGO PUSHES every escrow transition (TradeManager.TradeStateChanged), so a waiter can
+  // block on that instead of sleeping a fixed tick — the partner pressing Submit is then
+  // reacted to as fast as the client reports it, rather than up to a poll interval later.
+  // Every waiter still passes a bounded timeout, so a missed or unfired event degrades to
+  // exactly the old polling behaviour instead of hanging.
+  readonly object _stateLock = new();
+  long _stateSeq;
+
+  /// <summary>Monotonic counter bumped on every observed trade state change.</summary>
+  public long StateSeq { get { lock (_stateLock) return _stateSeq; } }
+
+  /// <summary>
+  /// Block until the trade state changes (<see cref="StateSeq"/> moves past
+  /// <paramref name="sinceSeq"/>) or <paramref name="timeoutMs"/> elapses; true if a change
+  /// landed. Capture <see cref="StateSeq"/> BEFORE evaluating your condition, so a change
+  /// that races the evaluation is not missed.
+  /// </summary>
+  public bool WaitForStateChange(long sinceSeq, int timeoutMs)
+  {
+    lock (_stateLock)
+    {
+      if (_stateSeq != sinceSeq) return true;
+      System.Threading.Monitor.Wait(_stateLock, timeoutMs);
+      return _stateSeq != sinceSeq;
+    }
+  }
+
+  /// <summary>Wake everyone waiting on a state change.</summary>
+  void BumpState()
+  {
+    lock (_stateLock) { _stateSeq++; System.Threading.Monitor.PulseAll(_stateLock); }
+  }
+
   public long CompletedTradeSeq { get; private set; }
 
   /// <summary>Escrow id of the most recently COMPLETED trade. Completion proof must be tied
@@ -128,10 +178,9 @@ public sealed class TradeExecutor : IDisposable
   /// instead of a canned per-shape guess. Static: one flow runs at a time.</summary>
   public static string? LastFlowDetail;
 
-  /// <summary>How many cards the last RequestViaWishlist matched against the
-  /// partner's presented trade binder (&gt;0 means the card IS in their offer, even
-  /// if it hasn't landed on our receive side yet).</summary>
-  public int LastMatchCount { get; private set; }
+  // (Removed LastMatchCount: nothing ever read it, and its name asserted the OPPOSITE of
+  // what the value means — see RequestViaWishlist, where the count is the UNMATCHED
+  // remainder. A write-only property documenting a falsehood is worse than no property.)
 
   static List<string> SnapshotItems(ItemCollection coll)
   {
@@ -169,7 +218,21 @@ public sealed class TradeExecutor : IDisposable
     catch (Exception ex) { Log($"[ledger] write failed: {ex.Message}"); }
   }
 
-  static void Log(string s) => Console.WriteLine(s);
+  /// <summary>
+  /// Optional second destination for executor log lines. The serve points this at its
+  /// ring buffer so the dashboard's GET /log shows [trade]/[wishlist]/[handshake] lines,
+  /// which previously never left the console. Receives the SAME pre-stamped string.
+  /// </summary>
+  public static Action<string>? Sink;
+
+  static void Log(string s)
+  {
+    // Stamp here rather than at ~200 call sites. Without a timestamp the logs cannot
+    // answer "how long did that phase take", which is the whole point of the [perf] lines.
+    string line = LogFormat.Stamp(s);
+    Console.WriteLine(line);
+    try { Sink?.Invoke(line); } catch { /* a logging sink must never break a trade */ }
+  }
 
   // Trade actions open WPF dialogs / mutate UI-bound models, so they must run on
   // MTGO's UI dispatcher thread. BeginUIThreadScope marshals the remote call there.
@@ -359,6 +422,34 @@ public sealed class TradeExecutor : IDisposable
   }
 
   /// <summary>
+  /// DIAGNOSTIC: dump every binder the SDK can enumerate, surfacing per-binder read failures
+  /// rather than coercing them to "" the way the name lookups do — a failed Name read and an
+  /// absent binder are indistinguishable in the normal logs, and they mean opposite things.
+  /// Called only on failure paths.
+  /// </summary>
+  public void DumpBinders(string why)
+  {
+    Log($"[binder-debug] {why}: enumerating CollectionManager.Binders...");
+    int i = 0;
+    try
+    {
+      foreach (var b in MTGOSDK.API.Collection.CollectionManager.Binders)
+      {
+        string nm, id, cnt;
+        try { nm = b.Name ?? "(null)"; }
+        catch (Exception ex) { nm = $"<threw {ex.GetType().Name}: {ex.Message.Split('\n')[0]}>"; }
+        try { id = ((int)b.Id).ToString(); }
+        catch (Exception ex) { id = $"<threw {ex.GetType().Name}>"; }
+        try { cnt = b.ItemCount.ToString(); }
+        catch (Exception ex) { cnt = $"<threw {ex.GetType().Name}>"; }
+        Log($"[binder-debug]   [{i++}] name='{nm}' id={id} items={cnt}");
+      }
+    }
+    catch (Exception ex) { Log($"[binder-debug] enumeration threw: {ex.GetType().Name}: {ex.Message.Split('\n')[0]}"); }
+    Log($"[binder-debug] {why}: {i} binder(s) enumerated.");
+  }
+
+  /// <summary>
   /// Make <paramref name="binderName"/> the client's LAST-USED binder. The trade
   /// invite (SendTradeInvitationReqAction, dispatched by AdvanceBinderSelection) is
   /// parameterless, so the binder it PRESENTS comes from this ambient state
@@ -377,13 +468,34 @@ public sealed class TradeExecutor : IDisposable
       dynamic mgr = Unbind((object)ObjectProvider.Get(IGroupingManager, true, false, false));
       dynamic ib  = Unbind((object)binder);
       OnUI(() => { mgr.LastUsedBinder = ib; });
+
       // READ BACK: a setter that returns without throwing has NOT proven anything — if the
       // assignment silently didn't take, MTGO would present the previously-used binder and
       // the partner would see cards we never meant to offer. Verify by id.
-      int gotId = Try(() => (int)Unbind((object)mgr.LastUsedBinder).Id) ?? -1;
-      if (wantId != 0 && gotId != wantId)
+      //
+      // Read through CollectionManager.LastUsedBinder — the SDK's WRAPPED Binder — not off
+      // the raw manager DRO: the DRO exposes `Name` but has no `Id` member, so reading id
+      // there throws RuntimeBinderException and the comparison could never pass. Poll,
+      // because the write is marshaled onto MTGO's UI thread and need not be visible on the
+      // first read. Fails closed: a write that never lands never reads back as our binder.
+      int gotId = 0; string gotName = "";
+      bool Matches()
       {
-        Log($"[binder] VERIFY FAILED: LastUsedBinder reads back as id={gotId}, expected '{binderName}' (id={wantId}) — refusing to present it.");
+        var lub = MTGOSDK.API.Collection.CollectionManager.LastUsedBinder;
+        gotId = Try(() => (int)lub!.Id) ?? 0;
+        gotName = Try(() => lub!.Name) ?? "";
+        // Prefer identity. Fall back to the name only when the binder reports no usable id
+        // (some groupings read back as 0) — that is the same key the lookup above used, so
+        // it is no weaker than the selection itself.
+        return wantId != 0
+          ? gotId == wantId
+          : string.Equals(gotName, binderName, StringComparison.OrdinalIgnoreCase);
+      }
+      if (!WaitUntilSync(Matches, delay: 100, retries: 20))   // up to ~2s
+      {
+        Log($"[binder] VERIFY FAILED: LastUsedBinder reads back as '{gotName}' (id={gotId}), " +
+            $"expected '{binderName}' (id={wantId}) — refusing to present it.");
+        DumpBinders("after failed LastUsedBinder verify");
         return false;
       }
       Log($"[binder] LastUsedBinder = '{binderName}' (id={wantId}) — verified by read-back.");
@@ -414,7 +526,7 @@ public sealed class TradeExecutor : IDisposable
     try { state = cur.State; } catch { }
 
     // Don't yank a trade the human is actively committing.
-    if (state.ToString().StartsWith("Approval"))
+    if (IsHumanApproving(state.ToString()))
     {
       Log($"[cleanup] trade in {state} (human committing) — leaving it alone.");
       return;
@@ -610,13 +722,72 @@ public sealed class TradeExecutor : IDisposable
   /// throws "Multiple objects found"); enumerate all and pick the one bound to the
   /// LIVE trade — matching the current partner name and a non-terminal state.
   /// </summary>
+  /// <summary>
+  /// True while a human is actively committing the trade (any Approval* state). ONE
+  /// definition, because two places depend on agreeing: CancelCurrent refuses to tear a
+  /// trade down in this state, and FinalizeTrade's completion wait extends its budget in it.
+  /// If those two ever disagreed, one would abandon a trade the other considers live.
+  /// </summary>
+  public static bool IsHumanApproving(string state) =>
+    (state ?? "").StartsWith("Approval", StringComparison.OrdinalIgnoreCase);
+
+  /// <summary>
+  /// Escrow id of a raw ActiveTradeViewModel DRO, as a string ("" if unreadable).
+  /// <para/>
+  /// The member is <c>EscrowId</c>, NOT <c>Id</c>: <c>Id</c> exists only on the SDK's
+  /// wrapper (<c>TradeEscrow.cs:37</c>, <c>public int Id =&gt; @base.EscrowId</c>), so
+  /// reading <c>.Id</c> off the raw object throws — the same trap as <c>Binder.Id</c> vs
+  /// <c>NetDeckId</c>. That read was silently failing here for both the scan and the fast
+  /// path, which is why this mapping now lives in exactly one place.
+  /// </summary>
+  static string EscrowIdOf(dynamic activeTradeVm) =>
+    Try(() => (string)activeTradeVm.CurrentTradeEscrow.EscrowId.ToString()) ?? "";
+
   static dynamic GetLiveTradeVM()
   {
-    string partner = null, liveId = null;
-    try { var cur = TradeManager.CurrentTrade; partner = cur?.TradePartnerName; liveId = Try(() => cur.Id.ToString()); } catch { }
+    var swVm = System.Diagnostics.Stopwatch.StartNew();
+    string liveId = Try(() => TradeManager.CurrentTrade.Id.ToString()) ?? "";
+
+    // ── FAST PATH: locator → scene view-model → the active trade view-model ──────────
+    // The scan below rebuilds the ClrMD snapshot of MTGO and walks EVERY object on its
+    // heap to find a single instance — measured at 14-16s, three times per trade. This
+    // reaches the same object through MTGO's own service locator plus one private-field
+    // read, the pattern the SDK already uses elsewhere (Client.cs reads m_loginViewModel
+    // straight off the shell view-model). Measured at 2-157ms.
+    //
+    // FAILS SAFE: accepted ONLY when the view-model's own escrow id equals the LIVE escrow
+    // id — the same identity test the scan uses for its best match. Not registered, field
+    // empty, unreadable, or bound to a different trade all fall through to the scan, which
+    // is unchanged. So this can be slower, never wrong.
+    if (liveId.Length > 0)
+    {
+      try
+      {
+        dynamic scene = Unbind((object)ObjectProvider.Get(ITradeSceneVM, true, false, false));
+        dynamic fast = scene.m_activeTradeViewModel;
+        string fastEsc = fast is null ? "" : EscrowIdOf(fast);
+        if (fastEsc.Length > 0 && fastEsc == liveId)
+        {
+          Log($"[perf] vm-resolve fast {swVm.ElapsedMilliseconds}ms (locator → TradeSceneViewModel, escrow {liveId})");
+          return fast;
+        }
+        Log(fast is null
+          ? "[vm] fast path: m_activeTradeViewModel was null — falling back to heap scan."
+          : $"[vm] fast path escrow mismatch (vm='{fastEsc}' live='{liveId}') — falling back to heap scan.");
+      }
+      catch (Exception ex)
+      {
+        Log($"[vm] fast path unavailable ({ex.GetType().Name}: {ex.Message.Split('\n')[0]}) — falling back to heap scan.");
+      }
+    }
+
+    // Only the scan needs the partner name (for its ambiguous fallback match), so read it
+    // here rather than up front — the fast path above never uses it.
+    string partner = Try(() => (string)TradeManager.CurrentTrade.TradePartnerName);
 
     dynamic vm = null, firstLive = null, firstNameMatch = null;
     int scanned = 0;
+    bool matchedById = false;   // false here means we fell back to an AMBIGUOUS match
     try
     {
       foreach (var cand in RemoteClient.GetInstances(ActiveTradeVM))
@@ -625,13 +796,13 @@ public sealed class TradeExecutor : IDisposable
         dynamic c = Unbind((object)cand);
         string cn = Try(() => (string)c.CurrentTradeUserName) ?? "";
         string est = Try(() => (string)c.CurrentTradeEscrow.CurrentState.ToString()) ?? "";
-        string escId = Try(() => c.CurrentTradeEscrow.Id.ToString()) ?? "";
+        string escId = EscrowIdOf(c);
         bool nameOk = partner is null || string.Equals(cn, partner, StringComparison.OrdinalIgnoreCase);
         bool live = est.StartsWith("Negotiate") || est.StartsWith("Approval") || est.StartsWith("Invite");
         // BEST: the VM bound to the LIVE escrow (matched by id) — unambiguous even
         // when STALE VMs from earlier trades this session share the partner name and
         // a non-terminal cached state (which made the match/request hit a dead VM).
-        if (liveId != null && liveId.Length > 0 && escId == liveId) { vm = c; break; }
+        if (liveId != null && liveId.Length > 0 && escId == liveId) { vm = c; matchedById = true; break; }
         if (firstLive is null && nameOk && live) firstLive = c;
         if (firstNameMatch is null && nameOk) firstNameMatch = c;
       }
@@ -645,7 +816,9 @@ public sealed class TradeExecutor : IDisposable
     if (vm is null)
       throw new InvalidOperationException(
         $"No live {ActiveTradeVM} found (scanned {scanned}) — open a trade first.");
-    Log($"[trade] reached ActiveTradeViewModel (partner={Try(() => (string)vm.CurrentTradeUserName) ?? "?"}, scanned {scanned})");
+    // One line, and no extra remote read for the partner name — `partner` is already in hand.
+    Log($"[perf] vm-resolve scan {swVm.ElapsedMilliseconds}ms (partner={partner ?? "?"}, scanned={scanned}, " +
+        $"matched={(matchedById ? $"by-escrow-id({liveId})" : "AMBIGUOUS name/live fallback")})");
     return vm;
   }
 
@@ -657,10 +830,22 @@ public sealed class TradeExecutor : IDisposable
   /// </summary>
   public string RequestViaWishlist(int catalogId, int quantity, string cardName)
   {
+    // TIMED in three parts so the cost can be attributed: vm = resolving the view-model,
+    // ui = the UI-thread marshaled import/match, wait+read = the settle sleep below.
+    var swTotal = System.Diagnostics.Stopwatch.StartNew();
     dynamic vm = GetLiveTradeVM();
+    long msVm = swTotal.ElapsedMilliseconds;
     Log($"[wishlist] requesting catId={catalogId} x{quantity} ({cardName}) via import/match");
 
-    int matched = -1;
+    // UNMATCHED, not matched. MatchDesiredCardsFromPartnersTradeBinder returns
+    // List<IFileImportCard> — the SAME DTO type we hand it — i.e. the leftovers it could
+    // not find, so 0 means everything was found. Evidenced 2026-08-14: a request whose
+    // ItemsLocalUserWants went from empty to the full quantity still returned a list that
+    // enumerated to 0 elements, so the count is genuinely empty rather than unreadable, and
+    // it cannot be a count of matches. Treat non-zero as "some of what we asked for is not
+    // in their binder"; never treat this value as the success signal — the authoritative
+    // check is the item appearing on the escrow (Negotiate's StatusById).
+    int unmatched = -1;
     try
     {
       OnUI(() =>
@@ -672,18 +857,21 @@ public sealed class TradeExecutor : IDisposable
         if (!string.IsNullOrEmpty(cardName)) card.CardName = cardName;
         grouping.Cards.Add(card);
         dynamic result = vm.MatchDesiredCardsFromPartnersTradeBinder(grouping);
-        matched = Try(() => (int)result.Count) ?? -1;
+        unmatched = Try(() => (int)result.Count) ?? -1;
         // Some paths only build the match list; ensure it's applied + sent.
         try { vm.SendPendingItems(); } catch { }
       });
     }
     catch (Exception ex) { Log($"[wishlist] tolerated downstream warning ({ex.Message.Split('\n')[0]})"); }
-    LastMatchCount = matched;
-    Log($"[wishlist] MatchDesiredCardsFromPartnersTradeBinder matched {matched} card(s)");
+    long msUi = swTotal.ElapsedMilliseconds - msVm;
+    if (unmatched != 0)
+      Log($"[wishlist] {unmatched} requested card(s) NOT found in the partner's binder (-1 = unreadable)");
 
     System.Threading.Thread.Sleep(1500);
     string requested = ReadRequestedItems(vm);
     Log($"[wishlist] you-receive (ItemsLocalUserWants) now: {requested}");
+    Log($"[perf] wishlist cat={catalogId} total={swTotal.ElapsedMilliseconds}ms " +
+        $"(vm={msVm} ui={msUi} wait+read={swTotal.ElapsedMilliseconds - msVm - msUi})");
     return requested;
   }
 
@@ -694,7 +882,9 @@ public sealed class TradeExecutor : IDisposable
   /// </summary>
   public void SubmitDeposit()
   {
+    var swSubmit = System.Diagnostics.Stopwatch.StartNew();
     dynamic vm = GetLiveTradeVM();
+    long msVm = swSubmit.ElapsedMilliseconds;
     bool can = false;
     OnUI(() =>
     {
@@ -702,6 +892,7 @@ public sealed class TradeExecutor : IDisposable
       if (can) vm.SubmitTradeExecute();
     });
     Log($"[trade] deposit submit: {(can ? "SubmitTradeExecute dispatched" : "SubmitTradeCanExecute=false — skipped")}.");
+    Log($"[perf] submit {swSubmit.ElapsedMilliseconds}ms (vm={msVm})");
   }
 
   /// <summary>
@@ -717,7 +908,9 @@ public sealed class TradeExecutor : IDisposable
     if (!AllowCommit)
       throw new InvalidOperationException(
         "ConfirmTrade BLOCKED: AllowCommit is false (dry-run). No assets moved.");
+    var swConfirm = System.Diagnostics.Stopwatch.StartNew();
     dynamic vm = GetLiveTradeVM();
+    long msConfirmVm = swConfirm.ElapsedMilliseconds;
     bool can = false; string why = "";
     // ATOMIC final gate: identity, approval-state and the dispatch happen in ONE UI-thread
     // operation, so the partner cannot slip a change in between the checks and the commit.
@@ -740,6 +933,7 @@ public sealed class TradeExecutor : IDisposable
       can = true;
     });
     Log($"[trade] FINAL APPROVE: {(can ? "ConfirmTradeExecute dispatched — COMMIT" : $"skipped ({why})")}.");
+    Log($"[perf] confirm {swConfirm.ElapsedMilliseconds}ms (vm={msConfirmVm})");
     return can;
   }
 
@@ -1345,10 +1539,22 @@ public sealed class TradeExecutor : IDisposable
             (inner != null ? $" || inner: {inner.GetType().Name}: {inner.Message.Split('\n')[0]}" : ""));
       }
 
-      System.Threading.Thread.Sleep(1500);
-      var found = MTGOSDK.API.Collection.CollectionManager.Binders
-        .FirstOrDefault(b => string.Equals(Try(() => b.Name) ?? "", binderName, StringComparison.OrdinalIgnoreCase));
-      if (found != null && BinderHasExactly(found, items))
+      // CreateNewBinder is dispatched async onto the UI thread, so we have to wait for the
+      // binder to actually appear with the right contents. POLL for that rather than
+      // sleeping a flat 1.5s — same worst case, but a create that lands quickly (the common
+      // case) no longer costs the full window on every give-trade. Each pass is two remote
+      // enumerations (the binder list, then its contents), so poll gently.
+      MTGOSDK.API.Collection.Binder? found = null;
+      bool exact = false;
+      WaitUntilSync(() =>
+      {
+        found = MTGOSDK.API.Collection.CollectionManager.Binders
+          .FirstOrDefault(b => string.Equals(Try(() => b.Name) ?? "", binderName, StringComparison.OrdinalIgnoreCase));
+        // Contents can still be populating after the binder itself appears, so keep
+        // polling until they match or the window closes.
+        return exact = found != null && BinderHasExactly(found, items);
+      }, delay: 300, retries: 5);   // up to ~1.5s
+      if (exact)
       {
         Log($"[binder] '{found.Name}' ready (id={Try(() => found.Id)}, items={Try(() => found.ItemCount)}).");
         return found;
@@ -1395,10 +1601,16 @@ public sealed class TradeExecutor : IDisposable
       return false;
     }
 
-    System.Threading.Thread.Sleep(1500);
-    var still = MTGOSDK.API.Collection.CollectionManager.Binders
-      .FirstOrDefault(b => string.Equals(Try(() => b.Name) ?? "", binderName, StringComparison.OrdinalIgnoreCase));
-    if (still != null) { Log($"[binder] '{binderName}' still present after delete."); return false; }
+    // DeleteGrouping is dispatched async onto the UI thread. POLL for the binder to
+    // disappear instead of sleeping a flat 1.5s — same 1.5s worst case, but a delete that
+    // lands quickly (the common case) no longer costs the full window. Together with the
+    // create above this was ~3s of dead time on every give-trade. Each pass is a remote
+    // binder enumeration, so poll gently.
+    bool gone = WaitUntilSync(() =>
+      MTGOSDK.API.Collection.CollectionManager.Binders
+        .FirstOrDefault(b => string.Equals(Try(() => b.Name) ?? "", binderName, StringComparison.OrdinalIgnoreCase)) is null,
+      delay: 300, retries: 5);   // up to ~1.5s
+    if (!gone) { Log($"[binder] '{binderName}' still present after delete."); return false; }
     Log($"[binder] '{binderName}' deleted.");
     return true;
   }
@@ -1634,6 +1846,10 @@ public sealed class TradeExecutor : IDisposable
     if (existing is null)
     {
       Log($"[binder] no binder named '{binderName}' — attempting to create an empty one...");
+      // DIAGNOSTIC: the lookup above coerces a failed Name read to "", so "not found" may
+      // really mean "the binder is there but unreadable" — in which case creating another
+      // one is exactly the wrong move, and we'd pile up duplicates every run.
+      DumpBinders($"'{binderName}' not found by name");
       var made = TryCreateEmptyBinder(binderName);
       if (made != null) return made;
       Log($"[binder] SETUP NEEDED: could not create '{binderName}' via any API path. In the MTGO client, " +
@@ -1816,12 +2032,19 @@ public sealed class TradeExecutor : IDisposable
   {
     _warm = false;   // a fresh attach may mean a cold client
     Action<TradeEscrow, bool> started = (e, isPlayer) =>
+    {
+      BumpState();
       Log($"[event] TradeStarted player={isPlayer} partner={Try(() => e.TradePartnerName) ?? "?"} state={e.State}");
+    };
     TradeManager.TradeStarted += started;
     _off.Add(() => TradeManager.TradeStarted -= started);
 
     Action<TradeEscrow, (TradeState Old, TradeState New)> changed = (e, s) =>
     {
+      // Wake waiters FIRST — before the snapshot reads below, which are remote calls and
+      // take far longer than the transition itself. A waiter re-reads the escrow anyway.
+      BumpState();
+
       // Observe only. The bot never sends the commit here (ConfirmTrade is gated).
       Log($"[event] StateChanged {s.Old} -> {s.New} partner={Try(() => e.TradePartnerName) ?? "?"}");
 
@@ -1858,6 +2081,11 @@ public sealed class TradeExecutor : IDisposable
         _lastReceived = new(); _lastGiven = new(); _lastPartner = null;
         _lastReceivedS = new(); _lastGivenS = new();
       }
+
+      // Bump AGAIN now that the completion bookkeeping above is published: the commit
+      // waiter's condition is CompletedTradeSeq/LastCompletedEscrowId, which are only set
+      // at the end of this handler — the early bump alone would wake it too soon to see them.
+      BumpState();
     };
     TradeManager.TradeStateChanged += changed;
     _off.Add(() => TradeManager.TradeStateChanged -= changed);
