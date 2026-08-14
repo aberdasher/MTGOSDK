@@ -152,8 +152,8 @@ button.recall:hover{border-color:var(--acc)}
         <input id="fcard" placeholder="filter by card…" oninput="renderSheet()">
       </div>
       <div class="sheetwrap"><table class="sheet">
-        <thead><tr><th>Card</th><th>Printing</th><th>From</th><th>Qty</th><th>Can lend to</th><th>Status</th><th></th></tr></thead>
-        <tbody id="sheet"><tr><td colspan="7" class="muted">no holdings yet</td></tr></tbody>
+        <thead><tr><th>Card</th><th>Printing</th><th>Direction</th><th>Qty</th><th>When (UTC)</th><th>Job</th><th></th></tr></thead>
+        <tbody id="sheet"><tr><td colspan="7" class="muted">no movements yet</td></tr></tbody>
       </table></div>
     </section>
   </div>
@@ -216,31 +216,28 @@ async function prune(){const m=$('prunemsg');m.textContent='pruning…';
     m.textContent=r.ok?('pruned '+(d.pruned||0)+' binder(s)'):('failed: '+(d.error||('HTTP '+r.status)));}
   catch(e){m.textContent='error';}
   setTimeout(()=>{m.textContent='';},6000);}
-let allHoldings=[];
-async function holdingsTick(){try{const r=await api('/holdings');if(!r.ok)return;const j=await r.json();allHoldings=j.holdings||[];renderSheet();}catch(e){}}
+// The ledger is a record of what CROSSED THE MTGO BOUNDARY — not who owns what. Balances
+// and claims (including tournament escrow) live in DraftBot; nothing here implies ownership.
+let allEntries=[], ledgerNet={};
+async function holdingsTick(){try{const r=await api('/ledger');if(!r.ok)return;const j=await r.json();allEntries=j.entries||[];ledgerNet=j.netByCard||{};renderSheet();}catch(e){}}
 function renderSheet(){
   const fp=($('fplayer').value||'').trim().toLowerCase(), fc=($('fcard').value||'').trim().toLowerCase();
-  const rows=allHoldings.filter(h=>{
-    const players=[h.owner,h.borrower].concat(h.canLendTo||[]).filter(Boolean).join(' ').toLowerCase();
-    return (!fp||players.includes(fp)) && (!fc||(h.card||'').toLowerCase().includes(fc));
-  });
-  const onloan=allHoldings.filter(h=>h.status==='onloan').length;
-  $('hcount').textContent=allHoldings.length?('· '+allHoldings.length+' held, '+onloan+' on loan'):'';
+  const rows=allEntries.filter(e=>
+    (!fp||(e.user||'').toLowerCase().includes(fp)) && (!fc||(e.card||'').toLowerCase().includes(fc)));
+  const net=Object.keys(ledgerNet).map(k=>k+' '+(ledgerNet[k]>=0?'+':'')+ledgerNet[k]).join(', ');
+  $('hcount').textContent=allEntries.length?('· '+allEntries.length+' movements'+(net?' · net '+net:'')):'';
   const tb=$('sheet');
-  if(!rows.length){tb.innerHTML='<tr><td colspan="7" class="muted">'+(allHoldings.length?'no holdings match the filter':'no holdings yet — deposits and lends show up here')+'</td></tr>';return;}
-  tb.innerHTML='';rows.forEach(h=>{
-    const from=(h.owner==='house')?'<span class="muted">house</span>':esc(h.owner);
-    const canlend=(h.canLendTo&&h.canLendTo.length)?esc(h.canLendTo.join(', ')):'<span class="muted">anyone</span>';
-    const status=(h.status==='onloan')?'<span class="pill onloan">on loan → '+esc(h.borrower||'?')+'</span>':'<span class="pill held">held</span>';
-    const act=(h.status==='onloan')?'<button class="mini recall" onclick="recall(\''+h.id+'\')">recall</button>':'';
+  if(!rows.length){tb.innerHTML='<tr><td colspan="7" class="muted">'+(allEntries.length?'no movements match the filter':'no movements yet — deposits and withdrawals show up here')+'</td></tr>';return;}
+  tb.innerHTML='';rows.forEach(e=>{
+    const isIn=(e.kind||'')==='deposit';
+    const dir=isIn?'<span class="pill held">in ← '+esc(e.user)+'</span>'
+                  :'<span class="pill onloan">out → '+esc(e.user)+'</span>';
+    const when=(e.at||'').replace('T',' ').replace(/\..*$/,'');
     const tr=el('tr');
-    tr.innerHTML='<td><b>'+esc(h.card)+'</b></td><td class="num">'+h.catId+'</td><td>'+from+'</td><td class="num">'+h.qty+'</td><td>'+canlend+'</td><td>'+status+'</td><td>'+act+'</td>';
+    tr.innerHTML='<td><b>'+esc(e.card)+'</b></td><td class="num">'+e.catId+'</td><td>'+dir+'</td><td class="num">'+(isIn?'+':'-')+e.qty+'</td><td class="muted">'+esc(when)+'</td><td class="muted">'+esc(e.jobId||'')+'</td><td></td>';
     tb.append(tr);
   });
 }
-async function recall(id){try{const r=await api('/holdings/'+id+'/recall',{method:'POST'});let d={};try{d=await r.json();}catch(e){}
-  if(!r.ok){alert('recall failed: '+(d.error||('HTTP '+r.status)));return;}
-  tick();holdingsTick();}catch(e){}}
 $('ocommit').addEventListener('change',e=>{$('cwarn').style.display=e.target.checked?'block':'none';});
 async function queue(){const o={partner:$('partner').value.trim(),give:rows('give'),receive:rows('receive'),commit:$('ocommit').checked,waitMinutes:parseInt($('wait').value)||0};
   if(!o.partner){alert('partner required');return;}

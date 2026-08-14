@@ -41,7 +41,6 @@ public sealed class TradeJob
   public bool Commit { get; init; }                    // false => dry-run (reaches approval, cancels)
   public int WaitSec { get; init; } = int.MaxValue;    // readiness wait for partner (online+YES); MaxValue = until ready
   public int CatId { get; init; }                      // recall: the exact printing to reclaim
-  public string? LoanId { get; init; }                 // recall: the loan being settled
   public string? Intent { get; init; }                 // give custody semantics: "loan" | "withdraw"; null = infer (tix=withdraw, cards=loan)
   public volatile bool Cancelled;                      // operator cancel (before/at pickup, or via abort while running)
   public JobState State { get; set; } = JobState.Queued;
@@ -77,7 +76,7 @@ public sealed class TradeService
   readonly Action<string> _log;
   // Optional vault read: () => (owned tix, distinct item count, top holdings). Null => /vault n/a.
   readonly Func<(int tix, int distinct, List<(string name, int qty)> top)>? _vaultFn;
-  readonly HoldingStore _holdings;   // custody ledger — deposits + house loans, per-owner allow-lists
+  readonly LedgerStore _ledger;      // append-only record of what crossed the boundary (NOT claims)
 
   readonly ConcurrentDictionary<string, TradeJob> _jobs = new();
   readonly BlockingCollection<TradeJob> _queue = new(new ConcurrentQueue<TradeJob>());
@@ -106,11 +105,11 @@ public sealed class TradeService
     Func<string, List<(string name, int qty, int catId)>, List<(string name, int qty, int catId)>, bool, int, (bool ok, string detail)> tradeFn,
     Func<string, string, int, int, bool, int, (bool ok, string detail)> recallFn,
     Func<(int tix, int distinct, List<(string name, int qty)> top)>? vaultFn,
-    HoldingStore holdings,
+    LedgerStore ledger,
     Action<string> log)
   {
     _token = token; _bind = bind; _port = port; _conn = conn;
-    _perJobTimeoutSec = perJobTimeoutSec; _commitArmed = commitArmed; _tradeFn = tradeFn; _recallFn = recallFn; _vaultFn = vaultFn; _holdings = holdings;
+    _perJobTimeoutSec = perJobTimeoutSec; _commitArmed = commitArmed; _tradeFn = tradeFn; _recallFn = recallFn; _vaultFn = vaultFn; _ledger = ledger;
     // Tee every service log line into a ring buffer so the dashboard's GET /log can show it.
     // Stamped through LogFormat so service lines and executor lines in the same ring share
     // one format and can be diffed against each other.
@@ -152,8 +151,8 @@ public sealed class TradeService
 
     _log($"[serve] listening on {prefix}   custodian={_conn.Account}   (Bearer token required)");
     _log($"[serve] dashboard: http://{_bind}:{_port}/  (open in a browser; paste the token)");
-    _log("[serve] routes: GET / (dashboard) | GET /health | GET /vault | GET /holdings | GET /autocomplete?q= | GET /log | GET /jobs | GET /jobs/{id} | " +
-         "POST /jobs/{id}/cancel | POST /holdings/{id}/recall | POST /owners/{owner}/allow | POST /binders/prune | POST /request | POST /deposit | POST /trade");
+    _log("[serve] routes: GET / (dashboard) | GET /health | GET /vault | GET /ledger | GET /autocomplete?q= | GET /log | GET /jobs | GET /jobs/{id} | " +
+         "POST /jobs/{id}/cancel | POST /recall | POST /binders/prune | POST /request | POST /deposit | POST /trade");
 
     while (true)
     {
@@ -215,25 +214,13 @@ public sealed class TradeService
       return;
     }
     if (method == "GET" && path == "/vault") { HandleVault(ctx); return; }
-    if (method == "GET" && path == "/holdings")
+    if (method == "GET" && path == "/ledger")
     {
-      var allow = _holdings.AllAllow();
-      var list = _holdings.Active().Select(h => new { id = h.Id, owner = h.Owner, card = h.Card, catId = h.CatId,
-        qty = h.Qty, borrower = h.Borrower, status = h.Status, acquiredAt = h.AcquiredAt,
-        canLendTo = allow.TryGetValue(h.Owner, out var l) ? l : new List<string>() }).ToList();
-      Write(ctx, 200, new { holdings = list });
-      return;
-    }
-    if (method == "POST" && path.StartsWith("/owners/") && path.EndsWith("/allow"))
-    {
-      string owner = Uri.UnescapeDataString(path.Substring("/owners/".Length, path.Length - "/owners/".Length - "/allow".Length));
-      string abody; using (var rr = new StreamReader(req.InputStream, req.ContentEncoding ?? Encoding.UTF8)) abody = rr.ReadToEnd();
-      List<string> borrowers;
-      try { borrowers = JsonSerializer.Deserialize<AllowDto>(abody, JsonIn)?.Borrowers ?? new(); }
-      catch (Exception ex) { Write(ctx, 400, new { error = "bad json", detail = ex.Message }); return; }
-      _holdings.SetOwnerAllow(owner, borrowers);
-      _log($"[holding] owner {owner} allow-list = [{string.Join(", ", _holdings.OwnerAllow(owner))}]");
-      Write(ctx, 200, new { owner, allow = _holdings.OwnerAllow(owner) });
+      // What crossed the boundary, newest first, plus the aggregate net per card. NOT a
+      // per-user balance — see LedgerStore. Ask DraftBot who is owed what.
+      var list = _ledger.Recent(200).Select(e => new { id = e.Id, kind = e.Kind, user = e.User,
+        card = e.Card, catId = e.CatId, qty = e.Qty, at = e.At, jobId = e.JobId }).ToList();
+      Write(ctx, 200, new { entries = list, total = _ledger.Count, netByCard = _ledger.NetByCard() });
       return;
     }
     if (method == "GET" && path == "/binders")
@@ -248,8 +235,7 @@ public sealed class TradeService
     if (method == "POST" && path == "/deposit") { HandleEnqueue(ctx, req, "deposit"); return; }  // receive
     if (method == "POST" && path == "/trade")   { HandleEnqueue(ctx, req, "trade");   return; }  // give+receive
     if (method == "POST" && path == "/binders/prune") { HandlePrune(ctx); return; }
-    if (method == "POST" && path.StartsWith("/holdings/") && path.EndsWith("/recall"))
-    { HandleRecall(ctx, path.Substring("/holdings/".Length, path.Length - "/holdings/".Length - "/recall".Length)); return; }
+    if (method == "POST" && path == "/recall") { HandleRecall(ctx, req); return; }
 
     Write(ctx, 404, new { error = "not found", path, method });
   }
@@ -349,24 +335,21 @@ public sealed class TradeService
   {
     var job = _custodyJob;
     if (job is null || !string.Equals(partner, job.User, StringComparison.OrdinalIgnoreCase)) return;
-    if (job.Type == "recall") return;   // the worker settles the specific loan itself
+
+    // Record WHAT MOVED, in both directions, and nothing else. No intent, no loan/withdraw
+    // distinction, no per-user balance: those are claims, and claims are DraftBot's. A card
+    // leaving the vault looks identical here whether it was sold, lent or paid out — the
+    // difference is a claim, recorded there.
     foreach (var g in given)
     {
-      bool isTix = string.Equals(g.Name, "Event Ticket", StringComparison.OrdinalIgnoreCase);
-      string intent = job.Intent ?? ((job.Type == "trade" || isTix) ? "withdraw" : "loan");
-      if (intent == "withdraw")
-      {
-        int released = _holdings.ConsumeDeposits(job.User, g.Name, g.Qty);
-        _log($"[holding] {job.User} withdrew {g.Qty}x {g.Name}" +
-             (released > 0 ? $" — released {released} from their held deposits"
-                           : " — no held deposits to release (claim accounting lives in DraftBot)"));
-      }
-      else
-      { var h = _holdings.RecordHouseLoan(g.Name, g.CatId, g.Qty, job.User); _log($"[holding] {job.User} borrowed {g.Qty}x {g.Name} (cat {g.CatId}) — house loan {h.Id}"); }
+      var e = _ledger.RecordWithdraw(job.User, g.Name, g.CatId, g.Qty, job.Id);
+      _log($"[ledger] OUT {g.Qty}x {g.Name} (cat {g.CatId}) -> {job.User} (entry {e.Id}, job {job.Id})");
     }
-    if (job.Type == "deposit")
-      foreach (var rc in received)
-      { var h = _holdings.RecordDeposit(job.User, rc.Name, rc.CatId, rc.Qty); _log($"[holding] {job.User} deposited {rc.Qty}x {rc.Name} (cat {rc.CatId}) — holding {h.Id} (owner {job.User})"); }
+    foreach (var rc in received)
+    {
+      var e = _ledger.RecordDeposit(job.User, rc.Name, rc.CatId, rc.Qty, job.Id);
+      _log($"[ledger] IN  {rc.Qty}x {rc.Name} (cat {rc.CatId}) <- {job.User} (entry {e.Id}, job {job.Id})");
+    }
   }
 
   void WorkerLoop()
@@ -397,15 +380,11 @@ public sealed class TradeService
         (bool ok, string detail) r;
         if (job.Type == "recall")
         {
-          // Recall: receive the EXACT owed printing back, then settle that loan.
+          // Receive the EXACT printing back. Settling the obligation is DraftBot's — here it
+          // is just an inbound movement, recorded by OnTradeCompleted like any other.
           string rcard = job.Receive.Count > 0 ? job.Receive[0].Name : "";
           int rqty = job.Receive.Count > 0 ? job.Receive[0].Qty : 1;
           r = _recallFn(job.User, rcard, job.CatId, rqty, job.Commit, job.WaitSec);
-          if (r.ok && job.LoanId != null)
-          {
-            _holdings.SettleReturn(job.LoanId);
-            _log($"[holding] {job.LoanId} settled — got {rcard} (cat {job.CatId}) back from {job.User}.");
-          }
         }
         else
         {
@@ -525,21 +504,32 @@ public sealed class TradeService
     Write(ctx, 200, new { id, cancelling = true, running });
   }
 
-  // Enqueue a recall: reclaim the EXACT lent printing from the borrower, then settle the loan.
-  void HandleRecall(HttpListenerContext ctx, string holdingId)
+  // Enqueue a recall: reclaim an EXACT printing from a named user. The CALLER supplies what
+  // to reclaim from whom, because the obligation ("they owe this card back") is a claim and
+  // claims live in DraftBot. The bot only executes the trade — a receive-only trade pinned
+  // to catId — and records the movement in the ledger like any other.
+  void HandleRecall(HttpListenerContext ctx, HttpListenerRequest req)
   {
-    var h = _holdings.Get(holdingId);
-    if (h is null) { Write(ctx, 404, new { error = "no such holding", id = holdingId }); return; }
-    if (h.Status != "onloan" || h.Borrower is null) { Write(ctx, 409, new { error = "holding is not on loan", status = h.Status }); return; }
+    string body; using (var rr = new StreamReader(req.InputStream, req.ContentEncoding ?? Encoding.UTF8)) body = rr.ReadToEnd();
+    RecallDto? dto;
+    try { dto = JsonSerializer.Deserialize<RecallDto>(body, JsonIn); }
+    catch (Exception ex) { Write(ctx, 400, new { error = "bad json", detail = ex.Message }); return; }
+    string user = (dto?.User ?? "").Trim();
+    string card = (dto?.Card ?? "").Trim();
+    int catId = dto?.CatId ?? 0;
+    int qty = Math.Max(1, dto?.Qty ?? 1);
+    if (user.Length == 0 || card.Length == 0 || catId <= 0)
+    { Write(ctx, 400, new { error = "user, card and catId are required (catId pins the exact printing to reclaim)" }); return; }
+
     var job = new TradeJob
     {
-      Id = NewId(), Type = "recall", User = h.Borrower,
-      Receive = new() { new TradeItem { Name = h.Card, Qty = h.Qty } },
-      CatId = h.CatId, LoanId = h.Id, Commit = true, WaitSec = int.MaxValue,
+      Id = NewId(), Type = "recall", User = user,
+      Receive = new() { new TradeItem { Name = card, Qty = qty } },
+      CatId = catId, Commit = true, WaitSec = int.MaxValue,
     };
     _jobs[job.Id] = job;
     _queue.Add(job);
-    _log($"[serve] queued recall {job.Id}: reclaim {h.Qty}x {h.Card} (cat {h.CatId}) from {h.Borrower} (holding {h.Id})");
+    _log($"[serve] queued recall {job.Id}: reclaim {qty}x {card} (cat {catId}) from {user}");
     Write(ctx, 202, Project(job));
   }
 
@@ -600,5 +590,11 @@ public sealed class TradeService
     public int? CatId { get; set; }   // exact printing (from a .dek import)
   }
 
-  sealed class AllowDto { public List<string>? Borrowers { get; set; } }
+  sealed class RecallDto
+  {
+    public string? User { get; set; }
+    public string? Card { get; set; }
+    public int? CatId { get; set; }   // required: pins the EXACT printing to reclaim
+    public int? Qty { get; set; }
+  }
 }

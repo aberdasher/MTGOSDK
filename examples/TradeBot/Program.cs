@@ -1310,21 +1310,13 @@ using (var exec = new TradeExecutor { AllowCommit = allowCommit })
   // the vault itself tracks those (ledger.log records the raw event).
   if (mode != "serve")
   {
-    var cliHoldings = new TradeBot.HoldingStore();
+    var cliLedger = new TradeBot.LedgerStore();
     exec.TradeCompleted += (partner, given, received) =>
     {
       foreach (var g in given)
-      {
-        bool isTix = string.Equals(g.Name, "Event Ticket", StringComparison.OrdinalIgnoreCase);
-        if (mode == "lend" && !isTix)
-        { var h = cliHoldings.RecordHouseLoan(g.Name, g.CatId, g.Qty, partner); Line($"[holding] {partner} borrowed {g.Qty}x {g.Name} (cat {g.CatId}) — house loan {h.Id}"); }
-        else
-        {
-          int released = cliHoldings.ConsumeDeposits(partner, g.Name, g.Qty);
-          Line($"[holding] gave {g.Qty}x {g.Name} to {partner}" +
-               (released > 0 ? $" — released {released} from their held deposits" : " (permanent transfer, nothing owed back)"));
-        }
-      }
+      { var e = cliLedger.RecordWithdraw(partner, g.Name, g.CatId, g.Qty); Line($"[ledger] OUT {g.Qty}x {g.Name} (cat {g.CatId}) -> {partner} (entry {e.Id})"); }
+      foreach (var rc in received)
+      { var e = cliLedger.RecordDeposit(partner, rc.Name, rc.CatId, rc.Qty); Line($"[ledger] IN  {rc.Qty}x {rc.Name} (cat {rc.CatId}) <- {partner} (entry {e.Id})"); }
     };
   }
 
@@ -2427,8 +2419,9 @@ using (var exec = new TradeExecutor { AllowCommit = allowCommit })
         },
         s => Line(s));
 
-      var holdings = new TradeBot.HoldingStore();
-      Line($"[serve] holdings ledger: {TradeBot.HoldingStore.DefaultPath} ({holdings.Active().Count} active).");
+      var ledger = new TradeBot.LedgerStore();
+      Line($"[serve] movement ledger: {TradeBot.LedgerStore.DefaultPath} ({ledger.Count} entries). " +
+           "Records what crossed the MTGO boundary; claims and balances live in DraftBot.");
       var svc = new TradeBot.TradeService(
         token: token, bind: bind, port: port, conn: conn, perJobTimeoutSec: perJobTimeout, commitArmed: allowCommit,
         tradeFn: (partner, give, receive, jobCommit, waitSec) =>
@@ -2475,7 +2468,7 @@ using (var exec = new TradeExecutor { AllowCommit = allowCommit })
                           .Select(k => (name: k.Key, qty: k.Value)).ToList();
           return (tix, byName.Count, top);
         },
-        holdings: holdings,
+        ledger: ledger,
         log: s => Line(s));
 
       // Executor output ([trade], [wishlist], [handshake], [perf]) stamps itself and now also

@@ -1,9 +1,27 @@
 /** @file
-  Holdings ledger — the custody accounting. Each Holding is a card the bot custodies: who it's
-  FROM (owner — a player who deposited it, or "house" = the bot's own card), the exact printing,
-  and where it is (held in the vault, or on loan with a borrower). Per-OWNER allow-lists gate who
-  an owner's cards may be lent to. Persisted to ~/mtgosdk-tradebot/holdings.json so it survives
-  restarts. (Supersedes the earlier loan-only ledger.)
+  Ledger — an append-only record of what physically crossed the MTGO boundary. Each entry
+  says a quantity of an exact printing moved IN (a player handed it to the custodian) or OUT
+  (the custodian handed it to a player), when, and as part of which job.
+
+  This is deliberately NOT an ownership or custody ledger, and it holds no claims:
+
+    * WHO IS OWED WHAT lives in DraftBot's wallet ledger, which is double-entry and whose
+      stated invariant is `vault tix == SUM(all wallet rows)`. Claims move between holders
+      there constantly WITHOUT anything physical happening — a tournament entry fee is a
+      transfer into a prize wallet, net zero, no MTGO trade. Mirroring any of that here
+      would create a second source of truth with no transactional link to the first.
+    * Likewise obligations (a borrower owing a card back) are claims, so they belong to
+      DraftBot too. The bot still EXECUTES a recall — a receive-only trade pinned to an
+      exact printing — but the caller supplies the printing; the bot does not remember it.
+
+  So entries are immutable: never decremented, never "consumed", never closed. The balance
+  question this file used to try to answer ("how much does X still have with us?") is not
+  answerable here and should not be asked of it — the honest answer needs DraftBot.
+
+  Persisted to ~/mtgosdk-tradebot/ledger.json so it survives restarts. Kept SEPARATE from
+  ledger.log, the executor's own text record: that one is written by the trade-completed
+  event handler and so survives even when a job is reported failed, which is what made a
+  real accounting divergence detectable. Two independent records is the point.
 **/
 using System;
 using System.Collections.Generic;
@@ -13,25 +31,23 @@ using System.Text.Json;
 
 namespace TradeBot;
 
-public sealed class Holding
+/// <summary>One asset movement across the MTGO boundary. Immutable once written.</summary>
+public sealed class LedgerEntry
 {
   public string Id { get; set; } = "";
-  public string Owner { get; set; } = "house";   // who the bot has it FROM ("house" = the bot's own card)
+  public string Kind { get; set; } = "deposit";  // deposit = came IN to us | withdraw = went OUT to them
+  public string User { get; set; } = "";         // the counterparty, NOT an owner of a claim
   public string Card { get; set; } = "";
-  public int CatId { get; set; }                 // the EXACT printing
+  public int CatId { get; set; }                 // the EXACT printing that moved
   public int Qty { get; set; } = 1;
-  public string? Borrower { get; set; }          // null => held in the vault; else on loan with this player
-  public string Status { get; set; } = "held";   // held | onloan | closed
-  public string AcquiredAt { get; set; } = "";   // ISO-8601 UTC
-  public string? UpdatedAt { get; set; }
+  public string At { get; set; } = "";           // ISO-8601 UTC
+  public string? JobId { get; set; }             // the serve job this movement belonged to
 }
 
-/// <summary>Thread-safe, disk-backed store of holdings + per-owner allow-lists. One instance owned by the serve.</summary>
-public sealed class HoldingStore
+/// <summary>Thread-safe, disk-backed, append-only ledger. One instance owned by the serve.</summary>
+public sealed class LedgerStore
 {
-  public const string House = "house";
-
-  sealed class Db { public List<Holding> Holdings { get; set; } = new(); public Dictionary<string, List<string>> Allow { get; set; } = new(StringComparer.OrdinalIgnoreCase); }
+  sealed class Db { public List<LedgerEntry> Entries { get; set; } = new(); }
 
   readonly string _path;
   readonly object _lock = new();
@@ -39,16 +55,15 @@ public sealed class HoldingStore
   static readonly JsonSerializerOptions Opts = new() { WriteIndented = true, PropertyNameCaseInsensitive = true };
 
   public static string DefaultPath =>
-    Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "mtgosdk-tradebot", "holdings.json");
+    Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "mtgosdk-tradebot", "ledger.json");
 
-  public HoldingStore(string? path = null) { _path = path ?? DefaultPath; Load(); }
+  public LedgerStore(string? path = null) { _path = path ?? DefaultPath; Load(); }
 
   void Load()
   {
     try { if (File.Exists(_path)) _db = JsonSerializer.Deserialize<Db>(File.ReadAllText(_path), Opts) ?? new(); }
     catch { _db = new(); }
-    _db.Allow ??= new(StringComparer.OrdinalIgnoreCase);
-    _db.Holdings ??= new();
+    _db.Entries ??= new();
   }
 
   void Save()
@@ -59,106 +74,49 @@ public sealed class HoldingStore
 
   static string NewId() => Guid.NewGuid().ToString("N").Substring(0, 12);
 
-  /// <summary>A player deposited a card into custody — record a held holding owned by them.</summary>
-  public Holding RecordDeposit(string owner, string card, int catId, int qty)
+  /// <summary>Record a movement. The only writer — there is no update and no delete.</summary>
+  public LedgerEntry Record(string kind, string user, string card, int catId, int qty, string? jobId = null)
   {
-    var h = new Holding { Id = NewId(), Owner = owner, Card = card, CatId = catId, Qty = Math.Max(1, qty),
-      Borrower = null, Status = "held", AcquiredAt = DateTime.UtcNow.ToString("o") };
-    lock (_lock) { _db.Holdings.Add(h); Save(); }
-    return h;
+    var e = new LedgerEntry
+    {
+      Id = NewId(), Kind = kind, User = user, Card = card, CatId = catId,
+      Qty = Math.Max(1, qty), At = DateTime.UtcNow.ToString("o"), JobId = jobId,
+    };
+    lock (_lock) { _db.Entries.Add(e); Save(); }
+    return e;
   }
 
-  /// <summary>The bot lent one of its OWN cards out — record a house holding on loan with the borrower.</summary>
-  public Holding RecordHouseLoan(string card, int catId, int qty, string borrower)
+  public LedgerEntry RecordDeposit(string user, string card, int catId, int qty, string? jobId = null)
+    => Record("deposit", user, card, catId, qty, jobId);
+
+  public LedgerEntry RecordWithdraw(string user, string card, int catId, int qty, string? jobId = null)
+    => Record("withdraw", user, card, catId, qty, jobId);
+
+  /// <summary>Most recent entries first, newest <paramref name="limit"/> only.</summary>
+  public List<LedgerEntry> Recent(int limit = 200)
   {
-    var h = new Holding { Id = NewId(), Owner = House, Card = card, CatId = catId, Qty = Math.Max(1, qty),
-      Borrower = borrower, Status = "onloan", AcquiredAt = DateTime.UtcNow.ToString("o") };
-    lock (_lock) { _db.Holdings.Add(h); Save(); }
-    return h;
+    lock (_lock) { return _db.Entries.OrderByDescending(e => e.At).Take(Math.Max(1, limit)).ToList(); }
   }
+
+  public int Count { get { lock (_lock) return _db.Entries.Count; } }
 
   /// <summary>
-  /// A player WITHDREW something they had in custody (e.g. tix going back out) — the
-  /// opposite of a deposit, and NOT a loan: nothing is owed back. Consumes up to
-  /// <paramref name="qty"/> from their oldest 'held' holdings of that card (reduce, close
-  /// zeroed rows). Returns how much was actually consumed — less than qty means the rest
-  /// wasn't tracked here (fungible-claim accounting lives in DraftBot).
+  /// Net quantity per card across the whole ledger (deposits minus withdrawals) — a
+  /// reconciliation aid against the physical vault, NOT a per-user balance. Deliberately
+  /// aggregate: per-user balances are DraftBot's, and computing one here would be wrong
+  /// the moment a claim moves between holders without a trade.
   /// </summary>
-  public int ConsumeDeposits(string owner, string card, int qty)
+  public Dictionary<string, int> NetByCard()
   {
-    int remaining = Math.Max(0, qty);
     lock (_lock)
     {
-      foreach (var h in _db.Holdings
-        .Where(h => h.Status == "held"
-                 && string.Equals(h.Owner, owner, StringComparison.OrdinalIgnoreCase)
-                 && string.Equals(h.Card, card, StringComparison.OrdinalIgnoreCase))
-        .OrderBy(h => h.AcquiredAt).ToList())
+      var net = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+      foreach (var e in _db.Entries)
       {
-        if (remaining <= 0) break;
-        int take = Math.Min(h.Qty, remaining);
-        h.Qty -= take; remaining -= take;
-        h.UpdatedAt = DateTime.UtcNow.ToString("o");
-        if (h.Qty <= 0) h.Status = "closed";
+        int sign = string.Equals(e.Kind, "withdraw", StringComparison.OrdinalIgnoreCase) ? -1 : 1;
+        net[e.Card] = (net.TryGetValue(e.Card, out var v) ? v : 0) + sign * e.Qty;
       }
-      if (remaining < qty) Save();
+      return net;
     }
-    return qty - remaining;
-  }
-
-  /// <summary>A card came back from its borrower. House cards close (back in the collection); a
-  /// player-owned card returns to "held" in custody. Returns false if unknown/not-on-loan.</summary>
-  public bool SettleReturn(string id)
-  {
-    lock (_lock)
-    {
-      var h = _db.Holdings.FirstOrDefault(x => x.Id == id);
-      if (h is null || h.Status != "onloan") return false;
-      h.Borrower = null; h.UpdatedAt = DateTime.UtcNow.ToString("o");
-      h.Status = string.Equals(h.Owner, House, StringComparison.OrdinalIgnoreCase) ? "closed" : "held";
-      Save();
-      return true;
-    }
-  }
-
-  public Holding? Get(string id) { lock (_lock) { return _db.Holdings.FirstOrDefault(h => h.Id == id); } }
-
-  /// <summary>Active holdings (not closed), on-loan first, then newest.</summary>
-  public List<Holding> Active()
-  {
-    lock (_lock)
-    {
-      return _db.Holdings.Where(h => h.Status != "closed")
-        .OrderBy(h => h.Status == "onloan" ? 0 : 1).ThenByDescending(h => h.AcquiredAt).ToList();
-    }
-  }
-
-  /// <summary>The allow-list for an owner (who may borrow their cards). Empty => anyone.</summary>
-  public List<string> OwnerAllow(string owner)
-  {
-    lock (_lock) { return _db.Allow.TryGetValue(owner, out var l) ? new List<string>(l) : new List<string>(); }
-  }
-
-  public void SetOwnerAllow(string owner, IEnumerable<string> borrowers)
-  {
-    lock (_lock)
-    {
-      _db.Allow[owner] = borrowers.Select(b => (b ?? "").Trim()).Where(b => b.Length > 0)
-        .Distinct(StringComparer.OrdinalIgnoreCase).ToList();
-      Save();
-    }
-  }
-
-  /// <summary>May <paramref name="borrower"/> borrow <paramref name="owner"/>'s cards? Empty allow-list = anyone.</summary>
-  public bool CanLend(string owner, string borrower)
-  {
-    var allow = OwnerAllow(owner);
-    return allow.Count == 0 || allow.Any(b => string.Equals(b, borrower, StringComparison.OrdinalIgnoreCase));
-  }
-
-  /// <summary>Snapshot of all owner allow-lists (for the dashboard).</summary>
-  public Dictionary<string, List<string>> AllAllow()
-  {
-    lock (_lock) { return _db.Allow.ToDictionary(kv => kv.Key, kv => new List<string>(kv.Value), StringComparer.OrdinalIgnoreCase); }
   }
 }
